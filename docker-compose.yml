@@ -1,0 +1,146 @@
+# Ambiente local de desenvolvimento — NÃO usar para medição.
+#
+# Antes de subir, no host Linux/WSL:
+#   sudo sysctl -w vm.max_map_count=262144
+# (sem isso o OpenSearch não inicia; para tornar permanente, adicione
+#  vm.max_map_count=262144 em /etc/sysctl.conf)
+#
+# Os quatro serviços juntos pedem ~10 GB de RAM. Se a máquina for mais
+# modesta, suba um perfil de cada vez:
+#   docker compose up postgres
+#   docker compose up valkey
+#   docker compose up scylla
+#   docker compose up opensearch
+#
+# `generator` (abaixo) não é um dos quatro bancos — é a ferramenta de
+# geração de massa da Fase 1 (data_generation/), isolada em container para
+# não depender do Python/venv do host. Uso: docker compose run --rm
+# generator all --sample-users 10000 --seed 42. Ver data_generation/README.md.
+
+services:
+
+  # Fase 1 — gerador de massa de dados. Ferramenta de lote (não fica no ar
+  # como as quatro abaixo); `docker compose run --rm generator <args>`.
+  generator:
+    build: ./data_generation
+    container_name: tcc-generator
+    volumes:
+      - ./data_generation/data:/app/data
+
+  # BD-1 — relacional orientado a linhas
+  postgres:
+    image: postgres:16-alpine
+    container_name: tcc-postgres
+    environment:
+      POSTGRES_USER: tcc
+      POSTGRES_PASSWORD: tcc
+      POSTGRES_DB: recsys
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schemas/postgres:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - work_mem=64MB
+      - -c
+      - max_connections=200
+      - -c
+      - random_page_cost=1.1          # SSD
+      - -c
+      - track_io_timing=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tcc -d recsys"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # BD-2 — chave-valor em memória
+  # Imagem com módulos de busca, necessária para E-2 (predicado no banco).
+  # Se dispensar E-2 no Valkey, troque por valkey/valkey:8-alpine.
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: tcc-valkey
+    ports:
+      - "6379:6379"
+    command:
+      - valkey-server
+      - --save
+      - ""                            # sem persistência: é bancada de teste
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 3gb
+      - --maxmemory-policy
+      - noeviction                    # despejo silencioso falsearia os resultados
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # BD-3 — wide-column distribuído
+  # As flags são obrigatórias: sem elas o Scylla tenta tomar a máquina inteira.
+  scylla:
+    image: scylladb/scylla:6.2
+    container_name: tcc-scylla
+    ports:
+      - "9042:9042"
+    command:
+      - --smp
+      - "1"
+      - --memory
+      - 2G
+      - --overprovisioned
+      - "1"
+      - --developer-mode
+      - "1"
+      - --skip-wait-for-gossip-to-settle
+      - "0"
+    volumes:
+      - scylla-data:/var/lib/scylla
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # BD-4 — índice invertido
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    container_name: tcc-opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g
+      - DISABLE_SECURITY_PLUGIN=true          # bancada local, sem TLS
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+volumes:
+  postgres-data:
+  scylla-data:
+  opensearch-data:

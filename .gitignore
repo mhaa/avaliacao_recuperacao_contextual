@@ -1,0 +1,16 @@
+# Claude Code
+.claude/
+CLAUDE.local.md
+.claude.json
+.mcp.json
+CONTEXTO.md
+CLAUDE.md
+
+
+# data_generation — dados gerados/baixados e ambiente virtual, nunca versionados
+data_generation/data/
+data_generation/.venv/
+data_generation/*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
