@@ -32,11 +32,17 @@ import polars as pl
 MEASUREMENT_SCENARIOS = frozenset({"measurement", "ramp_to_slo"})
 
 
-def parse_k6_ndjson(path: Path) -> pl.DataFrame:
+def parse_k6_ndjson(path: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS) -> pl.DataFrame:
     """latencies.parquet: uma linha por requisição — timestamp, latência,
     status, returned_count. Junta http_req_duration (built-in) e
     returned_count (customizada, ver load/scenarios.js) pelo tag
-    `request_id` que as duas carregam."""
+    `request_id` que as duas carregam.
+
+    `scenarios` default é MEASUREMENT_SCENARIOS (uso normal — nunca conta
+    `warmup`). infra/scripts/cloud_smoke_test.py passa
+    `scenarios={"smoke"}` para o mesmo parser, sobre o cenário de smoke de
+    load/scenarios.js — nunca o padrão, pra não haver risco de dado de
+    smoke entrar em MEASUREMENT_SCENARIOS por engano."""
     durations: list[dict] = []
     returned_by_request: dict[str, int] = {}
 
@@ -50,7 +56,7 @@ def parse_k6_ndjson(path: Path) -> pl.DataFrame:
                 continue
             data = event["data"]
             tags = data.get("tags") or {}
-            if tags.get("scenario") not in MEASUREMENT_SCENARIOS:
+            if tags.get("scenario") not in scenarios:
                 continue
 
             if event["metric"] == "http_req_duration":

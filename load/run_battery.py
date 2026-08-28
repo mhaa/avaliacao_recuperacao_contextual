@@ -18,10 +18,9 @@ Uso local (SMOKE apenas — CONTEXTO.md proíbe medir latência localmente):
         --cells e1-postgres --target-url http://service:8000/v1/recommendations \\
         --repetitions 1 --rate 10 --smoke
 
-Uso real (nuvem — infra/ da Etapa 9 ainda não existe): cada célula roda
-contra sua própria VM de serviço; --targets aponta um JSON
-{cell_id: target_url} a ser produzido pelos outputs do Terraform quando essa
-etapa existir.
+Uso real (nuvem — infra/, Etapa 9): cada célula roda contra sua própria VM
+de serviço; --targets aponta um JSON {cell_id: target_url} produzido a
+partir dos outputs `service_internal_ip` de infra/envs/experiment.
 """
 
 from __future__ import annotations
@@ -105,7 +104,11 @@ def run_k6(
         f"SELECTIVITY_TIER={selectivity_tier}",
     ]
     if smoke:
-        cmd += ["--vus", "1", "--duration", "10s"]
+        # --vus/--duration na CLI do k6 são ignorados quando
+        # options.scenarios já está definido no .js (é sempre o caso aqui) —
+        # SMOKE_MODE=true troca o cenário inteiro dentro de scenarios.js
+        # por um curto e sem threshold de SLO (ver load/scenarios.js).
+        cmd += ["-e", "SMOKE_MODE=true"]
 
     manifest = {
         "cell_id": cell_id,
@@ -130,7 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--phase", default="triagem", choices=["triagem", "confirmacao"])
+    parser.add_argument(
+        "--phase", default="triagem", choices=["triagem", "confirmacao", "smoke"]
+    )
     parser.add_argument("--rate", type=int, default=100)
     parser.add_argument("--k", type=int, default=20)
     parser.add_argument(

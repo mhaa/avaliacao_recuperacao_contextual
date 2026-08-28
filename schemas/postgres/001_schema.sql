@@ -7,7 +7,7 @@
 -- docker-entrypoint-initdb.d (ver docker-compose.yml) — só DDL aqui, nunca
 -- dado de teste ou de produção.
 
-CREATE TABLE candidates (
+CREATE TABLE IF NOT EXISTS candidates (
     user_id INT NOT NULL,
     item_id INT NOT NULL,
     rank SMALLINT NOT NULL,
@@ -15,14 +15,14 @@ CREATE TABLE candidates (
     PRIMARY KEY (user_id, item_id)
 );
 
-CREATE INDEX idx_candidates_user_rank ON candidates (user_id, rank);
+CREATE INDEX IF NOT EXISTS idx_candidates_user_rank ON candidates (user_id, rank);
 
 -- Pertença item -> contexto (dado de catálogo, C=20 contextos materializados
 -- por generator/contexts.py — ver data_generation/README.md).
-CREATE TABLE item_contexts (
+CREATE TABLE IF NOT EXISTS item_contexts (
     item_id INT NOT NULL,
     context_id SMALLINT NOT NULL,
     PRIMARY KEY (item_id, context_id)
 );
 
-CREATE INDEX idx_item_contexts_context ON item_contexts (context_id);
+CREATE INDEX IF NOT EXISTS idx_item_contexts_context ON item_contexts (context_id);

@@ -34,3 +34,11 @@ infra/**/*.tfstate.*
 infra/**/.terraform.tfstate.lock.info
 infra/**/terraform.tfvars
 !infra/**/terraform.tfvars.example
+
+# Chave da service account do Terraform (Fase 4) — NUNCA deveria existir
+# dentro do repo (infra/scripts/create_terraform_service_account.sh gera a
+# chave fora da árvore do Git de propósito e se recusa a escrever aqui),
+# mas ignorado por precaução (defesa em profundidade, não a proteção
+# principal).
+*-key.json
+infra/.gcp/

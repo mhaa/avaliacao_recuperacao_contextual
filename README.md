@@ -39,7 +39,7 @@ para gerar a base real completa (~200 mil usuários) basta omitir `--sample-user
 
 Implementação das 14 células de recuperação, 4 estratégias (E-1..E-4)
 sobre os quatro bancos (BD-1..BD-4) (eliminados 2 casos inviaveis). 
-Para rodar localmente os unitários desta fase: 
+Para rodar localmente os unitários desta fase sem banco de dados (adpatador fake): 
 
 ```
 docker compose build tools
@@ -54,22 +54,20 @@ crescente, `item_id` crescente em empate), exclusão de itens da sessão, o
 contrato de requisição/resposta (`core/contract.py`) e a montagem de
 respostas incompletas (nunca completadas de outra fonte).
 
-Como rodar:
-
-```
-docker compose build tools
-docker compose run --rm tools                    # camada rápida, sem banco
-```
-
-#### Etapa 2 — `storage/postgres.py` + `strategies/e1_app_filter.py`
+#### Fase 2.2 — `storage/postgres.py` + `strategies/e1_app_filter.py`
 
 Primeira célula ponta a ponta (a mais simples da matriz 4×4): E-1 (filtro na
-aplicação) sobre Postgres (BD-1). `storage/base.py` define as primitivas que
+aplicação) sobre Postgres (BD-1). 
+
+`storage/base.py` define as primitivas que
 cada banco pode ou não oferecer (`get_candidates`, `get_candidates_filtered`,
 `get_prematerialized`, `intersect`) — um adaptador que não suporta uma
 primitiva falha na **montagem** da célula, nunca em tempo de requisição.
+
 `storage/postgres.py` implementa `get_candidates`/`get_candidates_filtered`
-via `psycopg` (assíncrono); `storage/tests/fakes.py` traz um adaptador fake
+via `psycopg` (assíncrono); 
+
+`storage/tests/fakes.py` traz um adaptador fake
 em memória com as 4 primitivas, usado pelos testes de estratégia sem precisar
 de banco algum. O esquema mínimo do Postgres está em
 [`schemas/postgres/`](schemas/postgres/).
@@ -611,3 +609,156 @@ done
 > no `.gitignore`. `infra/` é montado como bind mount read-write em
 > `docker-compose.yml` (não `COPY`, ao contrário do resto do repositório)
 > exatamente para que esses arquivos apareçam no host.
+
+### Fase 4 — Deploy em nuvem (GCP)
+
+Passo a passo real, com credenciais e recursos faturáveis — cada `apply`
+abaixo custa dinheiro e exige confirmação explícita antes de rodar.
+
+**Compute Engine, não Cloud Run.** A camada de serviço roda em VM
+(`infra/modules/service/`), não em execução serverless — está fora de
+escopo do projeto (`CLAUDE.md`: "serverless execution"), e é consistente
+com `infra/modules/database/` já rodando a mesma imagem Docker do
+`docker-compose.yml` local em vez de um banco gerenciado. Autoscaling e
+cold starts de uma plataforma serverless contaminariam justamente a cauda
+de latência (p95/p99/p99.9) que o estudo mede.
+
+**0. Pré-requisitos manuais (fora deste repositório)**
+- Criar um projeto GCP e vincular uma conta de faturamento.
+- Habilitar as APIs: Compute Engine, Cloud Storage, Secret Manager,
+  Artifact Registry, Cloud Billing Budget, IAM, Identity-Aware Proxy.
+- `gcloud auth login` na máquina host (fora de qualquer container — os
+  scripts abaixo usam o `gcloud` do host, não o do container `tools`, que
+  só tem `terraform` e `k6`).
+
+**1. Credencial do Terraform — nunca dentro do repositório**
+
+O Terraform roda dentro do container `tools`, que precisa de uma
+credencial GCP. Em vez de montar as credenciais pessoais do usuário
+(`~/.config/gcloud`, que dá dor de cabeça no Docker Desktop/Windows e
+mistura identidade pessoal com automação), uma service account dedicada é
+criada e sua chave é gerada **fora da árvore do Git** — nunca dentro de
+`infra/` ou de qualquer pasta versionada, mesmo com `.gitignore`:
+
+```
+infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id> "$HOME/.tcc-secrets/terraform-key.json"
+```
+
+O script se recusa a escrever a chave se o caminho de saída cair dentro do
+repositório — checagem ativa (`git rev-parse --show-toplevel`), não só
+documentação. Ele concede os papéis mínimos que os recursos reais de
+`infra/` exigem: `roles/compute.admin` (VMs e rede), `roles/storage.admin`
+(buckets do bootstrap), `roles/iam.serviceAccountAdmin` +
+`roles/iam.serviceAccountUser` (a SA de runtime que
+`infra/modules/service/` cria para a própria VM de serviço),
+`roles/resourcemanager.projectIamAdmin` (a concessão de
+`secretmanager.secretAccessor` a essa SA), e `roles/billing.admin` na
+conta de faturamento (`google_billing_budget` exige isso separadamente,
+fora do projeto).
+
+Depois de gerada, exporte o caminho no shell do host (nunca num `.env`
+versionado) antes de qualquer comando Terraform via `docker-compose.gcp.yml`:
+
+```
+export GCP_TERRAFORM_KEY_PATH="$HOME/.tcc-secrets/terraform-key.json"
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
+```
+
+`docker-compose.gcp.yml` é um overlay opcional — nunca usado sozinho,
+sempre com `-f docker-compose.yml -f docker-compose.gcp.yml`. Ele monta a
+chave como um único arquivo read-only, sem copiá-la para dentro da árvore
+do Git.
+
+**2. Bootstrap — buckets de estado e resultados**
+
+```
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/bootstrap init
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
+```
+
+Guarde os outputs `terraform_state_bucket` e `results_bucket` — usados nos
+passos seguintes.
+
+**3. Orçamento — antes de qualquer VM**
+
+```
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/envs/budget \
+  init -backend-config="bucket=<terraform_state_bucket>"
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/envs/budget apply \
+  -var="project_id=<seu-projeto>" -var="billing_account_id=<sua-conta>" -var="monthly_budget_usd=<valor>"
+```
+
+**4. Imagens — build e push para o Artifact Registry**
+
+Deliberadamente fora do Terraform (`infra/modules/service/main.tf`:
+"publicada em Artifact Registry fora deste [terraform]"). Roda no host,
+com a sessão pessoal do usuário (`gcloud auth configure-docker`), não a
+service account do Terraform:
+
+```
+infra/scripts/build_and_push_images.sh <project-id> <region> [tag]
+```
+
+Cria o repositório Artifact Registry `tcc` se ainda não existir, builda
+`docker/Dockerfile.service` e `docker/Dockerfile.tools`, e faz push das
+duas — imprimindo as referências completas para colar em
+`service_image`/`tools_image` do `terraform.tfvars` (passo 6).
+
+**5. Secret Manager — senha do Postgres**
+
+O startup script de `infra/modules/service/` busca a senha em
+`gcloud secrets versions access latest --secret=tcc-postgres-password` —
+não existe recurso Terraform para criar o secret (checado em
+`infra/modules/service/main.tf`), é um passo manual:
+
+```
+echo -n "<senha-real>" | gcloud secrets create tcc-postgres-password --data-file=- --project=<seu-projeto>
+```
+
+**6. Por célula — plan/apply**
+
+```
+cd infra/envs/experiment
+cp terraform.tfvars.example terraform.tfvars   # preencher project_id, cell, storage, service_image, tools_image; nunca commitar
+```
+
+```
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment \
+  init -backend-config="bucket=<terraform_state_bucket>" -backend-config="prefix=cells/<cell>"
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment plan
+docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment apply   # faturável — confirmar antes
+```
+
+Depois de medir, `terraform destroy` a célula (o disco/snapshot sobrevive
+fora do ciclo de vida da VM — `infra/scripts/snapshot_after_load.sh`) antes
+de aplicar a próxima, para não pagar por VMs ociosas.
+
+### Smoke test em nuvem — antes de qualquer bateria real
+
+`infra/scripts/cloud_smoke_test.py` sobe uma célula de verdade, aplica
+schema, carrega o subconjunto pequeno de dados do oráculo
+(`harness/fixtures.py`), roda `harness/verify_cli.py` como gate de
+corretude, dispara uma carga leve (`SMOKE_MODE=true` em
+`load/scenarios.js`), imprime uma sanidade grosseira de latência/recursos
+(`docker stats` via SSH, não `analysis/resources.py` — esse continua só
+local), e derruba tudo no final — pensado para pegar problemas antes da
+bateria de medição real (cara, demorada, não deveria precisar ser
+re-executada). Roda no host (usa o `gcloud` do host para SSH via IAP nas
+VMs, todas sem IP público):
+
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket>
+```
+
+Cada `terraform apply`/`destroy` dentro dele é anunciado explicitamente e
+pede confirmação — mesmo já tendo sido descrito aqui. `--keep-infra` pula o
+destroy final, para investigar uma falha manualmente.

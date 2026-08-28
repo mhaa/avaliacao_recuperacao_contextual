@@ -50,6 +50,13 @@ const ITEM_COUNT = parseInt(__ENV.ITEM_COUNT || '87585', 10);
 // Rampa até violar o SLO (CONTEXTO.md): cenário à parte, ativado por env,
 // nunca simultâneo às taxas fixas.
 const RAMP_MODE = (__ENV.RAMP_MODE || 'false') === 'true';
+// Smoke test em nuvem (infra/scripts/cloud_smoke_test.py): só confirma que
+// o serviço responde, não mede nada — poucas iterações, sem SLO. Cenário
+// próprio (nome "smoke", fora de MEASUREMENT_SCENARIOS em
+// analysis/collect.py) em vez de tentar encolher constantRateScenarios via
+// --vus/--duration na CLI do k6, que o k6 ignora quando `options.scenarios`
+// já está definido.
+const SMOKE_MODE = (__ENV.SMOKE_MODE || 'false') === 'true';
 
 const contextsByTier = new SharedArray('contexts_by_tier', function () {
   return [JSON.parse(open('./fixtures/contexts_by_tier.json'))];
@@ -108,21 +115,33 @@ const rampScenarios = {
   },
 };
 
+const smokeScenarios = {
+  smoke: {
+    executor: 'per-vu-iterations',
+    vus: 1,
+    iterations: 10,
+    maxDuration: '30s',
+  },
+};
+
 // `abortOnFail` só no modo rampa: é o mecanismo que implementa "rampa até
 // violar o SLO" — para as taxas fixas queremos a janela de medição inteira
-// mesmo que o SLO seja violado ocasionalmente, para a análise decidir.
-const thresholds = RAMP_MODE
-  ? {
-      'http_req_duration{scenario:ramp_to_slo}': [{ threshold: 'p(99)<200', abortOnFail: true }],
-      'http_req_failed{scenario:ramp_to_slo}': [{ threshold: 'rate<0.01', abortOnFail: true }],
-    }
-  : {
-      'http_req_duration{scenario:measurement}': ['p(99)<200'],
-      'http_req_failed{scenario:measurement}': ['rate<0.01'],
-    };
+// mesmo que o SLO seja violado ocasionalmente, para a análise decidir. Smoke
+// não tem threshold de SLO nenhum — só sanidade ("não deu erro"), não medição.
+const thresholds = SMOKE_MODE
+  ? {}
+  : RAMP_MODE
+    ? {
+        'http_req_duration{scenario:ramp_to_slo}': [{ threshold: 'p(99)<200', abortOnFail: true }],
+        'http_req_failed{scenario:ramp_to_slo}': [{ threshold: 'rate<0.01', abortOnFail: true }],
+      }
+    : {
+        'http_req_duration{scenario:measurement}': ['p(99)<200'],
+        'http_req_failed{scenario:measurement}': ['rate<0.01'],
+      };
 
 export const options = {
-  scenarios: RAMP_MODE ? rampScenarios : constantRateScenarios,
+  scenarios: SMOKE_MODE ? smokeScenarios : RAMP_MODE ? rampScenarios : constantRateScenarios,
   thresholds,
 };
 

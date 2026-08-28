@@ -69,8 +69,13 @@ def build_storage(config: CellConfig) -> StorageAdapter:
     é o único lugar que precisa saber disso.
     """
     adapter_cls = STORAGE_REGISTRY[config.storage]
-    host = config.storage_config["host"]
-    port = config.storage_config["port"]
+    # STORAGE_HOST/STORAGE_PORT sobrescrevem cells/<id>.yaml quando
+    # definidos — cells/*.yaml hardcoda nomes de serviço do
+    # docker-compose (ex.: "postgres"), que não resolvem numa VM na
+    # nuvem; infra/modules/service/main.tf já define STORAGE_HOST com o
+    # IP interno real. Ausente localmente, cai no valor do YAML de sempre.
+    host = os.environ.get("STORAGE_HOST", config.storage_config["host"])
+    port = int(os.environ.get("STORAGE_PORT", config.storage_config["port"]))
 
     if config.storage == "postgres":
         user = _require_env("POSTGRES_USER", "postgres")
