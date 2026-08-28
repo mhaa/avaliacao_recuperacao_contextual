@@ -5,39 +5,25 @@
 # o gcloud CLI instalado.
 #
 # Segurança (decisão explícita do usuário: credenciais nunca vão para o
-# GitHub): este script SE RECUSA a escrever a chave dentro da árvore deste
-# repositório Git. A chave deve viver em outro lugar do disco — depois de
-# gerada, exporte GCP_TERRAFORM_KEY_PATH apontando pra ela e use
-# docker-compose.gcp.yml para montá-la no container só quando for rodar
-# Terraform de verdade.
+# GitHub, e nem devem persistir indefinidamente em disco local): a chave
+# gerada é guardada no Secret Manager (segredo "tcc-terraform-key") e a
+# cópia local temporária usada só pra fazer o upload é apagada logo em
+# seguida. Rodar Terraform de verdade depois exige buscar essa chave de
+# novo, sob demanda, via infra/scripts/with_terraform_credentials.sh — que
+# a materializa num arquivo temporário só pela duração de um comando e
+# apaga depois. Nunca fica um arquivo de chave permanente em lugar nenhum.
 #
-# Uso: infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id> <output-key-path>
-# Exemplo: infra/scripts/create_terraform_service_account.sh meu-projeto 012345-6789AB-CDEF01 "$HOME/.tcc-secrets/terraform-key.json"
+# Uso: infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id>
+# Exemplo: infra/scripts/create_terraform_service_account.sh meu-projeto 012345-6789AB-CDEF01
 
 set -euo pipefail
 
-PROJECT_ID="${1:?uso: create_terraform_service_account.sh <project-id> <billing-account-id> <output-key-path>}"
-BILLING_ACCOUNT_ID="${2:?uso: create_terraform_service_account.sh <project-id> <billing-account-id> <output-key-path>}"
-OUTPUT_KEY_PATH="${3:?uso: create_terraform_service_account.sh <project-id> <billing-account-id> <output-key-path>}"
-
-# --- Checagem de segurança: a chave nunca pode cair dentro do repo. ---
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CANDIDATE="$(dirname "$OUTPUT_KEY_PATH")"
-while [[ ! -d "$CANDIDATE" && "$CANDIDATE" != "/" && "$CANDIDATE" != "." ]]; do
-  CANDIDATE="$(dirname "$CANDIDATE")"
-done
-OUTPUT_DIR="$(cd "$CANDIDATE" && pwd)"
-case "$OUTPUT_DIR" in
-  "$REPO_ROOT"|"$REPO_ROOT"/*)
-    echo "ERRO: <output-key-path> ('$OUTPUT_KEY_PATH') cai dentro do repositório ('$REPO_ROOT')." >&2
-    echo "A chave da service account NUNCA pode ficar numa pasta versionada, mesmo com .gitignore." >&2
-    echo "Escolha um caminho fora do repo, ex.: \$HOME/.tcc-secrets/terraform-key.json" >&2
-    exit 1
-    ;;
-esac
+PROJECT_ID="${1:?uso: create_terraform_service_account.sh <project-id> <billing-account-id>}"
+BILLING_ACCOUNT_ID="${2:?uso: create_terraform_service_account.sh <project-id> <billing-account-id>}"
 
 SA_ID="terraform-tcc"
 SA_EMAIL="${SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+SECRET_ID="tcc-terraform-key"
 
 echo "Criando service account ${SA_EMAIL}..."
 gcloud iam service-accounts create "$SA_ID" \
@@ -73,16 +59,37 @@ gcloud billing accounts add-iam-policy-binding "$BILLING_ACCOUNT_ID" \
   --role="roles/billing.admin" \
   --quiet
 
-mkdir -p "$OUTPUT_DIR"
-echo "Gerando chave em ${OUTPUT_KEY_PATH}..."
-gcloud iam service-accounts keys create "$OUTPUT_KEY_PATH" \
+# Arquivo temporário só para o upload — nunca o destino final da chave.
+# `mktemp` nunca resolve dentro deste repositório, então não precisa de
+# checagem extra (ao contrário da versão anterior deste script).
+TMP_KEY="$(mktemp)"
+trap 'rm -f "$TMP_KEY"' EXIT
+
+echo "Gerando chave..."
+gcloud iam service-accounts keys create "$TMP_KEY" \
   --iam-account="$SA_EMAIL"
 
+echo "Guardando a chave no Secret Manager (segredo '${SECRET_ID}')..."
+if gcloud secrets describe "$SECRET_ID" --project="$PROJECT_ID" >/dev/null 2>&1; then
+  gcloud secrets versions add "$SECRET_ID" \
+    --project="$PROJECT_ID" \
+    --data-file="$TMP_KEY"
+else
+  gcloud secrets create "$SECRET_ID" \
+    --project="$PROJECT_ID" \
+    --replication-policy=automatic \
+    --data-file="$TMP_KEY"
+fi
+
 echo
-echo "Pronto. Antes de rodar Terraform via docker-compose.gcp.yml:"
-echo "  export GCP_TERRAFORM_KEY_PATH=\"$OUTPUT_KEY_PATH\""
+echo "Pronto. A chave está no Secret Manager, não em nenhum arquivo local"
+echo "(o temporário usado pra subir foi apagado)."
 echo
-echo "Trate '$OUTPUT_KEY_PATH' como um segredo: nunca copie para dentro do"
-echo "repositório, nunca cole em chat/issue. Quando o trabalho de campo"
-echo "terminar, revogue com:"
+echo "Para rodar Terraform de verdade, use o wrapper que busca a chave sob"
+echo "demanda e apaga depois de cada comando:"
+echo "  infra/scripts/with_terraform_credentials.sh $PROJECT_ID -- <comando docker compose>"
+echo
+echo "Quando o trabalho de campo terminar, revogue a chave e delete o secret:"
+echo "  gcloud iam service-accounts keys list --iam-account=$SA_EMAIL"
 echo "  gcloud iam service-accounts keys delete <KEY_ID> --iam-account=$SA_EMAIL"
+echo "  gcloud secrets delete $SECRET_ID --project=$PROJECT_ID"

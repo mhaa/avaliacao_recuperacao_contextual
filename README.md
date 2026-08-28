@@ -631,22 +631,25 @@ de latência (p95/p99/p99.9) que o estudo mede.
   scripts abaixo usam o `gcloud` do host, não o do container `tools`, que
   só tem `terraform` e `k6`).
 
-**1. Credencial do Terraform — nunca dentro do repositório**
+**1. Credencial do Terraform — nunca persiste em disco, nem fora do repositório**
 
 O Terraform roda dentro do container `tools`, que precisa de uma
 credencial GCP. Em vez de montar as credenciais pessoais do usuário
 (`~/.config/gcloud`, que dá dor de cabeça no Docker Desktop/Windows e
-mistura identidade pessoal com automação), uma service account dedicada é
-criada e sua chave é gerada **fora da árvore do Git** — nunca dentro de
-`infra/` ou de qualquer pasta versionada, mesmo com `.gitignore`:
+mistura identidade pessoal com automação) ou de gerar um arquivo de chave
+permanente em algum lugar do disco, uma service account dedicada é criada
+e sua chave vai **direto para o Secret Manager** — nunca um arquivo de
+chave de longa duração em lugar nenhum, nem dentro do repositório, nem
+fora dele:
 
 ```
-infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id> "$HOME/.tcc-secrets/terraform-key.json"
+infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id>
 ```
 
-O script se recusa a escrever a chave se o caminho de saída cair dentro do
-repositório — checagem ativa (`git rev-parse --show-toplevel`), não só
-documentação. Ele concede os papéis mínimos que os recursos reais de
+O script gera a chave num arquivo temporário só para o upload, sobe pro
+segredo `tcc-terraform-key` via `gcloud secrets create`/`versions add`, e
+apaga o temporário na sequência (`trap ... EXIT`, roda mesmo se algo
+falhar no meio). Concede os papéis mínimos que os recursos reais de
 `infra/` exigem: `roles/compute.admin` (VMs e rede), `roles/storage.admin`
 (buckets do bootstrap), `roles/iam.serviceAccountAdmin` +
 `roles/iam.serviceAccountUser` (a SA de runtime que
@@ -656,26 +659,34 @@ documentação. Ele concede os papéis mínimos que os recursos reais de
 conta de faturamento (`google_billing_budget` exige isso separadamente,
 fora do projeto).
 
-Depois de gerada, exporte o caminho no shell do host (nunca num `.env`
-versionado) antes de qualquer comando Terraform via `docker-compose.gcp.yml`:
+Para rodar Terraform de verdade depois, use
+`infra/scripts/with_terraform_credentials.sh` — ele busca a chave do
+Secret Manager (com a sua sessão pessoal, `gcloud auth login`; a própria
+service account do Terraform não pode ler sua própria chave, seria
+circular) para um arquivo temporário só pela duração de UM comando, e
+apaga em seguida:
 
 ```
-export GCP_TERRAFORM_KEY_PATH="$HOME/.tcc-secrets/terraform-key.json"
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
 ```
 
 `docker-compose.gcp.yml` é um overlay opcional — nunca usado sozinho,
-sempre com `-f docker-compose.yml -f docker-compose.gcp.yml`. Ele monta a
-chave como um único arquivo read-only, sem copiá-la para dentro da árvore
-do Git.
+sempre com `-f docker-compose.yml -f docker-compose.gcp.yml`, e sempre
+através do wrapper acima (nunca defina `GCP_TERRAFORM_KEY_PATH` manualmente
+— é o wrapper quem aponta pro arquivo temporário e cuida de apagá-lo).
+`infra/scripts/cloud_smoke_test.py` (fim desta seção) faz o mesmo
+internamente, sem precisar do wrapper.
 
 **2. Bootstrap — buckets de estado e resultados**
 
 ```
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/bootstrap init
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
 ```
 
@@ -685,10 +696,12 @@ passos seguintes.
 **3. Orçamento — antes de qualquer VM**
 
 ```
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/budget \
   init -backend-config="bucket=<terraform_state_bucket>"
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/budget apply \
   -var="project_id=<seu-projeto>" -var="billing_account_id=<sua-conta>" -var="monthly_budget_usd=<valor>"
 ```
@@ -728,18 +741,27 @@ cp terraform.tfvars.example terraform.tfvars   # preencher project_id, cell, sto
 ```
 
 ```
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/experiment \
   init -backend-config="bucket=<terraform_state_bucket>" -backend-config="prefix=cells/<cell>"
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/experiment plan
-docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/experiment apply   # faturável — confirmar antes
 ```
 
-Depois de medir, `terraform destroy` a célula (o disco/snapshot sobrevive
-fora do ciclo de vida da VM — `infra/scripts/snapshot_after_load.sh`) antes
-de aplicar a próxima, para não pagar por VMs ociosas.
+Depois de medir, `terraform destroy` a célula antes de aplicar a próxima,
+para não pagar por VMs ociosas (o disco/snapshot sobrevive fora do ciclo de
+vida da VM — `infra/scripts/snapshot_after_load.sh`):
+
+```
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment destroy   # faturável-adjacente — confirmar antes
+```
 
 ### Smoke test em nuvem — antes de qualquer bateria real
 
@@ -752,7 +774,9 @@ corretude, dispara uma carga leve (`SMOKE_MODE=true` em
 local), e derruba tudo no final — pensado para pegar problemas antes da
 bateria de medição real (cara, demorada, não deveria precisar ser
 re-executada). Roda no host (usa o `gcloud` do host para SSH via IAP nas
-VMs, todas sem IP público):
+VMs, todas sem IP público) e busca a credencial do Terraform sozinho, do
+Secret Manager, no início — sem precisar do wrapper do item 1 nem de
+nenhum export manual:
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest

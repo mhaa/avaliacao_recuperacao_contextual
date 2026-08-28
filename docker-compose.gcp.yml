@@ -1,16 +1,18 @@
 # Overlay opcional — só para comandos Terraform contra GCP de verdade
 # (Fase 4, README.md). Nunca usado sozinho; sempre combinado com
-# docker-compose.yml:
+# docker-compose.yml, e sempre via infra/scripts/with_terraform_credentials.sh
+# (comandos manuais) ou infra/scripts/cloud_smoke_test.py (orquestrado):
 #
-#   export GCP_TERRAFORM_KEY_PATH=/caminho/fora/do/repo/terraform-key.json
-#   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+#   infra/scripts/with_terraform_credentials.sh <project-id> -- \
+#     docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
 #     run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=..."
 #
-# A chave da service account (gerada por
-# infra/scripts/create_terraform_service_account.sh, que se recusa a
-# escrevê-la dentro do repo) é montada aqui como um único arquivo read-only,
-# nunca copiada para dentro da árvore do Git. GCP_TERRAFORM_KEY_PATH é uma
-# variável de ambiente do shell do host — nunca um .env versionado.
+# A chave da service account fica só no Secret Manager (segredo
+# "tcc-terraform-key", criado por
+# infra/scripts/create_terraform_service_account.sh) — nunca em arquivo
+# permanente. GCP_TERRAFORM_KEY_PATH aponta pra um arquivo temporário que o
+# wrapper busca do Secret Manager e apaga logo depois de cada comando;
+# nunca defina essa variável manualmente/permanentemente.
 
 services:
   tools:
