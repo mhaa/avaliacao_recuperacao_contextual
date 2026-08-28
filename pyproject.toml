@@ -19,6 +19,12 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.12",
     "scikit-posthocs>=0.9",
+    # scikit-posthocs 0.16.0 importa de statsmodels.sandbox.stats.multicomp
+    # (caminho deprecado há anos, removido de vez em statsmodels 0.15.0) —
+    # sem esse teto, um `pip install` novo quebra a importação de
+    # scikit_posthocs inteira. Rever este pin quando uma versão do
+    # scikit-posthocs corrigir o import (statsmodels.stats.multitest).
+    "statsmodels<0.15",
     "matplotlib>=3.8",
 ]
 
