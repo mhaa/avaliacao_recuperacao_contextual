@@ -27,6 +27,66 @@ services:
     volumes:
       - ./data_generation/data:/app/data
 
+  # Ferramentas — roda a suíte de testes do serviço de recuperação
+  # (core/, e storage/, strategies/, harness/ etc. conforme cada etapa for
+  # implementada). Ferramenta de lote, não fica no ar. Uso:
+  #   docker compose run --rm tools                     # camada rápida
+  #   docker compose run --rm tools -m integration ...   # exige bancos no ar
+  tools:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tools
+    container_name: tcc-tools
+    environment:
+      # Mesmas credenciais do serviço postgres abaixo — usadas por
+      # core/registry.py:build_storage para montar o conninfo (nunca vêm
+      # do YAML de cells/, só do ambiente).
+      POSTGRES_USER: tcc
+      POSTGRES_PASSWORD: tcc
+      POSTGRES_DB: recsys
+    volumes:
+      # Somente leitura: dados gerados por `generator` (ver harness/oracle.py
+      # e schemas/postgres/load_oracle_fixture.py), nunca escritos por aqui.
+      - ./data_generation/data:/app/data_generation/data:ro
+      # Leitura e escrita: fixture derivada por load/export_contexts_by_tier.py
+      # (Etapa 7) e saída bruta de load/run_battery.py — visíveis no host,
+      # mesmo princípio do bind mount acima.
+      - ./load/fixtures:/app/load/fixtures
+      - ./results:/app/results
+      # Leitura e escrita: infra/ (Etapa 9) não é copiado no build — o
+      # cache de provedores (.terraform/) e o .terraform.lock.hcl que
+      # `terraform init` gera precisam aparecer no host (o lock file é
+      # versionado; o resto do repositório usa COPY porque não precisa
+      # sobreviver a um único `docker compose run --rm`).
+      - ./infra:/app/infra
+      # Somente leitura: load/run_battery.py lê o hash do commit atual para
+      # cada manifest.json (IMPLEMENTACAO.md, "Coleta de resultados") — a
+      # imagem não copia .git (invalidaria o cache de build a cada commit).
+      - ./.git:/app/.git:ro
+
+  # Serviço de recuperação — só para smoke test local, NUNCA para medição
+  # (mesma regra de todo este arquivo). Uma imagem só, célula escolhida via
+  # CELL (default e1-postgres, a mais simples). Uso:
+  #   docker compose up -d postgres
+  #   docker compose up -d service
+  #   curl -X POST localhost:8000/v1/recommendations -d '{"user_id":1,"context":[],"exclude":[],"k":5}'
+  service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+    container_name: tcc-service
+    environment:
+      CELL: e1-postgres
+      POSTGRES_USER: tcc
+      POSTGRES_PASSWORD: tcc
+      POSTGRES_DB: recsys
+    ports:
+      - "8000:8000"
+      - "50051:50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # BD-1 — relacional orientado a linhas
   postgres:
     image: postgres:16-alpine
@@ -62,8 +122,10 @@ services:
       retries: 10
 
   # BD-2 — chave-valor em memória
-  # Imagem com módulos de busca, necessária para E-2 (predicado no banco).
-  # Se dispensar E-2 no Valkey, troque por valkey/valkey:8-alpine.
+  # Decisão de implementação (ver storage/valkey.py): sem tag oficial
+  # estável de um módulo de busca (RediSearch-equivalente) no momento da
+  # implementação, E-2 e E-4 usam primitivas nativas (HASH/SET, script Lua,
+  # SINTERSTORE) em vez de um módulo — por isso a imagem plain alpine basta.
   valkey:
     image: valkey/valkey:8-alpine
     container_name: tcc-valkey

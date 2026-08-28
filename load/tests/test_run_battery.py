@@ -1,0 +1,58 @@
+"""Testes das funções puras de load/run_battery.py — a execução real do k6
+via subprocess não é testada aqui (mesmo padrão de
+schemas/postgres/load_oracle_fixture.py: scripts de integração/orquestração
+não ganham teste unitário para o `main()`, só para a lógica pura)."""
+
+from __future__ import annotations
+
+import pytest
+
+from load.run_battery import (
+    build_run_plan,
+    list_viable_cell_ids,
+    shuffled_cell_order,
+    target_url_for,
+)
+
+
+def test_list_viable_cell_ids_matches_the_14_yaml_files():
+    ids = list_viable_cell_ids()
+    assert "_defaults" not in ids
+    assert len(ids) == 14
+    assert "e1-postgres" in ids
+    assert "e4-scylla" not in ids  # inviável: sem primitiva de interseção
+    assert "e3-opensearch" not in ids  # inviável: pré-materialização sem sentido
+
+
+def test_shuffled_cell_order_is_deterministic_given_the_same_seed():
+    cell_ids = [f"cell-{i}" for i in range(10)]
+    assert shuffled_cell_order(cell_ids, seed=1) == shuffled_cell_order(cell_ids, seed=1)
+
+
+def test_shuffled_cell_order_differs_across_seeds():
+    cell_ids = [f"cell-{i}" for i in range(10)]
+    assert shuffled_cell_order(cell_ids, seed=1) != shuffled_cell_order(cell_ids, seed=2)
+
+
+def test_shuffled_cell_order_is_a_permutation_not_a_subset():
+    cell_ids = [f"cell-{i}" for i in range(10)]
+    assert sorted(shuffled_cell_order(cell_ids, seed=7)) == sorted(cell_ids)
+
+
+def test_build_run_plan_runs_all_repetitions_of_a_cell_before_the_next():
+    plan = build_run_plan(["a", "b"], repetitions=3)
+    assert plan == [("a", 0), ("a", 1), ("a", 2), ("b", 0), ("b", 1), ("b", 2)]
+
+
+def test_target_url_for_uses_per_cell_mapping_when_given():
+    targets = {"e1-postgres": "http://cell-a", "e2-postgres": "http://cell-b"}
+    assert target_url_for("e1-postgres", None, targets) == "http://cell-a"
+
+
+def test_target_url_for_falls_back_to_shared_url():
+    assert target_url_for("e1-postgres", "http://shared", None) == "http://shared"
+
+
+def test_target_url_for_raises_without_either():
+    with pytest.raises(ValueError):
+        target_url_for("e1-postgres", None, None)

@@ -1,0 +1,6 @@
+id: e3-scylla
+strategy: e3_prematerialized
+storage: scylla
+storage_config:
+  host: scylla
+  port: 9042

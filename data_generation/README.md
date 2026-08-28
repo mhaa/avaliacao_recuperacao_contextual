@@ -1,9 +1,8 @@
 # Gerador de massa de dados — Fase 1 do TCC
 
 Este diretório contém a implementação do gerador de massa de dados usado nos
-experimentos: um pacote Python (em `data_generation/generator/`)
-que roda uma vez, offline, e produz os arquivos carregados nos quatro bancos. 
-A suíte de testes que verifica os critérios de aceitação está em `data_generation/tests/`.
+experimentos, composto de um pacote Python (em `data_generation/generator/`)
+que roda uma vez, offline, e produz os arquivos carregados nos quatro bancos e a suíte de testes que verifica os critérios de aceitação (em `data_generation/tests/`).
 
 ---
 
@@ -87,8 +86,7 @@ sempre ficam registrados ali, sem depender dos valores nominais.
 ## Saída
 
 Todos os artefatos ficam em `data/`, formato Parquet (compressão zstd),
-exceto onde indicado. `data/` inteiro é gerado e está fora do controle de
-versão (`.gitignore` na raiz do repositório).
+exceto onde indicado.
 
 ### `id_maps.parquet` — tradução de IDs
 
@@ -166,7 +164,7 @@ exclusão de sessão é aplicada em tempo de requisição sobre o resultado lido
 armazenar só 20 produziria respostas incompletas depois de excluir itens já
 vistos. Produzido por `generator/artifacts.py`.
 
-### `oracle.parquet` — casos de teste do arnês de correção
+### `oracle.parquet` — verificação de equivalência funcional
 
 Colunas: `case_id`, `user_id`, `context_ids`, `exclude_ids`, `k`,
 `expected_item_ids`, `expected_scores`. 1000 casos, cobrindo os três

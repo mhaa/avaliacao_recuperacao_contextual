@@ -1,0 +1,6 @@
+id: e1-postgres
+strategy: e1_app_filter
+storage: postgres
+storage_config:
+  host: postgres
+  port: 5432

@@ -1,0 +1,6 @@
+id: e2-valkey
+strategy: e2_pushdown
+storage: valkey
+storage_config:
+  host: valkey
+  port: 6379

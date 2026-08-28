@@ -1,0 +1,6 @@
+id: e2-scylla
+strategy: e2_pushdown
+storage: scylla
+storage_config:
+  host: scylla
+  port: 9042

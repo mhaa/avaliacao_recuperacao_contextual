@@ -1,0 +1,6 @@
+id: e3-valkey
+strategy: e3_prematerialized
+storage: valkey
+storage_config:
+  host: valkey
+  port: 6379

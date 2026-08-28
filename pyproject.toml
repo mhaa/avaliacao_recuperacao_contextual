@@ -1,0 +1,41 @@
+[project]
+name = "recsys-retrieval"
+version = "0.1.0"
+description = "Serviço de recuperação contextual — comparação de estratégias e bancos (TCC)"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "psycopg[binary]>=3.1",
+    "polars>=1.9",
+    "pyarrow>=17.0",
+    "valkey>=6.0",
+    "cassandra-driver>=3.29",
+    "opensearch-py>=2.6",
+    "pyyaml>=6.0",
+    "fastapi>=0.115",
+    "hypercorn>=0.17",
+    "grpcio>=1.60",
+    "protobuf>=4.25",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "scikit-posthocs>=0.9",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27", "grpcio-tools>=1.60"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["core", "storage", "strategies", "harness", "service", "service.proto", "load", "analysis"]
+
+[tool.pytest.ini_options]
+# Cresce junto com "packages" acima, conforme as próximas etapas.
+testpaths = ["core/tests", "storage/tests", "strategies/tests", "harness/tests", "cells/tests", "service/tests", "load/tests", "analysis/tests", "tests/acceptance"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires a running database, a generated data file (data_generation/data/), or a live service",
+]

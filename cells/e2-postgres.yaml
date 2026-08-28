@@ -1,0 +1,6 @@
+id: e2-postgres
+strategy: e2_pushdown
+storage: postgres
+storage_config:
+  host: postgres
+  port: 5432

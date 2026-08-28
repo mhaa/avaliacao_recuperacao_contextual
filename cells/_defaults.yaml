@@ -1,0 +1,9 @@
+# Comum a todas as células — cada cells/<id>.yaml sobrepõe só o que muda.
+# Valores fixos do desenho experimental (ver CONTEXTO.md, "Parâmetros fixos").
+cache: none
+transport: http1
+params:
+  n_candidates: 500
+  k: 20
+  prematerialized_m: 40
+  exclusion_size: 20

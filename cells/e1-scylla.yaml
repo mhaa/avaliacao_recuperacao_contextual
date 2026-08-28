@@ -1,0 +1,6 @@
+id: e1-scylla
+strategy: e1_app_filter
+storage: scylla
+storage_config:
+  host: scylla
+  port: 9042

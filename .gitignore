@@ -5,7 +5,7 @@ CLAUDE.local.md
 .mcp.json
 CONTEXTO.md
 CLAUDE.md
-
+IMPLEMENTACAO.md
 
 # data_generation — dados gerados/baixados e ambiente virtual, nunca versionados
 data_generation/data/
@@ -14,3 +14,23 @@ data_generation/*.egg-info/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# load/fixtures — derivado de data_generation/data/ por
+# load/export_contexts_by_tier.py, regenerável, nunca versionado.
+load/fixtures/*
+!load/fixtures/.gitkeep
+
+# results/ — saída bruta de load/run_battery.py (IMPLEMENTACAO.md,
+# "Coleta de resultados"): git-ignored exceto .gitkeep.
+results/*
+!results/.gitkeep
+
+# infra/ (Terraform, Etapa 9) — cache de provedores, estado (mesmo o local
+# de infra/bootstrap) e variáveis reais nunca são versionados.
+# .terraform.lock.hcl FICA versionado (IMPLEMENTACAO.md) — não entra aqui.
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/.terraform.tfstate.lock.info
+infra/**/terraform.tfvars
+!infra/**/terraform.tfvars.example

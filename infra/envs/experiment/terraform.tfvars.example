@@ -1,0 +1,12 @@
+# Copie para terraform.tfvars e preencha com valores reais.
+# terraform.tfvars NUNCA é commitado (ver .gitignore) — só este .example,
+# com placeholders (IMPLEMENTACAO.md: "Nenhum segredo em código ou em
+# .tfvars versionado").
+
+project_id    = "your-gcp-project-id"
+region        = "us-central1"
+zone          = "us-central1-a"
+cell          = "e1-postgres"
+storage       = "postgres"
+service_image = "us-central1-docker.pkg.dev/your-gcp-project-id/tcc/service:latest"
+tools_image   = "us-central1-docker.pkg.dev/your-gcp-project-id/tcc/tools:latest"

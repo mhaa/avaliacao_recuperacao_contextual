@@ -1,0 +1,6 @@
+id: e4-opensearch
+strategy: e4_intersection
+storage: opensearch
+storage_config:
+  host: opensearch
+  port: 9200

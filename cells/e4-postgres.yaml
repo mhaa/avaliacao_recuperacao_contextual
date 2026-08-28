@@ -1,0 +1,6 @@
+id: e4-postgres
+strategy: e4_intersection
+storage: postgres
+storage_config:
+  host: postgres
+  port: 5432

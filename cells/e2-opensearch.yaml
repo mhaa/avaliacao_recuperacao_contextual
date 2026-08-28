@@ -1,0 +1,6 @@
+id: e2-opensearch
+strategy: e2_pushdown
+storage: opensearch
+storage_config:
+  host: opensearch
+  port: 9200

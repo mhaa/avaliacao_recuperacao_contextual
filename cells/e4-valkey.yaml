@@ -1,0 +1,6 @@
+id: e4-valkey
+strategy: e4_intersection
+storage: valkey
+storage_config:
+  host: valkey
+  port: 6379

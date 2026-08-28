@@ -1,0 +1,6 @@
+id: e1-valkey
+strategy: e1_app_filter
+storage: valkey
+storage_config:
+  host: valkey
+  port: 6379

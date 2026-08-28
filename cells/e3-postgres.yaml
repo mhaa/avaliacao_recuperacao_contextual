@@ -1,0 +1,6 @@
+id: e3-postgres
+strategy: e3_prematerialized
+storage: postgres
+storage_config:
+  host: postgres
+  port: 5432

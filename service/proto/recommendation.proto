@@ -1,0 +1,29 @@
+// Contrato de recuperação para T-C (HTTP/2 + Protobuf). Espelha
+// core/contract.py campo a campo — sem metadados descritivos, mesmo
+// orçamento de payload (~800 bytes) do contrato HTTP/JSON.
+
+syntax = "proto3";
+
+package recommendation;
+
+message Request {
+  int64 user_id = 1;
+  repeated int64 context = 2;
+  repeated int64 exclude = 3;
+  int32 k = 4;
+}
+
+message ResponseItem {
+  int64 item_id = 1;
+  float score = 2;
+  int32 rank = 3;
+}
+
+message Response {
+  repeated ResponseItem items = 1;
+  int32 returned_count = 2;
+}
+
+service Recommendation {
+  rpc Retrieve(Request) returns (Response);
+}

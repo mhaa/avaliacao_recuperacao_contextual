@@ -1,0 +1,6 @@
+id: e1-opensearch
+strategy: e1_app_filter
+storage: opensearch
+storage_config:
+  host: opensearch
+  port: 9200
