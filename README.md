@@ -597,7 +597,7 @@ docker compose build tools   # inclui o binário do Terraform (hashicorp/terrafo
 
 docker compose run --rm --entrypoint terraform tools fmt -check -recursive -diff infra/
 
-for dir in bootstrap modules/network modules/database modules/service modules/loadgen envs/experiment envs/budget; do
+for dir in bootstrap modules/network modules/database modules/service modules/loadgen modules/budget_killswitch envs/experiment envs/budget; do
   docker compose run --rm --entrypoint terraform tools -chdir=infra/$dir init -backend=false
   docker compose run --rm --entrypoint terraform tools -chdir=infra/$dir validate
 done
@@ -626,7 +626,10 @@ de latência (p95/p99/p99.9) que o estudo mede.
 **0. Pré-requisitos manuais (fora deste repositório)**
 - Criar um projeto GCP e vincular uma conta de faturamento.
 - Habilitar as APIs: Compute Engine, Cloud Storage, Secret Manager,
-  Artifact Registry, Cloud Billing Budget, IAM, Identity-Aware Proxy.
+  Artifact Registry, Cloud Billing Budget, IAM, Identity-Aware Proxy,
+  Cloud Functions, Cloud Run Admin, Eventarc, Pub/Sub, Cloud Build, Cloud
+  Billing (as seis últimas só por causa da trava de segurança do
+  orçamento — ver subseção depois do passo 3).
 - `gcloud auth login` na máquina host (fora de qualquer container — os
   scripts abaixo usam o `gcloud` do host, não o do container `tools`, que
   só tem `terraform` e `k6`).
@@ -655,9 +658,15 @@ falhar no meio). Concede os papéis mínimos que os recursos reais de
 `roles/iam.serviceAccountUser` (a SA de runtime que
 `infra/modules/service/` cria para a própria VM de serviço),
 `roles/resourcemanager.projectIamAdmin` (a concessão de
-`secretmanager.secretAccessor` a essa SA), e `roles/billing.admin` na
-conta de faturamento (`google_billing_budget` exige isso separadamente,
-fora do projeto).
+`secretmanager.secretAccessor` a essa SA, e também a de
+`roles/billing.projectManager` à SA da trava de segurança abaixo), e
+`roles/billing.admin` na conta de faturamento (`google_billing_budget`
+exige isso separadamente, fora do projeto). Mais quatro papéis —
+`roles/cloudfunctions.admin`, `roles/run.admin`, `roles/eventarc.admin`,
+`roles/pubsub.admin` — só por causa da Cloud Function da trava de
+segurança de orçamento (`infra/modules/budget_killswitch/`, subseção
+depois do passo 3): Gen2 builda sobre Cloud Run e dispara via Eventarc a
+partir de um tópico Pub/Sub.
 
 Para rodar Terraform de verdade depois, use
 `infra/scripts/with_terraform_credentials.sh` — ele busca a chave do
@@ -703,8 +712,63 @@ infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/budget apply \
-  -var="project_id=<seu-projeto>" -var="billing_account_id=<sua-conta>" -var="monthly_budget_usd=<valor>"
+  -var="project_id=<seu-projeto>" -var="billing_account_id=<sua-conta>" -var="monthly_budget_usd=<valor>" \
+  -var="function_source_bucket=<saída de bootstrap: function_source_bucket>"
 ```
+
+`killswitch_dry_run` não precisa ser passado aqui — o default é `true` (ver
+subseção abaixo).
+
+**Trava de segurança de orçamento (Cloud Function)**
+
+Além do e-mail de alerta padrão, o `apply` acima cria também
+`module.budget_killswitch` (`infra/modules/budget_killswitch/`): um
+tópico Pub/Sub associado ao orçamento (`all_updates_rule`) e uma Cloud
+Function que reage a ele. A partir de 120% do orçamento
+(`threshold_rules { threshold_percent = 1.2, spend_basis =
+"CURRENT_SPEND" }`, separado do alerta informativo de 100% já existente),
+a function **desliga o billing do projeto inteiro**
+(`projects.updateBillingInfo` com `billing_account_name=""`) — não só as
+VMs que o Terraform conhece, mas qualquer recurso que gere custo no
+projeto. A GCE força a parada das VMs quando o billing cai, então isso
+cumpre o "desliga tudo" da forma mais abrangente possível.
+
+É uma exceção deliberada ao "Compute Engine, não Cloud Run" do início
+desta fase: essa Cloud Function é ferramenta auxiliar de operação, nunca
+participa do caminho medido, então autoscaling/cold start dela são
+irrelevantes para a cauda de latência do estudo.
+
+`killswitch_dry_run` (variável de `infra/envs/budget`, repassada a
+`module.budget_killswitch`) tem **default `true`**: a function só loga
+"desligaria o billing agora" e para, nunca chama a API de verdade. O
+`apply` acima, portanto, nunca arma uma trava que já corta billing por
+acidente — virar `killswitch_dry_run=false` é uma decisão separada,
+feita só depois de validar o fluxo:
+
+```
+# 1. Com killswitch_dry_run=true (default), publicar uma notificação
+#    sintética de 120% no tópico e confirmar no log da function que ela
+#    reconheceu o limiar sem desligar nada de verdade:
+gcloud pubsub topics publish tcc-budget-alerts \
+  --project=<seu-projeto> \
+  --message="$(echo -n '{"costAmount":240,"budgetAmount":200,"currencyCode":"USD"}' | base64)"
+gcloud functions logs read tcc-budget-killswitch --project=<seu-projeto> --region=<região> --gen2
+
+# 2. Só depois de confirmar o log acima, reaplicar com a trava armada
+#    de verdade — QUALQUER disparo real a partir daqui desliga o billing:
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/envs/budget apply \
+  -var="project_id=<seu-projeto>" -var="billing_account_id=<sua-conta>" -var="monthly_budget_usd=<valor>" \
+  -var="function_source_bucket=<function_source_bucket>" -var="killswitch_dry_run=false"
+```
+
+**Recuperação depois de um disparo real**: religar a conta de faturamento
+(`gcloud billing projects link <seu-projeto> --billing-account=<sua-conta>`
+ou pelo Console) e conferir manualmente o estado das VMs (`gcloud compute
+instances list`) antes de retomar qualquer medição — desligar o billing
+não deleta recursos, só os coloca em estado inconsistente até o billing
+voltar.
 
 **4. Imagens — build e push para o Artifact Registry**
 

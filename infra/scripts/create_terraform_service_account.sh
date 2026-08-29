@@ -33,12 +33,24 @@ gcloud iam service-accounts create "$SA_ID" \
 
 # Papéis mínimos exigidos pelos recursos reais em infra/ — ver o plano de
 # implementação para o mapeamento módulo -> papel.
+#
+# Os últimos quatro (cloudfunctions/run/eventarc/pubsub .admin) só existem
+# por causa de infra/modules/budget_killswitch/ (Cloud Function Gen2 —
+# builda sobre Cloud Run, dispara via Eventarc a partir de um tópico
+# Pub/Sub). Esse conjunto é o recomendado pelo Google para quem faz o
+# deploy de uma function Gen2, mas NÃO foi validado contra um
+# `terraform apply` real ainda — se faltar algum papel, o próprio erro do
+# apply aponta qual API está faltando.
 ROLES=(
   "roles/compute.admin"
   "roles/storage.admin"
   "roles/iam.serviceAccountAdmin"
   "roles/iam.serviceAccountUser"
   "roles/resourcemanager.projectIamAdmin"
+  "roles/cloudfunctions.admin"
+  "roles/run.admin"
+  "roles/eventarc.admin"
+  "roles/pubsub.admin"
 )
 for ROLE in "${ROLES[@]}"; do
   echo "Concedendo ${ROLE} no projeto ${PROJECT_ID}..."

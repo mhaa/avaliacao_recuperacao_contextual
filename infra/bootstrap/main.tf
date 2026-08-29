@@ -82,6 +82,23 @@ resource "google_storage_bucket" "results" {
   }
 }
 
+# Zip de origem da Cloud Function da trava de segurança de orçamento
+# (infra/modules/budget_killswitch/main.tf) — bucket próprio, separado do
+# de state, pra não misturar propósitos. Sem versioning: cada apply sobe
+# um objeto novo nomeado pelo hash do zip (google_storage_bucket_object
+# em budget_killswitch/main.tf), nunca sobrescreve o anterior.
+resource "google_storage_bucket" "function_source" {
+  name                        = "${var.project_id}-tcc-functions"
+  location                    = var.region
+  uniform_bucket_level_access = true
+
+  labels = {
+    project    = "tcc-recsys-retrieval"
+    phase      = "bootstrap"
+    managed_by = "terraform"
+  }
+}
+
 output "terraform_state_bucket" {
   description = "Nome do bucket a passar em -backend-config=\"bucket=...\" nos envs/*."
   value       = google_storage_bucket.terraform_state.name
@@ -90,4 +107,9 @@ output "terraform_state_bucket" {
 output "results_bucket" {
   description = "Nome do bucket onde os resultados coletados (results/) devem ser enviados."
   value       = google_storage_bucket.results.name
+}
+
+output "function_source_bucket" {
+  description = "Nome do bucket para o zip da Cloud Function da trava de segurança — passar em -var=\"function_source_bucket=...\" em envs/budget."
+  value       = google_storage_bucket.function_source.name
 }

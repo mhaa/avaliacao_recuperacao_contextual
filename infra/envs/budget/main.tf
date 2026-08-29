@@ -11,6 +11,10 @@ terraform {
       source  = "hashicorp/google-beta"
       version = "~> 5.0"
     }
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
   }
   backend "gcs" {
     # bucket via -backend-config; prefix fixo "budget" (não varia por célula).
@@ -41,8 +45,41 @@ variable "monthly_budget_usd" {
   }
 }
 
+variable "region" {
+  type        = string
+  description = "Região da Cloud Function da trava de segurança (module.budget_killswitch)."
+  default     = "us-central1"
+}
+
+variable "function_source_bucket" {
+  type        = string
+  description = "Bucket para o zip da Cloud Function da trava — output do bootstrap: function_source_bucket."
+}
+
+variable "killswitch_dry_run" {
+  type        = bool
+  description = "Repassado a module.budget_killswitch — true (default) até a trava ser validada de propósito (ver README.md)."
+  default     = true
+}
+
 provider "google-beta" {
   project = var.project_id
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# Trava de segurança: Cloud Function acionada pelo tópico Pub/Sub abaixo,
+# desliga o billing do projeto se o gasto cruzar 120% (threshold_rules
+# abaixo). Ver infra/modules/budget_killswitch/main.tf.
+module "budget_killswitch" {
+  source                 = "../../modules/budget_killswitch"
+  project_id             = var.project_id
+  region                 = var.region
+  function_source_bucket = var.function_source_bucket
+  killswitch_dry_run     = var.killswitch_dry_run
 }
 
 resource "google_billing_budget" "experiment" {
@@ -69,5 +106,21 @@ resource "google_billing_budget" "experiment" {
   }
   threshold_rules {
     threshold_percent = 1.0
+  }
+  # Limiar dedicado da trava de segurança — separado do alerta
+  # informativo de 100% acima. CURRENT_SPEND (não FORECASTED_SPEND): a
+  # trava só deve agir sobre gasto que já aconteceu, não sobre projeção.
+  threshold_rules {
+    threshold_percent = 1.2
+    spend_basis       = "CURRENT_SPEND"
+  }
+
+  # Publica toda mudança de threshold no tópico do module.budget_killswitch
+  # — a function decide sozinha (function_src/main.py: KILL_THRESHOLD) se
+  # a notificação corresponde ao limiar de 120% ou é só um dos alertas de
+  # 50/90/100% informativos. disable_default_iam_recipients não é setado
+  # (fica false): o e-mail de alerta padrão continua chegando também.
+  all_updates_rule {
+    pubsub_topic = module.budget_killswitch.topic_id
   }
 }

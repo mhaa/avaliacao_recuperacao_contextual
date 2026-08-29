@@ -35,6 +35,10 @@ infra/**/.terraform.tfstate.lock.info
 infra/**/terraform.tfvars
 !infra/**/terraform.tfvars.example
 
+# Zip gerado por data.archive_file (budget_killswitch) a cada
+# init/plan/apply — build artifact, não código-fonte.
+infra/**/function_src.zip
+
 # Chave da service account do Terraform (Fase 4) — NUNCA deveria existir
 # dentro do repo (infra/scripts/create_terraform_service_account.sh gera a
 # chave fora da árvore do Git de propósito e se recusa a escrever aqui),
