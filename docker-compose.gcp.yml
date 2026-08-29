@@ -7,16 +7,16 @@
 #     docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
 #     run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=..."
 #
-# A chave da service account fica só no Secret Manager (segredo
-# "tcc-terraform-key", criado por
-# infra/scripts/create_terraform_service_account.sh) — nunca em arquivo
-# permanente. GCP_TERRAFORM_KEY_PATH aponta pra um arquivo temporário que o
-# wrapper busca do Secret Manager e apaga logo depois de cada comando;
-# nunca defina essa variável manualmente/permanentemente.
+# Nenhuma chave de service account existe em lugar nenhum (bloqueada pela
+# política de organização desta conta, e desnecessária de qualquer forma):
+# o wrapper minta um token de acesso de curta duração via impersonação
+# (roles/iam.serviceAccountTokenCreator, concedido por
+# infra/scripts/create_terraform_service_account.sh) e passa como
+# GOOGLE_OAUTH_ACCESS_TOKEN — o provider `google` do Terraform usa esse
+# token diretamente, sem nenhum arquivo montado. Nunca defina essa
+# variável manualmente/permanentemente.
 
 services:
   tools:
     environment:
-      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-terraform-key.json
-    volumes:
-      - ${GCP_TERRAFORM_KEY_PATH:?defina GCP_TERRAFORM_KEY_PATH com o caminho da chave, fora do repo}:/run/secrets/gcp-terraform-key.json:ro
+      - GOOGLE_OAUTH_ACCESS_TOKEN

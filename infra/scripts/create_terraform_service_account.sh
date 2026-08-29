@@ -4,14 +4,16 @@
 # (usa `gcloud` diretamente), não dentro do container `tools`, que não tem
 # o gcloud CLI instalado.
 #
-# Segurança (decisão explícita do usuário: credenciais nunca vão para o
-# GitHub, e nem devem persistir indefinidamente em disco local): a chave
-# gerada é guardada no Secret Manager (segredo "tcc-terraform-key") e a
-# cópia local temporária usada só pra fazer o upload é apagada logo em
-# seguida. Rodar Terraform de verdade depois exige buscar essa chave de
-# novo, sob demanda, via infra/scripts/with_terraform_credentials.sh — que
-# a materializa num arquivo temporário só pela duração de um comando e
-# apaga depois. Nunca fica um arquivo de chave permanente em lugar nenhum.
+# Segurança: nenhuma chave de longa duração é gerada. A política de
+# organização desta conta (constraints/iam.disableServiceAccountKeyCreation,
+# herdada, não configurável neste projeto) bloqueia
+# `gcloud iam service-accounts keys create` de qualquer forma — o que
+# acabou sendo a opção certa mesmo sem essa restrição: em vez de uma chave
+# JSON, a conta pessoal do operador (quem roda este script) ganha
+# `roles/iam.serviceAccountTokenCreator` sobre esta SA, e passa a poder
+# IMPERSONÁ-LA sob demanda (tokens de acesso de curta duração, ~1h, nunca
+# persistidos em disco) via infra/scripts/with_terraform_credentials.sh —
+# nunca um arquivo de credencial de longa duração em lugar nenhum.
 #
 # Uso: infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id>
 # Exemplo: infra/scripts/create_terraform_service_account.sh meu-projeto 012345-6789AB-CDEF01
@@ -23,7 +25,7 @@ BILLING_ACCOUNT_ID="${2:?uso: create_terraform_service_account.sh <project-id> <
 
 SA_ID="terraform-tcc"
 SA_EMAIL="${SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
-SECRET_ID="tcc-terraform-key"
+OPERATOR="$(gcloud config get-value account 2>/dev/null)"
 
 echo "Criando service account ${SA_EMAIL}..."
 gcloud iam service-accounts create "$SA_ID" \
@@ -71,37 +73,24 @@ gcloud billing accounts add-iam-policy-binding "$BILLING_ACCOUNT_ID" \
   --role="roles/billing.admin" \
   --quiet
 
-# Arquivo temporário só para o upload — nunca o destino final da chave.
-# `mktemp` nunca resolve dentro deste repositório, então não precisa de
-# checagem extra (ao contrário da versão anterior deste script).
-TMP_KEY="$(mktemp)"
-trap 'rm -f "$TMP_KEY"' EXIT
-
-echo "Gerando chave..."
-gcloud iam service-accounts keys create "$TMP_KEY" \
-  --iam-account="$SA_EMAIL"
-
-echo "Guardando a chave no Secret Manager (segredo '${SECRET_ID}')..."
-if gcloud secrets describe "$SECRET_ID" --project="$PROJECT_ID" >/dev/null 2>&1; then
-  gcloud secrets versions add "$SECRET_ID" \
-    --project="$PROJECT_ID" \
-    --data-file="$TMP_KEY"
-else
-  gcloud secrets create "$SECRET_ID" \
-    --project="$PROJECT_ID" \
-    --replication-policy=automatic \
-    --data-file="$TMP_KEY"
-fi
+# Permite que a conta pessoal do operador (você, autenticado via
+# `gcloud auth login`) impersone esta SA — é assim que o Terraform vai
+# atuar como ela sem nenhuma chave existir em lugar nenhum.
+echo "Concedendo iam.serviceAccountTokenCreator a ${OPERATOR} sobre ${SA_EMAIL}..."
+gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+  --project="$PROJECT_ID" \
+  --member="user:${OPERATOR}" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --quiet
 
 echo
-echo "Pronto. A chave está no Secret Manager, não em nenhum arquivo local"
-echo "(o temporário usado pra subir foi apagado)."
+echo "Pronto. Nenhuma chave foi criada — nenhum arquivo de credencial de"
+echo "longa duração existe em lugar nenhum, nem local nem no Secret Manager."
 echo
-echo "Para rodar Terraform de verdade, use o wrapper que busca a chave sob"
-echo "demanda e apaga depois de cada comando:"
+echo "Para rodar Terraform de verdade, use o wrapper que minta um token de"
+echo "acesso por impersonação (válido por ~1h) só pela duração de cada comando:"
 echo "  infra/scripts/with_terraform_credentials.sh $PROJECT_ID -- <comando docker compose>"
 echo
-echo "Quando o trabalho de campo terminar, revogue a chave e delete o secret:"
-echo "  gcloud iam service-accounts keys list --iam-account=$SA_EMAIL"
-echo "  gcloud iam service-accounts keys delete <KEY_ID> --iam-account=$SA_EMAIL"
-echo "  gcloud secrets delete $SECRET_ID --project=$PROJECT_ID"
+echo "Quando o trabalho de campo terminar, revogue a impersonação:"
+echo "  gcloud iam service-accounts remove-iam-policy-binding $SA_EMAIL \\"
+echo "    --member=user:$OPERATOR --role=roles/iam.serviceAccountTokenCreator"

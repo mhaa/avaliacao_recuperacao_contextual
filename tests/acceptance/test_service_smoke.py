@@ -9,6 +9,10 @@ Exige, antes de rodar (mesma massa da suíte do harness):
     docker compose run --rm --entrypoint python tools schemas/postgres/load_oracle_fixture.py
     docker compose up -d service
     docker compose run --rm tools -m integration tests/acceptance/test_service_smoke.py -v
+
+Também é o Gate 2 do smoke test em nuvem (infra/scripts/cloud_smoke_test.py,
+build_remote_smoke_script) — mesma lógica, só que TEST_SERVICE_URL aponta
+para o IP interno da VM de serviço da célula em vez de `service:8000`.
 """
 
 from __future__ import annotations

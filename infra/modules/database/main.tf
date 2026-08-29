@@ -78,7 +78,7 @@ locals {
     postgres   = "-p 5432:5432 -v /mnt/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -c shared_buffers=1GB -c work_mem=64MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
     valkey     = "-p 6379:6379 --save \"\" --appendonly no --maxmemory 24gb --maxmemory-policy noeviction"
     scylla     = "-p 9042:9042 -v /mnt/data:/var/lib/scylla --smp 1 --memory 2G --overprovisioned 1 --developer-mode 1 --skip-wait-for-gossip-to-settle 0"
-    opensearch = "-p 9200:9200 -v /mnt/data:/usr/share/opensearch/data -e discovery.type=single-node -e bootstrap.memory_lock=true -e OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+    opensearch = "-p 9200:9200 -v /mnt/data:/usr/share/opensearch/data -e discovery.type=single-node -e bootstrap.memory_lock=true -e OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g -e DISABLE_SECURITY_PLUGIN=true"
   }
 }
 

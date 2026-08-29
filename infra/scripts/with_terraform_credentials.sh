@@ -1,12 +1,13 @@
 #!/bin/bash
-# Busca a chave da service account do Terraform no Secret Manager
-# (segredo "tcc-terraform-key", criado por
-# infra/scripts/create_terraform_service_account.sh) para um arquivo
-# temporário, roda o comando dado com GCP_TERRAFORM_KEY_PATH apontando
-# pra ele, e apaga o arquivo depois — mesmo se o comando falhar. Usa a
-# sessão pessoal do operador (`gcloud auth login`) pra ler o secret, não a
-# própria service account do Terraform (seria circular: ela não pode ler a
-# própria chave para se autenticar).
+# Minta um token de acesso de curta duração (~1h) impersonando a service
+# account do Terraform (terraform-tcc@<project-id>.iam.gserviceaccount.com,
+# criada por infra/scripts/create_terraform_service_account.sh) e roda o
+# comando dado com GOOGLE_OAUTH_ACCESS_TOKEN apontando pra ele — nunca
+# nenhum arquivo de credencial, nem temporário nem permanente. Usa a
+# sessão pessoal do operador (`gcloud auth login`) para mintar o token via
+# impersonação; exige que essa conta tenha sido concedida
+# roles/iam.serviceAccountTokenCreator sobre a SA
+# (create_terraform_service_account.sh já faz isso).
 #
 # Uso: infra/scripts/with_terraform_credentials.sh <project-id> -- <comando>
 # Exemplo:
@@ -28,9 +29,6 @@ if [[ $# -eq 0 ]]; then
   exit 1
 fi
 
-TMP_KEY="$(mktemp)"
-trap 'rm -f "$TMP_KEY"' EXIT
+SA_EMAIL="terraform-tcc@${PROJECT_ID}.iam.gserviceaccount.com"
 
-gcloud secrets versions access latest --secret=tcc-terraform-key --project="$PROJECT_ID" > "$TMP_KEY"
-
-GCP_TERRAFORM_KEY_PATH="$TMP_KEY" "$@"
+GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token --impersonate-service-account="$SA_EMAIL")" "$@"

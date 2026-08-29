@@ -614,47 +614,71 @@ done
 
 Passo a passo real, com credenciais e recursos faturáveis — cada `apply`
 abaixo custa dinheiro e exige confirmação explícita antes de rodar.
+O google fornece um budget de $300 para testar a plataforma.
 
-**Compute Engine, não Cloud Run.** A camada de serviço roda em VM
-(`infra/modules/service/`), não em execução serverless — está fora de
-escopo do projeto (`CLAUDE.md`: "serverless execution"), e é consistente
-com `infra/modules/database/` já rodando a mesma imagem Docker do
-`docker-compose.yml` local em vez de um banco gerenciado. Autoscaling e
-cold starts de uma plataforma serverless contaminariam justamente a cauda
+Aqui será utilizado o **Compute Engine e não o Cloud Run.** A camada de serviço roda em VM
+(`infra/modules/service/`), não em execução serverless. Autoscaling e
+cold starts de uma plataforma serverless contaminariam a cauda
 de latência (p95/p99/p99.9) que o estudo mede.
 
 **0. Pré-requisitos manuais (fora deste repositório)**
 - Criar um projeto GCP e vincular uma conta de faturamento.
+- Instalar `Google Cloud CLI` na máquina host e executar no terminal `gcloud auth login` .
 - Habilitar as APIs: Compute Engine, Cloud Storage, Secret Manager,
-  Artifact Registry, Cloud Billing Budget, IAM, Identity-Aware Proxy,
+  Artifact Registry, Cloud Billing Budget, IAM, Identity-Aware Proxy, Cloud Resource Manager API,
   Cloud Functions, Cloud Run Admin, Eventarc, Pub/Sub, Cloud Build, Cloud
   Billing (as seis últimas só por causa da trava de segurança do
   orçamento — ver subseção depois do passo 3).
-- `gcloud auth login` na máquina host (fora de qualquer container — os
-  scripts abaixo usam o `gcloud` do host, não o do container `tools`, que
-  só tem `terraform` e `k6`).
+```
+gcloud services enable \
+  compute.googleapis.com storage.googleapis.com secretmanager.googleapis.com \
+  artifactregistry.googleapis.com billingbudgets.googleapis.com iam.googleapis.com \
+  iap.googleapis.com cloudresourcemanager.googleapis.com \
+  cloudfunctions.googleapis.com run.googleapis.com eventarc.googleapis.com \
+  pubsub.googleapis.com cloudbuild.googleapis.com cloudbilling.googleapis.com \
+  --project=<project-id>
+```
 
-**1. Credencial do Terraform — nunca persiste em disco, nem fora do repositório**
+| API | Papel neste projeto |
+|---|---|
+| Compute Engine | VMs de banco/serviço/loadgen de cada célula (`infra/modules/{database,service,loadgen}`). |
+| Cloud Storage | Bucket de estado do Terraform e de resultados (`infra/bootstrap`), e o bucket do zip de código-fonte da Cloud Function (`function_source_bucket`). |
+| Secret Manager | Guarda a senha do Postgres (`tcc-postgres-password`) — nunca em arquivo permanente. A credencial do Terraform não usa Secret Manager: é impersonação (IAM), sem chave nenhuma. |
+| Artifact Registry | Onde `build_and_push_images.sh` publica as imagens `service` e `tools`. |
+| Cloud Billing Budget | Cria o orçamento (`google_billing_budget`) com os alertas de 50/90/100% e a `all_updates_rule` que publica cada atualização de gasto no tópico Pub/Sub da trava de segurança. |
+| IAM | Cria e concede papéis às service accounts: a do Terraform, a de cada VM de serviço, e a da Cloud Function (`tcc-budget-killswitch`). |
+| Identity-Aware Proxy | Túnel SSH para as VMs sem IP público (`gcloud compute ssh --tunnel-through-iap`, usado em `cloud_smoke_test.py` e nas operações manuais). |
+| Cloud Resource Manager | Operações no nível do projeto — `google_project_iam_member` e os comandos `gcloud projects`/`billing projects`. |
+| Cloud Functions | A trava de segurança em si: `google_cloudfunctions2_function.budget_killswitch` (`infra/modules/budget_killswitch/main.tf`). |
+| Cloud Run Admin | Cloud Functions de 2ª geração roda por baixo como um serviço Cloud Run — exigida mesmo sem uso direto de Cloud Run. |
+| Eventarc | Implementa o `event_trigger` da function — entrega as mensagens do tópico Pub/Sub para ela. |
+| Pub/Sub | O tópico `tcc-budget-alerts`: o orçamento publica, a function assina. |
+| Cloud Build | Empacota `function_src/main.py` ao fazer deploy da function a partir de código-fonte. |
+| Cloud Billing | O código da function (`billing_v1.CloudBillingClient()`) lê e, se precisar, desliga o billing do projeto; também usada pelos comandos `gcloud billing` manuais. |
 
-O Terraform roda dentro do container `tools`, que precisa de uma
-credencial GCP. Em vez de montar as credenciais pessoais do usuário
-(`~/.config/gcloud`, que dá dor de cabeça no Docker Desktop/Windows e
-mistura identidade pessoal com automação) ou de gerar um arquivo de chave
-permanente em algum lugar do disco, uma service account dedicada é criada
-e sua chave vai **direto para o Secret Manager** — nunca um arquivo de
-chave de longa duração em lugar nenhum, nem dentro do repositório, nem
-fora dele:
+**1. Criação de "Service Account" para o Terraform — nunca uma chave, nem no repositório nem fora dele**
+
+O Terraform é responsável por provisionar e gerenciar toda a infraestrutura real deste projeto na nuvem — os buckets de estado e de resultados (passo 2), o orçamento e sua trava de segurança (passo 3), e as VMs de banco, serviço e loadgen de cada célula (passo 6) — e por isso precisa de uma identidade própria no GCP para realizar isso. O Terraform roda dentro do container `tools`.
+Execute:
 
 ```
 infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id>
 ```
 
-O script gera a chave num arquivo temporário só para o upload, sobe pro
-segredo `tcc-terraform-key` via `gcloud secrets create`/`versions add`, e
-apaga o temporário na sequência (`trap ... EXIT`, roda mesmo se algo
-falhar no meio). Concede os papéis mínimos que os recursos reais de
-`infra/` exigem: `roles/compute.admin` (VMs e rede), `roles/storage.admin`
-(buckets do bootstrap), `roles/iam.serviceAccountAdmin` +
+**Nenhuma chave é gerada.** A política de organização desta conta
+(`constraints/iam.disableServiceAccountKeyCreation`, herdada, não
+sobrescrevível neste projeto sem privilégios de admin da organização —
+confirmado na prática) bloqueia `gcloud iam service-accounts keys create`
+de qualquer forma. Em vez disso, o script concede sua conta pessoal
+(`gcloud config get-value account`) o papel `roles/iam.serviceAccountTokenCreator`
+sobre a SA — o que permite **impersoná-la** sob demanda, mintando tokens de
+acesso de curta duração (~1h) só quando necessário. Mais simples que
+Workload Identity Federation (não exige provedor de identidade externo) e
+sem nenhum arquivo de credencial em lugar nenhum.
+
+Além disso, concede os papéis mínimos que os recursos reais de `infra/`
+exigem à própria SA `terraform-tcc`: `roles/compute.admin` (VMs e rede),
+`roles/storage.admin` (buckets do bootstrap), `roles/iam.serviceAccountAdmin` +
 `roles/iam.serviceAccountUser` (a SA de runtime que
 `infra/modules/service/` cria para a própria VM de serviço),
 `roles/resourcemanager.projectIamAdmin` (a concessão de
@@ -665,15 +689,15 @@ exige isso separadamente, fora do projeto). Mais quatro papéis —
 `roles/cloudfunctions.admin`, `roles/run.admin`, `roles/eventarc.admin`,
 `roles/pubsub.admin` — só por causa da Cloud Function da trava de
 segurança de orçamento (`infra/modules/budget_killswitch/`, subseção
-depois do passo 3): Gen2 builda sobre Cloud Run e dispara via Eventarc a
+depois do passo 3): Gen2 faz o build sobre Cloud Run e dispara via Eventarc a
 partir de um tópico Pub/Sub.
 
 Para rodar Terraform de verdade depois, use
-`infra/scripts/with_terraform_credentials.sh` — ele busca a chave do
-Secret Manager (com a sua sessão pessoal, `gcloud auth login`; a própria
-service account do Terraform não pode ler sua própria chave, seria
-circular) para um arquivo temporário só pela duração de UM comando, e
-apaga em seguida:
+`infra/scripts/with_terraform_credentials.sh` — ele minta um token de
+acesso por impersonação (com a sua sessão pessoal, `gcloud auth login`; a
+própria service account do Terraform não pode impersonar a si mesma, seria
+circular) só pela duração de UM comando; o token nunca toca o disco, vive
+só numa variável de ambiente:
 
 ```
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
@@ -683,10 +707,9 @@ infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
 
 `docker-compose.gcp.yml` é um overlay opcional — nunca usado sozinho,
 sempre com `-f docker-compose.yml -f docker-compose.gcp.yml`, e sempre
-através do wrapper acima (nunca defina `GCP_TERRAFORM_KEY_PATH` manualmente
-— é o wrapper quem aponta pro arquivo temporário e cuida de apagá-lo).
-`infra/scripts/cloud_smoke_test.py` (fim desta seção) faz o mesmo
-internamente, sem precisar do wrapper.
+através do wrapper acima (nunca defina `GOOGLE_OAUTH_ACCESS_TOKEN`
+manualmente — é o wrapper quem minta o token e o repassa). `infra/scripts/cloud_smoke_test.py`
+(fim desta seção) faz o mesmo internamente, sem precisar do wrapper.
 
 **2. Bootstrap — buckets de estado e resultados**
 
