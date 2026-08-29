@@ -69,13 +69,28 @@ resource "google_service_account" "killswitch" {
 
 # Papel mínimo documentado pelo Google para permitir
 # projects.updateBillingInfo sem dar roles/billing.admin completo à SA de
-# runtime da function. CONFIRMAR este binding (papel e escopo) contra a
-# documentação oficial do Google ao aplicar de verdade pela primeira vez —
-# é o ponto mais fácil de errar, e só se descobre o erro na hora que a
-# trava precisar disparar.
+# runtime da function. CONFIRMADO ao aplicar de verdade pela primeira
+# vez: sozinho não basta — só inclui
+# resourcemanager.projects.{create,delete}BillingAssignment
+# (gcloud iam roles describe roles/billing.projectManager), nenhuma
+# permissão de LEITURA. get_project_billing_info() (chamado ANTES do
+# updateBillingInfo, pra não repetir a chamada se o billing já estiver
+# desligado) exige resourcemanager.projects.get, que só apareceu numa
+# invocação real como "403 PermissionDenied: The caller does not have
+# permission" — nunca detectável sem essa invocação de verdade.
 resource "google_project_iam_member" "killswitch_billing_manager" {
   project = var.project_id
   role    = "roles/billing.projectManager"
+  member  = "serviceAccount:${google_service_account.killswitch.email}"
+}
+
+# roles/browser: só resourcemanager.projects.{get,list} (+ folders/orgs
+# equivalentes) — nenhum acesso a custo/pagamento da conta de billing,
+# ao contrário de roles/billing.admin, que teria resolvido isso mas é
+# exatamente o que o comentário acima diz pra evitar.
+resource "google_project_iam_member" "killswitch_project_viewer" {
+  project = var.project_id
+  role    = "roles/browser"
   member  = "serviceAccount:${google_service_account.killswitch.email}"
 }
 
@@ -125,6 +140,11 @@ resource "google_cloudfunctions2_function" "budget_killswitch" {
     service_account_email = google_service_account.killswitch.email
     environment_variables = {
       DRY_RUN = tostring(var.killswitch_dry_run)
+      # Gen2 (Cloud Run por baixo) NÃO injeta isso automaticamente — só
+      # Gen1 fazia. Sem isso, main.py's os.environ["GOOGLE_CLOUD_PROJECT"]
+      # explode com KeyError (confirmado numa invocação real, a primeira
+      # a passar da barreira de IAM).
+      GOOGLE_CLOUD_PROJECT = var.project_id
     }
   }
 
@@ -133,6 +153,14 @@ resource "google_cloudfunctions2_function" "budget_killswitch" {
     event_type     = "google.cloud.pubsub.topic.v1.messagePublished"
     pubsub_topic   = google_pubsub_topic.budget_alerts.id
     retry_policy   = "RETRY_POLICY_DO_NOT_RETRY"
+    # Sem isso, o gatilho usa a SA de compute padrão do projeto para
+    # invocar a function — e essa organização desabilita concessões
+    # automáticas de IAM para SAs padrão (mesma causa raiz do bug do
+    # Cloud Build na Fase 4 passo 3), então a chamada falha com "The
+    # IAM principal lacks {run.routes.invoke} permission" (confirmado
+    # publicando uma notificação sintética de verdade no tópico: zero
+    # execuções da function, só esse erro nos logs do Cloud Run).
+    service_account_email = google_service_account.killswitch.email
   }
 
   labels = {
@@ -140,6 +168,20 @@ resource "google_cloudfunctions2_function" "budget_killswitch" {
     phase      = "budget"
     managed_by = "terraform"
   }
+}
+
+# Function Gen2 roda sobre um serviço Cloud Run por baixo — a
+# subscription push do Pub/Sub (event_trigger acima) precisa de
+# roles/run.invoker NESSE serviço para efetivamente conseguir chamá-lo,
+# além do service_account_email do próprio gatilho já apontar pra essa
+# SA. Reaproveita a SA de runtime da function (google_service_account.
+# killswitch) em vez de criar uma segunda SA só para isso.
+resource "google_cloud_run_service_iam_member" "killswitch_invoker" {
+  project  = var.project_id
+  location = var.region
+  service  = google_cloudfunctions2_function.budget_killswitch.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.killswitch.email}"
 }
 
 output "topic_id" {

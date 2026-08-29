@@ -679,7 +679,12 @@ exigem à própria SA `terraform-tcc`: `roles/compute.admin` (VMs e rede),
 `infra/modules/service/` cria para a própria VM de serviço),
 `roles/resourcemanager.projectIamAdmin` (a concessão de
 `secretmanager.secretAccessor` a essa SA, e também a de
-`roles/billing.projectManager` à SA da trava de segurança abaixo), e
+`roles/billing.projectManager` + `roles/browser` (esse último só
+descoberto necessário ao disparar a trava de verdade pela primeira vez:
+`billing.projectManager` sozinho não inclui `resourcemanager.projects.get`,
+que `get_project_billing_info()` exige) à SA da trava de segurança
+abaixo, e ainda `roles/run.invoker` no serviço Cloud Run por trás dela,
+pro gatilho Pub/Sub conseguir efetivamente chamá-la), e
 `roles/billing.admin` na conta de faturamento (`google_billing_budget`
 exige isso separadamente, fora do projeto). Mais quatro papéis —
 `roles/cloudfunctions.admin`, `roles/run.admin`, `roles/eventarc.admin`,
@@ -774,18 +779,32 @@ feita só depois de validar o fluxo:
 ```
 # 1. Com killswitch_dry_run=true (default), publicar uma notificação
 #    sintética de 120% no tópico e confirmar no log da function que ela
-#    reconheceu o limiar sem desligar nada de verdade:
+#    reconheceu o limiar sem desligar nada de verdade. NÃO pré-codifique
+#    o --message em base64 você mesmo: o próprio `gcloud pubsub topics
+#    publish` já faz isso internamente (é assim que notificações reais
+#    de billing chegam), então codificar antes gera um "duplo base64" —
+#    a function decodifica uma vez e recebe de volta a string base64
+#    original, não o JSON, e quebra com JSONDecodeError (confirmado numa
+#    execução real, a primeira a passar da barreira de IAM):
 gcloud pubsub topics publish tcc-budget-alerts \
   --project=<seu-projeto> \
-  --message="$(echo -n '{"costAmount":240,"budgetAmount":200,"currencyCode":"USD"}' | base64)"
+  --message='{"costAmount":4200,"budgetAmount":3500,"currencyCode":"BRL"}'
 gcloud functions logs read tcc-budget-killswitch --project=<seu-projeto> --region=<região> --gen2
 
 # 2. Só depois de confirmar o log acima, reaplicar com a trava armada
-#    de verdade — QUALQUER disparo real a partir daqui desliga o billing:
+#    de verdade — QUALQUER disparo real a partir daqui desliga o billing.
+#    -var="currency_code=..." é OBRIGATÓRIO aqui de novo: variáveis do
+#    Terraform não são "sticky" entre chamadas de apply separadas (só o
+#    estado do recurso já aplicado é — o valor da variável em si não).
+#    Omitir esse -var faria o Terraform tentar reverter a moeda do
+#    orçamento para o default "USD", reproduzindo o mesmo "Error 400"
+#    genérico do passo 3 (confirmado ao revisar este trecho antes de
+#    rodar de verdade, nunca chegou a falhar na prática).
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/budget apply \
   -var="project_id=<seu-projeto>" -var="billing_account_id=<sua-conta>" -var="monthly_budget_usd=<valor>" \
+  -var="currency_code=<moeda-da-sua-conta>" \
   -var="function_source_bucket=<function_source_bucket>" -var="killswitch_dry_run=false"
 ```
 
@@ -875,12 +894,28 @@ teste HTTP via `tests/acceptance/test_service_smoke.py`) e a carga leve
 precisam confirmar que a célula funciona de ponta a ponta antes de gastar
 tempo/dinheiro numa bateria de medição real.
 
+Realize o smoke test para cada um dos bancos de dados:
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python infra/scripts/cloud_smoke_test.py e1-valkey <project-id> us-central1 us-central1-a <terraform_state_bucket>
+```
+
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python infra/scripts/cloud_smoke_test.py e1-scylla <project-id> us-central1 us-central1-a <terraform_state_bucket>
+```
+
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 us-central1-a <terraform_state_bucket>
+```
+
 ### Fase 5 — Execução dos testes de carga e captura de resultados
 
 Diferente do smoke test — que sobe, valida e derruba tudo sozinho — aqui
 você controla cada fase manualmente, porque é aqui que a bateria de
 medição real acontece (`load/run_battery.py`, depois
-`analysis/collect.py`/`stats.py`), cara e demorada o suficiente para não
+`analysis/collect.py`/`stats.py`), custoso e demorado o suficiente para não
 valer a pena automatizar o ciclo de vida completo da infraestrutura.
 
 **Por célula — plan/apply**
