@@ -10,6 +10,7 @@ responsabilidade de service/main.py, ainda não implementado".
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
 
 from core.config import CellConfig
 from storage.base import StorageAdapter
@@ -81,12 +82,18 @@ def build_storage(config: CellConfig) -> StorageAdapter:
         user = _require_env("POSTGRES_USER", "postgres")
         password = _require_env("POSTGRES_PASSWORD", "postgres")
         dbname = _require_env("POSTGRES_DB", "postgres")
-        conninfo = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+        # quote(): user/password entram numa URI, não num par chave=valor
+        # — sem escapar, um caractere especial de URL na senha (base64
+        # rotineiramente inclui "+"/"/") corrompe a string de conexão e o
+        # psycopg autentica com um valor diferente do real. Bug de
+        # verdade, só aparece com senha gerada aleatoriamente — nunca
+        # com "tcc"/"tcc" fixos do docker-compose.yml local.
+        conninfo = f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{dbname}"
         return adapter_cls(conninfo)
 
     if config.storage == "valkey":
         password = os.environ.get("VALKEY_PASSWORD")
-        auth = f":{password}@" if password else ""
+        auth = f":{quote(password, safe='')}@" if password else ""
         url = f"redis://{auth}{host}:{port}/0"
         return adapter_cls(url)
 

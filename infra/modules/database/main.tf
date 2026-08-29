@@ -74,11 +74,40 @@ locals {
     scylla     = "scylladb/scylla:6.2"
     opensearch = "opensearchproject/opensearch:2.18.0"
   }
+  # /mnt/disks/data, não /mnt/data: no COS a raiz é somente-leitura
+  # (dm-verity) — só /mnt/disks (e /var, /home) são graváveis. Confirmado
+  # na prática (mkdir em /mnt/data falhava com "Read-only file system").
+  #
+  # docker_run_flags = só opções de verdade do `docker run` (-p/-v/-e),
+  # colocadas ANTES do nome da imagem. docker_command_args = argumentos do
+  # processo do próprio container (postgres/valkey-server/scylla), que
+  # precisam vir DEPOIS da imagem — ver docker-compose.yml local, onde
+  # cada um já é um `command:` YAML separado. Misturar os dois antes da
+  # imagem quebra na prática: `docker run` tentou interpretar
+  # `-c shared_buffers=1GB` como a própria flag `-c`/`--cpu-shares` dele
+  # (que espera um inteiro), não como argumento do Postgres — confirmado
+  # rodando de verdade contra uma VM real.
   docker_run_flags = {
-    postgres   = "-p 5432:5432 -v /mnt/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -c shared_buffers=1GB -c work_mem=64MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
-    valkey     = "-p 6379:6379 --save \"\" --appendonly no --maxmemory 24gb --maxmemory-policy noeviction"
-    scylla     = "-p 9042:9042 -v /mnt/data:/var/lib/scylla --smp 1 --memory 2G --overprovisioned 1 --developer-mode 1 --skip-wait-for-gossip-to-settle 0"
-    opensearch = "-p 9200:9200 -v /mnt/data:/usr/share/opensearch/data -e discovery.type=single-node -e bootstrap.memory_lock=true -e OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g -e DISABLE_SECURITY_PLUGIN=true"
+    # PGDATA numa subpasta, não a raiz do volume: montar um disco recém-
+    # formatado direto como data dir faz o initdb recusar ("directory
+    # ... exists but is not empty" — o ext4 sempre tem um lost+found na
+    # raiz). Nunca aparece localmente porque docker-compose.yml usa um
+    # volume nomeado do Docker, não um disco bruto — confirmado rodando
+    # de verdade contra uma VM real.
+    postgres   = "-p 5432:5432 -v /mnt/disks/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -e PGDATA=/var/lib/postgresql/data/pgdata"
+    valkey     = "-p 6379:6379"
+    scylla     = "-p 9042:9042 -v /mnt/disks/data:/var/lib/scylla"
+    # OPENSEARCH_JAVA_OPTS precisa de aspas em volta do valor inteiro: sem
+    # elas, o shell quebra "-Xms2g -Xmx2g" em dois tokens e o segundo
+    # ("-Xmx2g") chega ao `docker run` como se fosse uma flag própria dele
+    # ("unknown shorthand flag: 'X'") — confirmado rodando de verdade.
+    opensearch = "-p 9200:9200 -v /mnt/disks/data:/usr/share/opensearch/data -e discovery.type=single-node -e bootstrap.memory_lock=true -e OPENSEARCH_JAVA_OPTS=\"-Xms2g -Xmx2g\" -e DISABLE_SECURITY_PLUGIN=true"
+  }
+  docker_command_args = {
+    postgres   = "-c shared_buffers=1GB -c work_mem=64MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
+    valkey     = "--save \"\" --appendonly no --maxmemory 24gb --maxmemory-policy noeviction"
+    scylla     = "--smp 1 --memory 2G --overprovisioned 1 --developer-mode 1 --skip-wait-for-gossip-to-settle 0"
+    opensearch = ""
   }
 }
 
@@ -87,6 +116,22 @@ resource "google_compute_disk" "data" {
   zone = var.zone
   size = var.data_disk_size_gb
   type = "pd-ssd"
+}
+
+resource "google_service_account" "database" {
+  account_id   = "tcc-${var.cell}-database"
+  display_name = "tcc-recsys database service account (${var.cell})"
+}
+
+# Só a célula postgres usa isso (busca a própria senha no boot, ver
+# startup-script abaixo) — concedido incondicionalmente aos 4 bancos
+# porque é mais simples que condicionar por storage e não custa nada nos
+# outros 3, que nunca chamam a API. Mesmo padrão de
+# infra/modules/service/main.tf: só o necessário, nada mais.
+resource "google_project_iam_member" "database_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.database.email}"
 }
 
 resource "google_compute_instance" "database" {
@@ -110,23 +155,55 @@ resource "google_compute_instance" "database" {
     # Sem access_config: sem IP público (IMPLEMENTACAO.md).
   }
 
+  service_account {
+    email  = google_service_account.database.email
+    scopes = ["cloud-platform"]
+  }
+
   metadata = {
     startup-script = <<-EOT
       #!/bin/bash
       set -euo pipefail
-      mkdir -p /mnt/data
+      mkdir -p /mnt/disks/data
       mkfs.ext4 -F /dev/disk/by-id/google-data 2>/dev/null || true
-      mount /dev/disk/by-id/google-data /mnt/data
+      mount /dev/disk/by-id/google-data /mnt/disks/data
+      %{if var.storage == "opensearch"}
+      # A imagem oficial do OpenSearch roda como usuário não-root (uid
+      # 1000) e não ajusta a posse do diretório de dados montado — sem
+      # isso o processo falha no boot com "AccessDeniedException:
+      # /usr/share/opensearch/data/nodes" (confirmado rodando de
+      # verdade). Postgres e Scylla fazem esse chown internamente no
+      # próprio entrypoint (rodando como root antes de trocar de
+      # usuário), então não precisam disso.
+      chown -R 1000:1000 /mnt/disks/data
+      %{endif}
       %{if var.storage == "postgres"}
-      POSTGRES_PASSWORD=$(gcloud secrets versions access latest --secret=tcc-postgres-password)
+      # COS não tem o Cloud SDK (`gcloud`) instalado — confirmado na
+      # prática (nem no PATH). Busca a senha direto na API do Secret
+      # Manager, autenticado com o token da conta de serviço da VM via
+      # servidor de metadados (o único jeito de fazer isso sem gcloud).
+      # Padrão do sed tolera espaço opcional depois dos dois-pontos: o
+      # endpoint de token do metadados devolve JSON compacto, mas a API
+      # do Secret Manager devolve formatada ("data": "...", com espaço)
+      # — confirmado inspecionando a resposta real numa VM.
+      ACCESS_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" | sed -n 's/.*"access_token": *"\([^"]*\)".*/\1/p')
+      POSTGRES_PASSWORD=$(curl -sf -H "Authorization: Bearer $ACCESS_TOKEN" "https://secretmanager.googleapis.com/v1/projects/${var.project_id}/secrets/tcc-postgres-password/versions/latest:access" | sed -n 's/.*"data": *"\([^"]*\)".*/\1/p' | base64 -d)
+      # A primeira conexão de saída de uma VM nova pode dar timeout antes
+      # do Cloud NAT/rede estabilizar (~20-30s de boot) — confirmado
+      # reproduzindo 2x seguidas contra o Docker Hub. Retry evita ter que
+      # destruir e tentar de novo manualmente por causa disso.
+      for i in 1 2 3 4 5; do docker pull ${local.docker_image["postgres"]} && break || sleep 10; done
       docker run -d --name tcc-database --restart unless-stopped \
         -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
         ${local.docker_run_flags["postgres"]} \
-        ${local.docker_image["postgres"]}
+        ${local.docker_image["postgres"]} \
+        ${local.docker_command_args["postgres"]}
       %{else}
+      for i in 1 2 3 4 5; do docker pull ${local.docker_image[var.storage]} && break || sleep 10; done
       docker run -d --name tcc-database --restart unless-stopped \
         ${local.docker_run_flags[var.storage]} \
-        ${local.docker_image[var.storage]}
+        ${local.docker_image[var.storage]} \
+        ${local.docker_command_args[var.storage]}
       %{endif}
     EOT
   }

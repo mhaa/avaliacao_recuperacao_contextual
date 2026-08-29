@@ -17,7 +17,9 @@ terraform {
     }
   }
   backend "gcs" {
-    # bucket via -backend-config; prefix fixo "budget" (não varia por célula).
+    # bucket via -backend-config (varia por projeto); prefix fixo aqui —
+    # ao contrário de envs/experiment, este env não varia por célula.
+    prefix = "budget"
   }
 }
 
@@ -37,12 +39,18 @@ variable "billing_account_id" {
 
 variable "monthly_budget_usd" {
   type        = number
-  description = "Limite mensal em USD — ajustar conforme dimensionamento.xlsx (Etapa 1)."
+  description = "Limite mensal, na moeda de var.currency_code (nome da variável é histórico — ajustar conforme dimensionamento.xlsx (Etapa 1))."
   default     = 200
   validation {
     condition     = var.monthly_budget_usd > 0
     error_message = "monthly_budget_usd precisa ser positivo."
   }
+}
+
+variable "currency_code" {
+  type        = string
+  description = "Código ISO 4217 da moeda do orçamento — PRECISA bater com a moeda da conta de faturamento (gcloud billing accounts describe <id>), senão a criação falha com \"Error 400: Request contains an invalid argument\" (descoberto na prática: não é bug do provider nem da impersonação, é mismatch de moeda)."
+  default     = "USD"
 }
 
 variable "region" {
@@ -93,7 +101,7 @@ resource "google_billing_budget" "experiment" {
 
   amount {
     specified_amount {
-      currency_code = "USD"
+      currency_code = var.currency_code
       units         = tostring(var.monthly_budget_usd)
     }
   }

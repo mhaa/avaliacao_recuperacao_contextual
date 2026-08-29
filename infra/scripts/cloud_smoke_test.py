@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -57,9 +58,29 @@ def storage_for_cell(cell_id: str) -> str:
     return cell_id.split("-", 1)[1]
 
 
+def _resolve_cmd(cmd: list[str]) -> list[str]:
+    """No Windows, `gcloud`/`docker` são wrappers `.cmd`/`.exe` — CreateProcess
+    (usado por subprocess.run com shell=False) não os acha pelo nome puro,
+    só cmd.exe faz essa busca por PATHEXT. shutil.which resolve isso de
+    forma portátil (funciona igual em Linux/Mac, onde já resolvia por PATH
+    de qualquer forma), sem precisar de shell=True — que exigiria escapar
+    cada argumento manualmente."""
+    resolved = shutil.which(cmd[0])
+    return [resolved, *cmd[1:]] if resolved else cmd
+
+
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     print(f"+ {' '.join(cmd)}")
-    return subprocess.run(cmd, check=True, **kwargs)
+    if kwargs.get("text"):
+        # Sem isso, subprocess decodifica com locale.getpreferredencoding()
+        # — no Windows isso é cp1252, e a saída remota (pytest/k6 rodando
+        # em Linux) pode conter bytes UTF-8 que não são cp1252 válido,
+        # derrubando a thread leitora com UnicodeDecodeError e perdendo o
+        # resultado inteiro dos gates (confirmado rodando de verdade
+        # contra e1-opensearch).
+        kwargs.setdefault("encoding", "utf-8")
+        kwargs.setdefault("errors", "replace")
+    return subprocess.run(_resolve_cmd(cmd), check=True, **kwargs)
 
 
 def _confirm_billable(message: str) -> None:
@@ -124,7 +145,14 @@ def terraform_output_json() -> dict:
         "-json",
     ]
     print(f"+ {' '.join(cmd)}")
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        _resolve_cmd(cmd),
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     parsed = json.loads(result.stdout)
     return {k: v["value"] for k, v in parsed.items()}
 
@@ -154,18 +182,22 @@ def wait_for_container(
     while time.monotonic() < deadline:
         try:
             result = subprocess.run(
-                [
-                    "gcloud",
-                    "compute",
-                    "ssh",
-                    instance,
-                    f"--zone={zone}",
-                    f"--project={project_id}",
-                    "--tunnel-through-iap",
-                    f"--command={check_cmd}",
-                ],
+                _resolve_cmd(
+                    [
+                        "gcloud",
+                        "compute",
+                        "ssh",
+                        instance,
+                        f"--zone={zone}",
+                        f"--project={project_id}",
+                        "--tunnel-through-iap",
+                        f"--command={check_cmd}",
+                    ]
+                ),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=60,
             )
             if result.stdout.strip():
@@ -291,6 +323,13 @@ def main(argv: list[str] | None = None) -> int:
         terraform(
             [
                 "init",
+                # -reconfigure: infra/ é bind mount (README.md, Etapa 9) —
+                # o .terraform/ local ainda lembra o backend da célula
+                # anterior. Cada prefixo por célula é deliberadamente uma
+                # localização isolada nova, nunca uma migração de estado
+                # — confirmado rodando smoke test em duas células
+                # seguidas, sem isso o init recusa trocar de prefixo.
+                "-reconfigure",
                 f"-backend-config=bucket={args.terraform_state_bucket}",
                 f"-backend-config=prefix=cells/{args.cell}",
             ]

@@ -45,6 +45,26 @@ variable "machine_type" {
   default     = "n2-standard-8"
 }
 
+resource "google_service_account" "loadgen" {
+  account_id   = "tcc-${var.cell}-loadgen"
+  display_name = "tcc-recsys loadgen service account (${var.cell})"
+}
+
+# tools_image é privada (Artifact Registry, não Docker Hub) — sem isso, o
+# `docker pull` no boot falha com "Unauthenticated request" (mesmo bug já
+# confirmado e corrigido em infra/modules/service/main.tf).
+resource "google_project_iam_member" "loadgen_artifact_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.loadgen.email}"
+}
+
+locals {
+  # Mesma extração de infra/modules/service/main.tf — host do registro a
+  # partir da própria referência da imagem, sem variável nova.
+  tools_registry_host = split("/", var.tools_image)[0]
+}
+
 resource "google_compute_instance" "loadgen" {
   name         = "tcc-${var.cell}-loadgen"
   zone         = var.zone
@@ -62,11 +82,29 @@ resource "google_compute_instance" "loadgen" {
     # daqui dentro, não da estação do operador.
   }
 
+  service_account {
+    email  = google_service_account.loadgen.email
+    scopes = ["cloud-platform"]
+  }
+
   metadata = {
     startup-script = <<-EOT
       #!/bin/bash
       set -euo pipefail
-      docker pull ${var.tools_image}
+      # COS não tem gcloud — autentica o Docker direto via token OAuth do
+      # servidor de metadados (mesmo padrão de infra/modules/service e
+      # infra/modules/database).
+      ACCESS_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" | sed -n 's/.*"access_token": *"\([^"]*\)".*/\1/p')
+      # DOCKER_CONFIG em /tmp: /root também é raiz somente-leitura no COS
+      # — "docker login" sem isso falha tentando gravar
+      # /root/.docker/config.json (confirmado rodando de verdade).
+      export DOCKER_CONFIG=/tmp/.docker
+      echo "$ACCESS_TOKEN" | docker login -u oauth2accesstoken --password-stdin "https://${local.tools_registry_host}"
+      # A primeira conexão de saída de uma VM nova pode dar timeout antes
+      # do Cloud NAT/rede estabilizar (~20-30s de boot) — confirmado
+      # reproduzindo 2x seguidas contra o Docker Hub. Retry evita destruir
+      # e tentar de novo manualmente por causa disso.
+      for i in 1 2 3 4 5; do docker pull ${var.tools_image} && break || sleep 10; done
     EOT
   }
 

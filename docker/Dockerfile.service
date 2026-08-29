@@ -12,11 +12,14 @@ COPY core ./core
 COPY storage ./storage
 COPY strategies ./strategies
 COPY service ./service
-# harness/ não é usado em runtime pelo serviço, mas pyproject.toml declara
-# em "packages" (compartilhado com Dockerfile.tools) — pip install . (não
-# editável) valida que todo pacote listado existe fisicamente. Descartado
-# junto com o resto deste estágio builder.
+# harness/, load/ e analysis/ não são usados em runtime pelo serviço, mas
+# pyproject.toml declara os três em "packages" (compartilhado com
+# Dockerfile.tools) — pip install . (não editável) valida que todo pacote
+# listado existe fisicamente. Descartados junto com o resto deste estágio
+# builder.
 COPY harness ./harness
+COPY load ./load
+COPY analysis ./analysis
 
 RUN pip install --no-cache-dir --prefix=/install .
 

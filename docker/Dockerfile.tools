@@ -37,6 +37,20 @@ COPY tests ./tests
 COPY load ./load
 COPY analysis ./analysis
 
+# Fixture do oráculo (harness/fixtures.py) — só o que ele de fato lê, não
+# a massa completa (data_generation/data/raw/ e inverted_bitmaps/ ficam
+# de fora, ~1GB a menos). Localmente isso chega via o volume montado em
+# docker-compose.yml; na nuvem (infra/modules/loadgen) não existe bind
+# mount nenhum, então sem isso o smoke test falha com FileNotFoundError
+# assim que schemas/postgres/load_oracle_fixture.py tenta ler
+# oracle.parquet — confirmado rodando de verdade contra uma VM real.
+COPY data_generation/data/oracle.parquet ./data_generation/data/oracle.parquet
+COPY data_generation/data/candidates.parquet ./data_generation/data/candidates.parquet
+COPY data_generation/data/prematerialized.parquet ./data_generation/data/prematerialized.parquet
+COPY data_generation/data/items.parquet ./data_generation/data/items.parquet
+COPY data_generation/data/contexts.parquet ./data_generation/data/contexts.parquet
+COPY data_generation/data/inverted_lists.parquet ./data_generation/data/inverted_lists.parquet
+
 RUN pip install --no-cache-dir -e ".[dev]"
 
 ENTRYPOINT ["python", "-m", "pytest"]

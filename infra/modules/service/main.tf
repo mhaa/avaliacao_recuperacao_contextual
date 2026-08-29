@@ -64,6 +64,23 @@ resource "google_project_iam_member" "service_secret_accessor" {
   member  = "serviceAccount:${google_service_account.service.email}"
 }
 
+# `service_image` é privada (Artifact Registry, não Docker Hub) — sem
+# isso, o `docker pull` no boot falha com "Unauthenticated request"
+# (confirmado rodando de verdade contra uma VM real).
+resource "google_project_iam_member" "service_artifact_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.service.email}"
+}
+
+locals {
+  # Host do registro extraído da própria referência da imagem (ex.:
+  # "us-central1-docker.pkg.dev" de
+  # "us-central1-docker.pkg.dev/PROJECT/tcc/service:latest") — evita uma
+  # variável nova só para repetir o que `service_image` já contém.
+  service_registry_host = split("/", var.service_image)[0]
+}
+
 resource "google_compute_instance" "service" {
   name         = "tcc-${var.cell}-service"
   zone         = var.zone
@@ -89,7 +106,31 @@ resource "google_compute_instance" "service" {
     startup-script = <<-EOT
       #!/bin/bash
       set -euo pipefail
-      POSTGRES_PASSWORD=$(gcloud secrets versions access latest --secret=tcc-postgres-password || echo "")
+      # COS não tem o Cloud SDK (`gcloud`) instalado — confirmado na
+      # prática. Busca a senha direto na API do Secret Manager,
+      # autenticado com o token da conta de serviço da VM via servidor de
+      # metadados (o único jeito de fazer isso sem gcloud). Mesmo padrão
+      # de infra/modules/database/main.tf.
+      # Padrão do sed tolera espaço opcional depois dos dois-pontos: o
+      # endpoint de token do metadados devolve JSON compacto, mas a API
+      # do Secret Manager devolve formatada ("data": "...", com espaço)
+      # — confirmado inspecionando a resposta real numa VM.
+      ACCESS_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" | sed -n 's/.*"access_token": *"\([^"]*\)".*/\1/p')
+      POSTGRES_PASSWORD=$(curl -sf -H "Authorization: Bearer $ACCESS_TOKEN" "https://secretmanager.googleapis.com/v1/projects/${var.project_id}/secrets/tcc-postgres-password/versions/latest:access" | sed -n 's/.*"data": *"\([^"]*\)".*/\1/p' | base64 -d)
+      # service_image é privada (Artifact Registry) — autentica o Docker
+      # com o mesmo token OAuth já buscado acima (mesmo escopo
+      # cloud-platform cobre Secret Manager e Artifact Registry).
+      # DOCKER_CONFIG em /tmp: /root também é raiz somente-leitura no COS
+      # — "docker login" sem isso falha tentando gravar
+      # /root/.docker/config.json (confirmado rodando de verdade).
+      export DOCKER_CONFIG=/tmp/.docker
+      echo "$ACCESS_TOKEN" | docker login -u oauth2accesstoken --password-stdin "https://${local.service_registry_host}"
+      # A primeira conexão de saída de uma VM nova pode dar timeout antes
+      # do Cloud NAT/rede estabilizar (~20-30s de boot) — confirmado
+      # reproduzindo 2x seguidas contra o Docker Hub (mesmo mecanismo,
+      # ainda que aqui seja Artifact Registry). Retry evita destruir e
+      # tentar de novo manualmente por causa disso.
+      for i in 1 2 3 4 5; do docker pull ${var.service_image} && break || sleep 10; done
       docker run -d --name tcc-service --restart unless-stopped \
         -e CELL=${var.cell} \
         -e STORAGE_HOST=${var.database_internal_ip} \

@@ -656,7 +656,7 @@ gcloud services enable \
 | Cloud Build | Empacota `function_src/main.py` ao fazer deploy da function a partir de código-fonte. |
 | Cloud Billing | O código da function (`billing_v1.CloudBillingClient()`) lê e, se precisar, desliga o billing do projeto; também usada pelos comandos `gcloud billing` manuais. |
 
-**1. Criação de "Service Account" para o Terraform — nunca uma chave, nem no repositório nem fora dele**
+**1. Criação de credenciais para o Terraform**
 
 O Terraform é responsável por provisionar e gerenciar toda a infraestrutura real deste projeto na nuvem — os buckets de estado e de resultados (passo 2), o orçamento e sua trava de segurança (passo 3), e as VMs de banco, serviço e loadgen de cada célula (passo 6) — e por isso precisa de uma identidade própria no GCP para realizar isso. O Terraform roda dentro do container `tools`.
 Execute:
@@ -665,11 +665,7 @@ Execute:
 infra/scripts/create_terraform_service_account.sh <project-id> <billing-account-id>
 ```
 
-**Nenhuma chave é gerada.** A política de organização desta conta
-(`constraints/iam.disableServiceAccountKeyCreation`, herdada, não
-sobrescrevível neste projeto sem privilégios de admin da organização —
-confirmado na prática) bloqueia `gcloud iam service-accounts keys create`
-de qualquer forma. Em vez disso, o script concede sua conta pessoal
+**Nenhuma chave é gerada.** O script concede à sua conta pessoal
 (`gcloud config get-value account`) o papel `roles/iam.serviceAccountTokenCreator`
 sobre a SA — o que permite **impersoná-la** sob demanda, mintando tokens de
 acesso de curta duração (~1h) só quando necessário. Mais simples que
@@ -692,26 +688,12 @@ segurança de orçamento (`infra/modules/budget_killswitch/`, subseção
 depois do passo 3): Gen2 faz o build sobre Cloud Run e dispara via Eventarc a
 partir de um tópico Pub/Sub.
 
-Para rodar Terraform de verdade depois, use
+Para gerar o token para o Terraform, use
 `infra/scripts/with_terraform_credentials.sh` — ele minta um token de
-acesso por impersonação (com a sua sessão pessoal, `gcloud auth login`; a
-própria service account do Terraform não pode impersonar a si mesma, seria
-circular) só pela duração de UM comando; o token nunca toca o disco, vive
-só numa variável de ambiente:
+acesso por impersonação (da sua sessão pessoal, `gcloud auth login`) só pela duração de UM comando; o token nunca toca o disco, vive
+só numa variável de ambiente.
 
-```
-infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
-  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
-  run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
-```
-
-`docker-compose.gcp.yml` é um overlay opcional — nunca usado sozinho,
-sempre com `-f docker-compose.yml -f docker-compose.gcp.yml`, e sempre
-através do wrapper acima (nunca defina `GOOGLE_OAUTH_ACCESS_TOKEN`
-manualmente — é o wrapper quem minta o token e o repassa). `infra/scripts/cloud_smoke_test.py`
-(fim desta seção) faz o mesmo internamente, sem precisar do wrapper.
-
-**2. Bootstrap — buckets de estado e resultados**
+**2. Bootstrap — cria os buckets de estado, resultados e código-fonte da function**
 
 ```
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
@@ -722,10 +704,31 @@ infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
 ```
 
-Guarde os outputs `terraform_state_bucket` e `results_bucket` — usados nos
-passos seguintes.
+3 buckets são criados — guarde os 3 outputs, usados nos passos seguintes
+(`terraform_state_bucket` no `-backend-config` de todo `envs/*`;
+`function_source_bucket` no `-var` do passo 3):
+
+```
+terraform_state_bucket = "<seu-projeto>-tcc-tfstate"
+results_bucket         = "<seu-projeto>-tcc-results"
+function_source_bucket = "<seu-projeto>-tcc-functions"
+```
 
 **3. Orçamento — antes de qualquer VM**
+
+Aqui definimos um limite de gasto para o projeto, atente para o parâmetro `monthly_budget_usd=<valor>`
+
+> **Pegadinha real encontrada na prática:** `currency_code` (nova
+> variável) **precisa bater com a moeda da sua conta de faturamento**
+> (confira com `gcloud billing accounts describe <sua-conta>` — o campo
+> `currencyCode`). Se divergir, `terraform apply` falha com "Error 400:
+> Request contains an invalid argument" — uma mensagem completamente
+> genérica que não menciona moeda em lugar nenhum. Isso não é bug do
+> Terraform nem da impersonação (testado e descartado): reproduzido e
+> isolado via `gcloud billing budgets create` direto, fora do Terraform.
+> Se sua conta não for USD, passe `-var="currency_code=<sua-moeda>"`
+> também — e lembre que `monthly_budget_usd` vira o valor **nessa**
+> moeda, não necessariamente em dólares (nome da variável é histórico).
 
 ```
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
@@ -736,6 +739,7 @@ infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/budget apply \
   -var="project_id=<seu-projeto>" -var="billing_account_id=<sua-conta>" -var="monthly_budget_usd=<valor>" \
+  -var="currency_code=<moeda-da-sua-conta>" \
   -var="function_source_bucket=<saída de bootstrap: function_source_bucket>"
 ```
 
@@ -756,8 +760,7 @@ VMs que o Terraform conhece, mas qualquer recurso que gere custo no
 projeto. A GCE força a parada das VMs quando o billing cai, então isso
 cumpre o "desliga tudo" da forma mais abrangente possível.
 
-É uma exceção deliberada ao "Compute Engine, não Cloud Run" do início
-desta fase: essa Cloud Function é ferramenta auxiliar de operação, nunca
+Essa Cloud Function é ferramenta auxiliar de operação, nunca
 participa do caminho medido, então autoscaling/cold start dela são
 irrelevantes para a cauda de latência do estudo.
 
@@ -820,18 +823,73 @@ não existe recurso Terraform para criar o secret (checado em
 echo -n "<senha-real>" | gcloud secrets create tcc-postgres-password --data-file=- --project=<seu-projeto>
 ```
 
-**6. Por célula — plan/apply**
+**6. `terraform.tfvars` — imagens fixas por ambiente**
+
+Cria e preenche o arquivo de variáveis que o Terraform lê automaticamente
+de dentro de `infra/envs/experiment/` sempre que rodar ali — não precisa
+passá-lo via `-var` em lugar nenhum. Existe porque `service_image` e
+`tools_image` ([infra/envs/experiment/main.tf:75-83](infra/envs/experiment/main.tf#L75-L83))
+são variáveis **obrigatórias, sem default**, e nem o smoke test do passo 7
+nem os `apply`/`destroy` manuais da Fase 5 as passam via `-var` — só
+`project_id`/`cell`/`storage`/`region`/`zone` variam por chamada. Sem esse
+arquivo, com as referências reais das imagens já publicadas (passo 4),
+qualquer `terraform apply` aqui falha pedindo essas duas variáveis.
 
 ```
 cd infra/envs/experiment
 cp terraform.tfvars.example terraform.tfvars   # preencher project_id, cell, storage, service_image, tools_image; nunca commitar
 ```
 
+Os valores de `project_id`/`cell`/`storage` deste arquivo servem só de
+referência — tanto o smoke test quanto os `apply` manuais da Fase 5
+sobrescrevem os três via `-var` a cada chamada, célula por célula. Só
+`service_image`/`tools_image` precisam estar certos aqui.
+
+**7. Smoke test em nuvem — antes de qualquer bateria real**
+
+`infra/scripts/cloud_smoke_test.py` sobe uma célula de verdade, aplica
+schema, carrega o subconjunto pequeno de dados do oráculo
+(`harness/fixtures.py`), roda `harness/verify_cli.py` como gate de
+corretude, dispara uma carga leve (`SMOKE_MODE=true` em
+`load/scenarios.js`), imprime uma sanidade grosseira de latência/recursos
+(`docker stats` via SSH, não `analysis/resources.py` — esse continua só
+local), e derruba tudo no final — pensado para pegar problemas antes da
+bateria de medição real (cara, demorada, não deveria precisar ser
+re-executada). Roda no host (usa o `gcloud` do host para SSH via IAP nas
+VMs, todas sem IP público) e minta sozinho um token de acesso por
+impersonação da SA do Terraform no início — sem precisar do wrapper do
+passo 1 nem de nenhum export manual:
+
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket>
+```
+
+Cada `terraform apply`/`destroy` dentro dele é anunciado explicitamente e
+pede confirmação — mesmo já tendo sido descrito aqui. `--keep-infra` pula o
+destroy final, para investigar uma falha manualmente.
+
+**Só avance para a Fase 5 depois que o smoke test passar limpo** para a
+célula em questão — os gates de corretude (`harness/verify_cli.py`, o
+teste HTTP via `tests/acceptance/test_service_smoke.py`) e a carga leve
+precisam confirmar que a célula funciona de ponta a ponta antes de gastar
+tempo/dinheiro numa bateria de medição real.
+
+### Fase 5 — Execução dos testes de carga e captura de resultados
+
+Diferente do smoke test — que sobe, valida e derruba tudo sozinho — aqui
+você controla cada fase manualmente, porque é aqui que a bateria de
+medição real acontece (`load/run_battery.py`, depois
+`analysis/collect.py`/`stats.py`), cara e demorada o suficiente para não
+valer a pena automatizar o ciclo de vida completo da infraestrutura.
+
+**Por célula — plan/apply**
+
 ```
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/experiment \
-  init -backend-config="bucket=<terraform_state_bucket>" -backend-config="prefix=cells/<cell>"
+  init -reconfigure -backend-config="bucket=<terraform_state_bucket>" -backend-config="prefix=cells/<cell>"
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/experiment plan
@@ -849,27 +907,3 @@ infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/envs/experiment destroy   # faturável-adjacente — confirmar antes
 ```
-
-### Smoke test em nuvem — antes de qualquer bateria real
-
-`infra/scripts/cloud_smoke_test.py` sobe uma célula de verdade, aplica
-schema, carrega o subconjunto pequeno de dados do oráculo
-(`harness/fixtures.py`), roda `harness/verify_cli.py` como gate de
-corretude, dispara uma carga leve (`SMOKE_MODE=true` em
-`load/scenarios.js`), imprime uma sanidade grosseira de latência/recursos
-(`docker stats` via SSH, não `analysis/resources.py` — esse continua só
-local), e derruba tudo no final — pensado para pegar problemas antes da
-bateria de medição real (cara, demorada, não deveria precisar ser
-re-executada). Roda no host (usa o `gcloud` do host para SSH via IAP nas
-VMs, todas sem IP público) e busca a credencial do Terraform sozinho, do
-Secret Manager, no início — sem precisar do wrapper do item 1 nem de
-nenhum export manual:
-
-```
-export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket>
-```
-
-Cada `terraform apply`/`destroy` dentro dele é anunciado explicitamente e
-pede confirmação — mesmo já tendo sido descrito aqui. `--keep-infra` pula o
-destroy final, para investigar uma falha manualmente.
