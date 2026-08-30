@@ -73,12 +73,54 @@ resource "google_project_iam_member" "service_artifact_reader" {
   member  = "serviceAccount:${google_service_account.service.email}"
 }
 
+# Instrumentação de gargalo (CONTEXTO.md / analysis/resources.py:
+# GCPMonitoringCollector) — o coletor OpenTelemetry no startup-script
+# escreve métrica de memória sob esta SA.
+resource "google_project_iam_member" "service_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.service.email}"
+}
+
 locals {
   # Host do registro extraído da própria referência da imagem (ex.:
   # "us-central1-docker.pkg.dev" de
   # "us-central1-docker.pkg.dev/PROJECT/tcc/service:latest") — evita uma
   # variável nova só para repetir o que `service_image` já contém.
   service_registry_host = split("/", var.service_image)[0]
+
+  # Instrumentação de gargalo (CONTEXTO.md) — mesmo mecanismo de
+  # infra/modules/database/main.tf (Ops Agent oficial não roda em COS;
+  # OpenTelemetry Collector Contrib como contêiner). Duplicado idêntico
+  # nos 3 módulos de propósito — não é configuração por célula.
+  otel_collector_startup = <<-OTELEOT
+    cat > /etc/otel-config.yaml <<'YAMLEOF'
+    receivers:
+      hostmetrics:
+        collection_interval: 5s
+        root_path: /hostfs
+        scrapers:
+          memory:
+          cpu:
+          network:
+    processors:
+      batch:
+    exporters:
+      googlecloud:
+        project: "${var.project_id}"
+    service:
+      pipelines:
+        metrics:
+          receivers: [hostmetrics]
+          processors: [batch]
+          exporters: [googlecloud]
+    YAMLEOF
+    docker run -d --name tcc-otel-agent --restart unless-stopped \
+      --pid host --network host \
+      -v /:/hostfs:ro \
+      -v /etc/otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro \
+      otel/opentelemetry-collector-contrib:0.112.0
+  OTELEOT
 }
 
 resource "google_compute_instance" "service" {
@@ -106,6 +148,7 @@ resource "google_compute_instance" "service" {
     startup-script = <<-EOT
       #!/bin/bash
       set -euo pipefail
+      ${local.otel_collector_startup}
       # COS não tem o Cloud SDK (`gcloud`) instalado — confirmado na
       # prática. Busca a senha direto na API do Secret Manager,
       # autenticado com o token da conta de serviço da VM via servidor de

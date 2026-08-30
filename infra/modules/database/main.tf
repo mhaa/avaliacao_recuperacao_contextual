@@ -111,6 +111,44 @@ locals {
   }
 }
 
+# Instrumentação de gargalo (CONTEXTO.md) — Ops Agent oficial do Google não
+# roda em COS (sem apt/yum); usamos o OpenTelemetry Collector Contrib como
+# contêiner (hostmetrics + exporter googlecloud), lendo o sistema de
+# arquivos do host via /hostfs somente leitura. Duplicado idêntico nos 3
+# módulos (database/service/loadgen) — não é configuração por célula, não
+# vale a pena uma abstração Terraform só para isso. Métrica exata ainda sem
+# validação contra uma VM real — ver README.md, "Riscos conhecidos".
+locals {
+  otel_collector_startup = <<-OTELEOT
+    cat > /etc/otel-config.yaml <<'YAMLEOF'
+    receivers:
+      hostmetrics:
+        collection_interval: 5s
+        root_path: /hostfs
+        scrapers:
+          memory:
+          cpu:
+          network:
+    processors:
+      batch:
+    exporters:
+      googlecloud:
+        project: "${var.project_id}"
+    service:
+      pipelines:
+        metrics:
+          receivers: [hostmetrics]
+          processors: [batch]
+          exporters: [googlecloud]
+    YAMLEOF
+    docker run -d --name tcc-otel-agent --restart unless-stopped \
+      --pid host --network host \
+      -v /:/hostfs:ro \
+      -v /etc/otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro \
+      otel/opentelemetry-collector-contrib:0.112.0
+  OTELEOT
+}
+
 resource "google_compute_disk" "data" {
   name = "tcc-${var.cell}-data"
   zone = var.zone
@@ -131,6 +169,15 @@ resource "google_service_account" "database" {
 resource "google_project_iam_member" "database_secret_accessor" {
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.database.email}"
+}
+
+# Instrumentação de gargalo (CONTEXTO.md / analysis/resources.py:
+# GCPMonitoringCollector) — o coletor OpenTelemetry no startup-script
+# escreve métrica de memória sob esta SA.
+resource "google_project_iam_member" "database_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.database.email}"
 }
 
@@ -167,6 +214,7 @@ resource "google_compute_instance" "database" {
       mkdir -p /mnt/disks/data
       mkfs.ext4 -F /dev/disk/by-id/google-data 2>/dev/null || true
       mount /dev/disk/by-id/google-data /mnt/disks/data
+      ${local.otel_collector_startup}
       %{if var.storage == "opensearch"}
       # A imagem oficial do OpenSearch roda como usuário não-root (uid
       # 1000) e não ajusta a posse do diretório de dados montado — sem

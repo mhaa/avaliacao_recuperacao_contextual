@@ -31,6 +31,14 @@ dependencies = [
     # ensure_full_dataset_downloaded) — roda dentro do tools em produção
     # (Fase 5), não só em teste, por isso aqui e não em [dev].
     "google-cloud-storage>=2.18",
+    # analysis/resources.py:GCPMonitoringCollector consulta a CPU/rede/
+    # memória das 3 VMs (banco/serviço/gerador) — chamada a partir do HOST
+    # por infra/scripts/run_measurement_battery.py (a busca de saturação,
+    # load/saturation.py, checa a CPU do gerador a cada patamar), não de
+    # dentro do container `tools`. Precisa estar aqui mesmo assim, pois é a
+    # única lista de dependências do projeto: rode `pip install -e .` no
+    # host, além do `gcloud` CLI já exigido para Fase 4/5 (README.md).
+    "google-cloud-monitoring>=2.21",
 ]
 
 [project.optional-dependencies]

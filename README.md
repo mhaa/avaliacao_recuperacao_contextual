@@ -698,7 +698,7 @@ Para gerar o token para o Terraform, use
 acesso por impersonação (da sua sessão pessoal, `gcloud auth login`) só pela duração de UM comando; o token nunca toca o disco, vive
 só numa variável de ambiente.
 
-**2. Bootstrap — cria os buckets de estado, resultados e código-fonte da function**
+**2. Bootstrap — cria os buckets de estado, resultados, código-fonte da function e dataset**
 
 ```
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
@@ -932,6 +932,9 @@ Depois, aplique `infra/bootstrap` de novo (cria só o bucket novo, os outros
 ```
 infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/bootstrap init
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
   run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
 infra/scripts/upload_dataset.sh <dataset_bucket>
 ```
@@ -952,14 +955,23 @@ bucket de dataset acima — nunca o fixture do oráculo, que é exclusivo do
 smoke test) + fixture de contexto-por-seletividade, roda `load/run_battery.py`
 de verdade a partir da VM `loadgen` (via SSH/IAP — a VM de serviço não tem
 IP público) varrendo carga × seletividade conforme `CONTEXTO.md`,
-"Protocolo de medição", traz os `results/` de volta e sincroniza com o
-bucket de resultados do bootstrap (passo 2), e por fim `terraform destroy`
-a célula — mesma disciplina de confirmação antes de cada `apply`/`destroy`
-do smoke test.
+"Protocolo de medição", **e a busca de vazão de saturação** (mesma seção —
+rampa curta na triagem, rampa fina na confirmação, `load/saturation.py`),
+traz os `results/` de volta e sincroniza com o bucket de resultados do
+bootstrap (passo 2), e por fim `terraform destroy` a célula — mesma
+disciplina de confirmação antes de cada `apply`/`destroy` do smoke test.
+
+**Pré-requisito novo do host:** a busca de saturação checa a CPU do
+gerador a cada patamar via Cloud Monitoring
+(`analysis/resources.py:GCPMonitoringCollector`), chamada direto do host —
+rode `pip install -e .` uma vez (além do `gcloud` CLI já exigido pela Fase
+4) para ter `google-cloud-monitoring` disponível.
 
 **Triagem — todas as 14 células, carga e seletividade fixas em nível
 intermediário** (`CONTEXTO.md`, "Delineamento em duas etapas" — identifica a
-fronteira de Pareto latência × custo):
+fronteira de Pareto em **3 dimensões**: latência × custo × vazão de
+saturação). A rampa curta (exploratória, 1 repetição por patamar) roda
+automaticamente logo depois do sweep de carga fixa — não precisa de flag:
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
@@ -967,25 +979,53 @@ python -m infra.scripts.run_measurement_battery e1-postgres <project-id> us-cent
     <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase triagem
 ```
 
-Repita para as outras 13 células (troque só o nome da célula). `--ramp`
-adiciona a rampa até violar o SLO ao final do sweep; `--keep-infra` pula o
-`destroy` para investigar uma falha manualmente.
+Ou, via `make` (`Makefile`, alvo dedicado):
+
+```
+make saturation-triagem CELL=e1-postgres PROJECT_ID=<project-id> TF_STATE_BUCKET=<terraform_state_bucket> \
+    RESULTS_BUCKET=<results_bucket> DATASET_BUCKET=<dataset_bucket> TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+```
+
+Repita para as outras 13 células (troque só o nome da célula). `--keep-infra`
+pula o `destroy` para investigar uma falha manualmente. Se a rampa reportar
+`loadgen_bottleneck` (o gerador saturou antes da célula, CPU ≥ 60%), a
+vazão dessa célula fica sem dado — escale o tipo de máquina do gerador
+(`infra/modules/loadgen`) e repita só a rampa antes de confiar no
+resultado; latência/custo já medidos continuam válidos.
 
 Depois de rodar a triagem para as 14, consolide e ache a fronteira de
-Pareto:
+Pareto (agora considerando a vazão de saturação — células dentro de 20%
+uma da outra, ou censuradas, empatam nessa dimensão, `analysis/pareto.py`):
 
 ```
 docker compose run --rm --entrypoint python tools analysis/report.py \
     results --phase triagem --out results/report/triagem
 ```
 
+O `report.json` traz `pareto_frontier` (lista de `cell_id` não dominados) e
+`censorship_warning` (não nulo se mais da metade das células ficou
+censurada na vazão — sinal de que essa dimensão não discriminou e a
+fronteira deveria cair para 2D). Leia o `saturation_throughput_approx` (ou
+`saturation_lower_bound`, se censurada) de cada célula da fronteira em
+`report.json` — é o `--saturation-start` do próximo passo.
+
 **Confirmação — só as células da fronteira, varredura completa de carga ×
-seletividade + 5 repetições:**
+seletividade + 5 repetições, mais a rampa fina de saturação (5 repetições
+por patamar, nos 3 níveis de seletividade):**
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 python -m infra.scripts.run_measurement_battery <cell-da-fronteira> <project-id> us-central1 us-central1-a \
-    <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase confirmacao
+    <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase confirmacao \
+    --saturation-start <valor-do-report.json-da-triagem>
+```
+
+Ou via `make`:
+
+```
+make saturation-confirmacao CELL=<cell-da-fronteira> START=<valor-do-report.json-da-triagem> \
+    PROJECT_ID=<project-id> TF_STATE_BUCKET=<terraform_state_bucket> RESULTS_BUCKET=<results_bucket> \
+    DATASET_BUCKET=<dataset_bucket> TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 ```
 
 ```
@@ -996,9 +1036,22 @@ docker compose run --rm --entrypoint python tools analysis/report.py \
 `analysis/report.py` roda `collect.py` sobre cada repetição ainda não
 coletada, agrupa as latências por célula, aplica Kruskal-Wallis → Dunn
 (Bonferroni) → epsilon-quadrado → IC de bootstrap do p99 (`CONTEXTO.md`,
-"Estatística"), escreve `report.json` + `pareto.png`; na confirmação, ainda
+"Estatística"), escreve `report.json` + `pareto.png` (pontos da fronteira
+marcados, vazão de saturação anotada por célula); na confirmação, ainda
 roda TOST par-a-par entre as células da fronteira e gera o gráfico de
-comparação de percentis.
+comparação de percentis. As sondagens brutas da rampa de confirmação (a
+distribuição completa exigida por essa etapa, ao contrário da curta, que
+nunca é arquivada) ficam em `results/_saturation/<cell>/` — fora do
+namespace que `analysis/report.py` varre por padrão.
+
+**Instrumentação de gargalo** — durante a rampa de confirmação,
+`resources.csv` registra CPU/memória/rede das 3 VMs a cada 5s
+(`analysis/resources.py:GCPMonitoringCollector`, via um coletor
+OpenTelemetry rodando como contêiner em cada VM — Ops Agent oficial do
+Google não roda em COS, sem gerenciador de pacotes). **Esta é a parte
+menos testada do projeto** — só validada por `terraform validate`, nunca
+contra uma VM real; recomenda-se rodar a triagem de uma única célula
+primeiro e conferir `resources.csv` antes de rodar as 14.
 
 O disco da célula sobrevive fora do ciclo de vida da VM —
 `infra/scripts/snapshot_after_load.sh <disk-name> <zone> <project-id>`, se

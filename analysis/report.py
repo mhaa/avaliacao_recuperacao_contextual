@@ -22,6 +22,7 @@ import numpy as np
 import polars as pl
 
 from analysis.collect import collect
+from analysis.pareto import censorship_warning, pareto_frontier
 from analysis.plots import plot_pareto_frontier, plot_percentile_comparison
 from analysis.stats import (
     bootstrap_percentile_ci,
@@ -70,6 +71,29 @@ def ensure_collected(rep_dirs: list[Path]) -> None:
             collect(rep_dir)
 
 
+def load_cell_saturation(rep_dirs: list[Path]) -> dict[str, dict]:
+    """Lê saturation.json (um por execução de
+    infra/scripts/run_measurement_battery.py, em
+    results/<cell>/<phase>/<timestamp>/saturation.json — SaturationSearchResult
+    de load/saturation.py). Se uma célula tiver mais de uma execução, usa a
+    do timestamp mais recente. Ausência de saturation.json para uma célula
+    é normal (rodadas anteriores a esta etapa) — fica de fora do dict."""
+    timestamp_dir_by_cell: dict[str, Path] = {}
+    for rep_dir in rep_dirs:
+        cell_id = rep_dir.parents[2].name
+        timestamp_dir = rep_dir.parent
+        current = timestamp_dir_by_cell.get(cell_id)
+        if current is None or timestamp_dir.name > current.name:
+            timestamp_dir_by_cell[cell_id] = timestamp_dir
+
+    saturation_by_cell: dict[str, dict] = {}
+    for cell_id, timestamp_dir in timestamp_dir_by_cell.items():
+        saturation_path = timestamp_dir / "saturation.json"
+        if saturation_path.exists():
+            saturation_by_cell[cell_id] = json.loads(saturation_path.read_text())
+    return saturation_by_cell
+
+
 def load_cell_latencies(rep_dirs: list[Path]) -> dict[str, list[float]]:
     """Agrupa por cell_id (results/<cell_id>/<phase>/<timestamp>/rep<N>/),
     concatenando latency_ms de todas as repetições daquela célula."""
@@ -91,7 +115,10 @@ def percentiles_of(latencies: list[float]) -> dict[str, float]:
     }
 
 
-def build_report(groups: dict[str, list[float]]) -> dict:
+def build_report(
+    groups: dict[str, list[float]], saturation_by_cell: dict[str, dict] | None = None
+) -> dict:
+    saturation_by_cell = saturation_by_cell or {}
     labels = list(groups)
     kruskal = kruskal_wallis([groups[label] for label in labels])
     dunn = dunn_posthoc(groups) if kruskal.reject_h0 else {}
@@ -102,15 +129,21 @@ def build_report(groups: dict[str, list[float]]) -> dict:
     bootstrap_ci_p99 = {}
     for cell_id, latencies in groups.items():
         p99 = percentiles_of(latencies)["p99"]
+        saturation = saturation_by_cell.get(cell_id, {})
         cells.append(
             {
                 "cell_id": cell_id,
                 "latency_p99_ms": p99,
                 "cost_usd_hour": CELL_COST_USD_HOUR[storage_for_cell(cell_id)],
+                "saturation_throughput_approx": saturation.get("approx_throughput"),
+                "saturation_censored": saturation.get("censored", False),
+                "saturation_lower_bound": saturation.get("lower_bound"),
             }
         )
         ci = bootstrap_percentile_ci(latencies, percentile=0.99)
         bootstrap_ci_p99[cell_id] = {"low": ci.low, "high": ci.high}
+
+    frontier = pareto_frontier(cells)
 
     return {
         "kruskal_wallis": {
@@ -122,6 +155,8 @@ def build_report(groups: dict[str, list[float]]) -> dict:
         "effect_size_epsilon_squared": epsilon_squared,
         "bootstrap_ci_p99": bootstrap_ci_p99,
         "cells": cells,
+        "pareto_frontier": [c["cell_id"] for c in frontier],
+        "censorship_warning": censorship_warning(cells),
     }
 
 
@@ -157,12 +192,31 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     ensure_collected(rep_dirs)
+    saturation_by_cell = load_cell_saturation(rep_dirs)
     groups = load_cell_latencies(rep_dirs)
 
-    report = build_report(groups)
+    # loadgen_bottleneck invalida só a VAZÃO medida (o gerador saturou antes
+    # da célula) — nunca a latência/custo já coletados sob carga fixa, que
+    # continuam válidos. Descartar a célula inteira jogaria fora dado bom.
+    bottlenecked_cells = {
+        cell_id for cell_id, s in saturation_by_cell.items() if s.get("loadgen_bottleneck")
+    }
+    for cell_id in bottlenecked_cells:
+        print(
+            f"AVISO: {cell_id} — o gerador de carga saturou durante a rampa (loadgen_bottleneck); "
+            "a vazão de saturação desta célula fica sem dado (nem censurada, nem um valor) até o "
+            "gerador ser escalado e a rampa repetida. Latência/custo continuam válidos."
+        )
+        saturation_by_cell.pop(cell_id, None)
+
+    report = build_report(groups, saturation_by_cell)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "report.json").write_text(json.dumps(report, indent=2))
-    plot_pareto_frontier(report["cells"], args.out / "pareto.png")
+    plot_pareto_frontier(
+        report["cells"], args.out / "pareto.png", frontier_cell_ids=set(report["pareto_frontier"])
+    )
+    if report["censorship_warning"]:
+        print(f"AVISO: {report['censorship_warning']}")
 
     if args.phase == "confirmacao":
         extra = build_confirmation_extras(groups)

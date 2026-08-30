@@ -15,17 +15,44 @@ from pathlib import Path  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
 
-def plot_pareto_frontier(cells: list[dict], out_path: Path) -> None:
-    """`cells`: [{"cell_id": str, "latency_p99_ms": float, "cost_usd_hour": float}, ...]
-    — CONTEXTO.md, "Delineamento em duas etapas": a triagem "identifica a
-    fronteira de Pareto latência × custo"."""
+def plot_pareto_frontier(
+    cells: list[dict], out_path: Path, frontier_cell_ids: set[str] | None = None
+) -> None:
+    """`cells`: [{"cell_id": str, "latency_p99_ms": float, "cost_usd_hour": float,
+    "saturation_throughput_approx": float|None, "saturation_censored": bool}, ...]
+    (os dois últimos campos são opcionais — CONTEXTO.md, "Delineamento em
+    duas etapas": a triagem "identifica a fronteira de Pareto latência ×
+    custo", agora em 3 dimensões — analysis/pareto.py). Vazão de saturação
+    entra como anotação de texto, não um terceiro eixo (mais legível para o
+    texto do TCC do que um scatter 3D). `frontier_cell_ids` marca os pontos
+    não dominados (analysis/pareto.py:pareto_frontier) com um marcador
+    diferente dos dominados."""
     fig, ax = plt.subplots()
-    ax.scatter([c["cost_usd_hour"] for c in cells], [c["latency_p99_ms"] for c in cells])
+    frontier_cell_ids = frontier_cell_ids or set()
+
     for c in cells:
-        ax.annotate(c["cell_id"], (c["cost_usd_hour"], c["latency_p99_ms"]))
+        in_frontier = c["cell_id"] in frontier_cell_ids
+        ax.scatter(
+            [c["cost_usd_hour"]],
+            [c["latency_p99_ms"]],
+            marker="o" if in_frontier else "x",
+            s=80 if in_frontier else 40,
+        )
+        throughput = c.get("saturation_throughput_approx")
+        censored = c.get("saturation_censored", False)
+        if censored:
+            lower_bound = c.get("saturation_lower_bound")
+            throughput_label = f"≥{lower_bound:.0f} (censurada)" if lower_bound else "censurada"
+        elif throughput is not None:
+            throughput_label = f"{throughput:.0f} req/s"
+        else:
+            throughput_label = ""
+        label = c["cell_id"] + (f"\n{throughput_label}" if throughput_label else "")
+        ax.annotate(label, (c["cost_usd_hour"], c["latency_p99_ms"]), fontsize=8)
+
     ax.set_xlabel("Custo (US$/hora)")
     ax.set_ylabel("Latência p99 (ms)")
-    ax.set_title("Fronteira de Pareto — latência × custo (triagem)")
+    ax.set_title("Fronteira de Pareto — latência × custo × vazão de saturação (triagem)")
     _save(fig, out_path)
 
 

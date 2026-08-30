@@ -8,7 +8,13 @@ import csv
 
 import pytest
 
-from analysis.resources import ResourceSample, _parse_mem_usage, _parse_percent, write_resources_csv
+from analysis.resources import (
+    ResourceSample,
+    _parse_mem_usage,
+    _parse_percent,
+    classify_bottleneck,
+    write_resources_csv,
+)
 
 
 def test_parse_percent_strips_the_percent_sign():
@@ -41,3 +47,34 @@ def test_write_resources_csv_round_trips(tmp_path):
     assert rows[0]["component"] == "database"
     assert float(rows[0]["cpu_percent"]) == 12.3
     assert rows[1]["component"] == "service"
+
+
+def test_classify_bottleneck_picks_the_resource_closest_to_its_ceiling():
+    samples = [
+        ResourceSample(component="database", cpu_percent=95.0, memory_mb=1000.0),
+        ResourceSample(component="service", cpu_percent=40.0, memory_mb=500.0),
+        ResourceSample(component="loadgen", cpu_percent=30.0, memory_mb=500.0),
+    ]
+    assert classify_bottleneck(samples) == "database_cpu"
+
+
+def test_classify_bottleneck_considers_memory_when_a_ceiling_is_given():
+    samples = [
+        ResourceSample(component="database", cpu_percent=50.0, memory_mb=7000.0),
+        ResourceSample(component="service", cpu_percent=40.0, memory_mb=500.0),
+    ]
+    result = classify_bottleneck(samples, memory_ceiling_mb={"database": 8000.0, "service": 16000.0})
+    assert result == "database_memory"
+
+
+def test_classify_bottleneck_considers_network_when_present():
+    samples = [
+        ResourceSample(component="loadgen", cpu_percent=20.0, memory_mb=500.0, network_mbps=850.0),
+        ResourceSample(component="database", cpu_percent=20.0, memory_mb=500.0),
+    ]
+    assert classify_bottleneck(samples) == "loadgen_network"
+
+
+def test_classify_bottleneck_raises_without_samples():
+    with pytest.raises(ValueError):
+        classify_bottleneck([])

@@ -11,6 +11,7 @@ import pytest
 
 from load.run_battery import (
     build_k6_cmd,
+    build_probe_k6_cmd,
     build_run_plan,
     list_viable_cell_ids,
     shuffled_cell_order,
@@ -61,25 +62,34 @@ def test_target_url_for_raises_without_either():
         target_url_for("e1-postgres", None, None)
 
 
-def test_build_k6_cmd_plain_has_neither_smoke_nor_ramp_flag():
+def test_build_k6_cmd_plain_has_no_smoke_flag():
     cmd = build_k6_cmd(
-        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", False, False
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", False
     )
-    assert "SMOKE_MODE=true" not in cmd
-    assert "RAMP_MODE=true" not in cmd
-
-
-def test_build_k6_cmd_ramp_sets_ramp_mode_env_var():
-    cmd = build_k6_cmd(
-        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", False, True
-    )
-    assert "RAMP_MODE=true" in cmd
     assert "SMOKE_MODE=true" not in cmd
 
 
 def test_build_k6_cmd_smoke_sets_smoke_mode_env_var():
     cmd = build_k6_cmd(
-        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", True, False
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", True
     )
     assert "SMOKE_MODE=true" in cmd
-    assert "RAMP_MODE=true" not in cmd
+
+
+def test_build_probe_k6_cmd_sets_probe_mode_and_rate():
+    cmd = build_probe_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 4000, "medium", "0s", "1m"
+    )
+    assert "PROBE_MODE=true" in cmd
+    assert "PROBE_RATE=4000" in cmd
+    assert "PROBE_WARMUP=0s" in cmd
+    assert "PROBE_MEASURE=1m" in cmd
+    assert "SELECTIVITY_TIER=medium" in cmd
+
+
+def test_build_probe_k6_cmd_passes_through_warmup_and_measure_durations():
+    cmd = build_probe_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 11000, "low", "2m", "3m"
+    )
+    assert "PROBE_WARMUP=2m" in cmd
+    assert "PROBE_MEASURE=3m" in cmd

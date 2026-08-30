@@ -47,9 +47,17 @@ const EXCLUSION_SIZE = parseInt(__ENV.EXCLUSION_SIZE || '20', 10);
 // I=87.585 é constante do catálogo (CONTEXTO.md, "Parâmetros fixos") — não
 // escala com U, então não precisa de override entre local e nuvem.
 const ITEM_COUNT = parseInt(__ENV.ITEM_COUNT || '87585', 10);
-// Rampa até violar o SLO (CONTEXTO.md): cenário à parte, ativado por env,
-// nunca simultâneo às taxas fixas.
-const RAMP_MODE = (__ENV.RAMP_MODE || 'false') === 'true';
+// Sondagem de um único patamar (CONTEXTO.md, "Protocolo de medição" —
+// vazão de saturação): usada tanto pela rampa curta exploratória da
+// triagem quanto pela rampa fina de confirmação — a diferença entre elas
+// (patamares, se tem aquecimento, duração) é decidida no orquestrador
+// Python (load/saturation.py), nunca aqui. Substituiu o antigo RAMP_MODE/
+// rampScenarios (um único ramp contínuo, sem busca binária nem checagem
+// do gerador — não implementava o protocolo).
+const PROBE_MODE = (__ENV.PROBE_MODE || 'false') === 'true';
+const PROBE_RATE = parseInt(__ENV.PROBE_RATE || '100', 10);
+const PROBE_WARMUP = __ENV.PROBE_WARMUP || '0s';
+const PROBE_MEASURE = __ENV.PROBE_MEASURE || '1m';
 // Smoke test em nuvem (infra/scripts/cloud_smoke_test.py): só confirma que
 // o serviço responde, não mede nada — poucas iterações, sem SLO. Cenário
 // próprio (nome "smoke", fora de MEASUREMENT_SCENARIOS em
@@ -98,20 +106,15 @@ const constantRateScenarios = {
   },
 };
 
-const rampScenarios = {
-  ramp_to_slo: {
-    executor: 'ramping-arrival-rate',
-    startRate: 100,
+const probeScenarios = {
+  probe: {
+    executor: 'constant-arrival-rate',
+    rate: PROBE_RATE,
     timeUnit: '1s',
-    preAllocatedVUs: 1000,
-    maxVUs: 8000,
-    stages: [
-      { target: 100, duration: '30s' },
-      { target: 1000, duration: '1m' },
-      { target: 5000, duration: '2m' },
-      { target: 10000, duration: '2m' },
-      { target: 20000, duration: '2m' },
-    ],
+    duration: PROBE_MEASURE,
+    startTime: PROBE_WARMUP,
+    preAllocatedVUs: Math.max(50, Math.ceil(PROBE_RATE * 0.5)),
+    maxVUs: Math.max(200, PROBE_RATE * 2),
   },
 };
 
@@ -124,24 +127,21 @@ const smokeScenarios = {
   },
 };
 
-// `abortOnFail` só no modo rampa: é o mecanismo que implementa "rampa até
-// violar o SLO" — para as taxas fixas queremos a janela de medição inteira
-// mesmo que o SLO seja violado ocasionalmente, para a análise decidir. Smoke
-// não tem threshold de SLO nenhum — só sanidade ("não deu erro"), não medição.
-const thresholds = SMOKE_MODE
-  ? {}
-  : RAMP_MODE
-    ? {
-        'http_req_duration{scenario:ramp_to_slo}': [{ threshold: 'p(99)<200', abortOnFail: true }],
-        'http_req_failed{scenario:ramp_to_slo}': [{ threshold: 'rate<0.01', abortOnFail: true }],
-      }
+// Sem threshold nenhum em SMOKE_MODE (só sanidade, "não deu erro", não
+// medição) nem em PROBE_MODE (o Python decide violação de SLO olhando o
+// summary calculado por analysis/collect.py depois — comparar contra o
+// mesmo p99/taxa-de-erro que entra no manifest, em vez de duas
+// implementações do mesmo julgamento, uma em JS outra em Python).
+const thresholds =
+  SMOKE_MODE || PROBE_MODE
+    ? {}
     : {
         'http_req_duration{scenario:measurement}': ['p(99)<200'],
         'http_req_failed{scenario:measurement}': ['rate<0.01'],
       };
 
 export const options = {
-  scenarios: SMOKE_MODE ? smokeScenarios : RAMP_MODE ? rampScenarios : constantRateScenarios,
+  scenarios: SMOKE_MODE ? smokeScenarios : PROBE_MODE ? probeScenarios : constantRateScenarios,
   thresholds,
 };
 

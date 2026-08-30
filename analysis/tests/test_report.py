@@ -15,6 +15,7 @@ from analysis.report import (
     discover_rep_dirs,
     ensure_collected,
     load_cell_latencies,
+    load_cell_saturation,
 )
 
 
@@ -101,3 +102,43 @@ def test_build_report_rejects_h0_and_dunn_points_at_the_shifted_cell(tmp_path):
     assert report["dunn_posthoc"]["e1-postgres|e2-postgres"] > 0.05
     cell_ids = {c["cell_id"] for c in report["cells"]}
     assert cell_ids == set(cells)
+
+
+def test_load_cell_saturation_uses_the_most_recent_timestamp_per_cell(tmp_path):
+    old_dir = tmp_path / "e1-postgres" / "triagem" / "20260101T000000Z"
+    new_dir = tmp_path / "e1-postgres" / "triagem" / "20260102T000000Z"
+    (old_dir / "rep0").mkdir(parents=True)
+    (new_dir / "rep0").mkdir(parents=True)
+    (old_dir / "saturation.json").write_text(
+        json.dumps({"approx_throughput": 1000.0, "censored": False, "lower_bound": None, "loadgen_bottleneck": False})
+    )
+    (new_dir / "saturation.json").write_text(
+        json.dumps({"approx_throughput": 9000.0, "censored": False, "lower_bound": None, "loadgen_bottleneck": False})
+    )
+
+    result = load_cell_saturation([old_dir / "rep0", new_dir / "rep0"])
+
+    assert result["e1-postgres"]["approx_throughput"] == 9000.0
+
+
+def test_build_report_includes_saturation_fields_and_pareto_frontier(tmp_path):
+    results_root, cells = _build_fake_results(tmp_path)
+    rep_dirs = discover_rep_dirs(results_root, "triagem")
+    ensure_collected(rep_dirs)
+    groups = load_cell_latencies(rep_dirs)
+
+    saturation_by_cell = {
+        "e1-postgres": {"approx_throughput": 5000.0, "censored": False, "lower_bound": None},
+        "e2-postgres": {"approx_throughput": 5000.0, "censored": False, "lower_bound": None},
+        "e1-valkey": {"approx_throughput": None, "censored": True, "lower_bound": 50000.0},
+    }
+    report = build_report(groups, saturation_by_cell)
+
+    by_id = {c["cell_id"]: c for c in report["cells"]}
+    assert by_id["e1-postgres"]["saturation_throughput_approx"] == 5000.0
+    assert by_id["e1-valkey"]["saturation_censored"] is True
+    # e1-valkey tem latência muito pior (deslocada de propósito) — mesmo
+    # censurada (vencendo em vazão), não domina em latência/custo, então
+    # não deveria varrer a fronteira sozinha.
+    assert "pareto_frontier" in report
+    assert "censorship_warning" in report

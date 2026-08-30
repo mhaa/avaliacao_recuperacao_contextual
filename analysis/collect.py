@@ -27,9 +27,14 @@ from pathlib import Path
 import polars as pl
 
 # Escopo de medição: CONTEXTO.md, "2 min de aquecimento descartados + 5 min
-# de medição" (tag `measurement`) e a rampa até violar o SLO (tag
-# `ramp_to_slo`, load/scenarios.js RAMP_MODE=true) — nunca `warmup`.
-MEASUREMENT_SCENARIOS = frozenset({"measurement", "ramp_to_slo"})
+# de medição" (tag `measurement`) — nunca `warmup`.
+MEASUREMENT_SCENARIOS = frozenset({"measurement"})
+
+# Sondagem de vazão de saturação (load/saturation.py, load/scenarios.js
+# PROBE_MODE=true) — usado explicitamente por
+# infra/scripts/run_measurement_battery.py, nunca no default (mesmo padrão
+# de analysis/smoke_report.py:SMOKE_SCENARIOS).
+PROBE_SCENARIOS = frozenset({"probe"})
 
 
 def parse_k6_ndjson(path: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS) -> pl.DataFrame:
@@ -140,8 +145,8 @@ def build_summary(latencies_df: pl.DataFrame) -> dict:
     }
 
 
-def collect(run_dir: Path) -> None:
-    latencies_df = parse_k6_ndjson(run_dir / "k6-raw.json")
+def collect(run_dir: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS) -> None:
+    latencies_df = parse_k6_ndjson(run_dir / "k6-raw.json", scenarios=scenarios)
     latencies_df.write_parquet(run_dir / "latencies.parquet")
 
     summary = build_summary(latencies_df)

@@ -24,10 +24,11 @@ partir dos outputs `service_internal_ip` de infra/envs/experiment. Quem
 invoca isso de fato é infra/scripts/run_measurement_battery.py, um combo
 (rate, selectivity_tier) por vez, via SSH na VM `loadgen`.
 
---ramp troca o executor de constant-arrival-rate para ramping-arrival-rate
-("rampa até violar o SLO", CONTEXTO.md) — mutuamente exclusivo com --smoke
-na prática, já que servem propósitos diferentes (nunca passar os dois numa
-mesma execução).
+A vazão de saturação (CONTEXTO.md, "Protocolo de medição") não é uma
+"bateria" no sentido deste arquivo (repetições × células) — é uma busca
+adaptativa de um único patamar por vez, orquestrada por
+load/saturation.py, que usa build_probe_k6_cmd() abaixo em vez de
+build_k6_cmd()/run_k6().
 """
 
 from __future__ import annotations
@@ -88,7 +89,6 @@ def build_k6_cmd(
     k: int,
     selectivity_tier: str,
     smoke: bool,
-    ramp: bool,
 ) -> list[str]:
     cmd = [
         "k6",
@@ -113,12 +113,43 @@ def build_k6_cmd(
         # SMOKE_MODE=true troca o cenário inteiro dentro de scenarios.js
         # por um curto e sem threshold de SLO (ver load/scenarios.js).
         cmd += ["-e", "SMOKE_MODE=true"]
-    if ramp:
-        # RAMP_MODE=true troca para o executor ramping-arrival-rate — "rampa
-        # até violar o SLO" (CONTEXTO.md, "Protocolo de medição"), com
-        # abortOnFail nos thresholds (load/scenarios.js).
-        cmd += ["-e", "RAMP_MODE=true"]
     return cmd
+
+
+def build_probe_k6_cmd(
+    json_out: Path,
+    cell_id: str,
+    target_url: str,
+    rate: int,
+    selectivity_tier: str,
+    warmup: str,
+    measure: str,
+) -> list[str]:
+    """Sondagem de um único patamar (load/saturation.py) — PROBE_MODE em
+    load/scenarios.js, sem RATE/K fixos de constant-arrival-rate normal
+    (a duração/aquecimento vêm do algoritmo de busca, não de --repetitions/
+    --phase)."""
+    return [
+        "k6",
+        "run",
+        str(SCENARIOS_SCRIPT),
+        "--out",
+        f"json={json_out}",
+        "-e",
+        f"CELL={cell_id}",
+        "-e",
+        f"TARGET_URL={target_url}",
+        "-e",
+        f"SELECTIVITY_TIER={selectivity_tier}",
+        "-e",
+        "PROBE_MODE=true",
+        "-e",
+        f"PROBE_RATE={rate}",
+        "-e",
+        f"PROBE_WARMUP={warmup}",
+        "-e",
+        f"PROBE_MEASURE={measure}",
+    ]
 
 
 def run_k6(
@@ -130,12 +161,11 @@ def run_k6(
     k: int,
     selectivity_tier: str,
     smoke: bool,
-    ramp: bool,
     out_dir: Path,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     json_out = out_dir / "k6-raw.json"
-    cmd = build_k6_cmd(json_out, cell_id, target_url, rate, k, selectivity_tier, smoke, ramp)
+    cmd = build_k6_cmd(json_out, cell_id, target_url, rate, k, selectivity_tier, smoke)
 
     manifest = {
         "cell_id": cell_id,
@@ -146,7 +176,6 @@ def run_k6(
         "k": k,
         "selectivity_tier": selectivity_tier,
         "smoke": smoke,
-        "ramp": ramp,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
     }
@@ -170,7 +199,13 @@ def main(argv: list[str] | None = None) -> int:
         "--selectivity-tier", default="medium", choices=["high", "medium", "low"]
     )
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--ramp", action="store_true")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="reusa um timestamp já existente (%%Y%%m%%dT%%H%%M%%SZ) em vez de gerar um novo — "
+        "usado por infra/scripts/run_measurement_battery.py para a varredura e a rampa curta de "
+        "saturação (load/saturation.py) caírem no mesmo diretório results/<cell>/<phase>/<ts>/.",
+    )
     args = parser.parse_args(argv)
 
     cell_ids = args.cells or list_viable_cell_ids()
@@ -178,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"ordem embaralhada (seed={args.seed}): {order}")
 
     targets = json.loads(args.targets.read_text()) if args.targets else None
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     for cell_id, repetition in build_run_plan(order, args.repetitions):
         url = target_url_for(cell_id, args.target_url, targets)
@@ -192,7 +227,6 @@ def main(argv: list[str] | None = None) -> int:
             args.k,
             args.selectivity_tier,
             args.smoke,
-            args.ramp,
             out_dir,
         )
     return 0

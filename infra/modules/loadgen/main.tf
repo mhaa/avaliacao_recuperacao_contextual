@@ -74,10 +74,53 @@ resource "google_storage_bucket_iam_member" "loadgen_dataset_reader" {
   member = "serviceAccount:${google_service_account.loadgen.email}"
 }
 
+# Instrumentação de gargalo (CONTEXTO.md / analysis/resources.py:
+# GCPMonitoringCollector) — mesma métrica de CPU que
+# load/saturation.py:GENERATOR_CPU_THRESHOLD checa a cada patamar da busca
+# de saturação, não só ao final; escrita sob esta SA.
+resource "google_project_iam_member" "loadgen_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.loadgen.email}"
+}
+
 locals {
   # Mesma extração de infra/modules/service/main.tf — host do registro a
   # partir da própria referência da imagem, sem variável nova.
   tools_registry_host = split("/", var.tools_image)[0]
+
+  # Instrumentação de gargalo (CONTEXTO.md) — mesmo mecanismo de
+  # infra/modules/database/main.tf (Ops Agent oficial não roda em COS;
+  # OpenTelemetry Collector Contrib como contêiner). Duplicado idêntico
+  # nos 3 módulos de propósito — não é configuração por célula.
+  otel_collector_startup = <<-OTELEOT
+    cat > /etc/otel-config.yaml <<'YAMLEOF'
+    receivers:
+      hostmetrics:
+        collection_interval: 5s
+        root_path: /hostfs
+        scrapers:
+          memory:
+          cpu:
+          network:
+    processors:
+      batch:
+    exporters:
+      googlecloud:
+        project: "${var.project_id}"
+    service:
+      pipelines:
+        metrics:
+          receivers: [hostmetrics]
+          processors: [batch]
+          exporters: [googlecloud]
+    YAMLEOF
+    docker run -d --name tcc-otel-agent --restart unless-stopped \
+      --pid host --network host \
+      -v /:/hostfs:ro \
+      -v /etc/otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro \
+      otel/opentelemetry-collector-contrib:0.112.0
+  OTELEOT
 }
 
 resource "google_compute_instance" "loadgen" {
@@ -106,6 +149,7 @@ resource "google_compute_instance" "loadgen" {
     startup-script = <<-EOT
       #!/bin/bash
       set -euo pipefail
+      ${local.otel_collector_startup}
       # COS não tem gcloud — autentica o Docker direto via token OAuth do
       # servidor de metadados (mesmo padrão de infra/modules/service e
       # infra/modules/database).
