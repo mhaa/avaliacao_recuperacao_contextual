@@ -176,7 +176,18 @@ def write_oracle(cases: list[dict], path) -> None:
 
 
 def run(data_dir: DataPaths, seed: int, force: bool) -> dict:
-    params = {"seed": seed}
+    # `sample_users` não é parâmetro desta etapa (o oráculo não restringe
+    # usuários por conta própria, só lê o que ingest já produziu) — mas o
+    # RESULTADO depende inteiramente da escala de `ingest` (candidates.parquet,
+    # id_maps.parquet). Sem incluir isso aqui, dois `all` com o mesmo seed em
+    # escalas diferentes (ex.: dev depois real) marcavam a etapa como "já
+    # feita" e nunca regeneravam — confirmado na prática: rodar `all` sem
+    # `--sample-users` depois de já ter rodado com `--sample-users 10000`
+    # manteve o oracle.parquet antigo, agora referenciando IDs densos de uma
+    # população de usuários completamente diferente da que id_maps.parquet
+    # passou a descrever.
+    ingest_u = read_stats(data_dir.stats).get("ingest", {}).get("U")
+    params = {"seed": seed, "ingest_u": ingest_u}
     if not force and stage_is_done("oracle", [data_dir.oracle], data_dir.stats, params):
         return read_stats(data_dir.stats).get("oracle", {})
 

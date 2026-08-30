@@ -47,16 +47,28 @@ def build_prematerialized(
     rank, truncado em m. Garante exatamente n_users * C linhas."""
     context_item_map = contexts_module.context_item_pairs(contexts_df, combination_membership)
 
-    joined = candidates_lf.join(context_item_map.lazy(), on="item_id", how="inner")
-
-    topm = (
-        joined.group_by(["user_id", "context_id"])
+    # Processa em lotes de usuário, não a base inteira de uma vez: em
+    # escala real (U=200.948), o join (candidates × pertences item-contexto,
+    # ~100M+ linhas de entrada) + group_by materializado de uma só vez
+    # estourou memória (SIGKILL, nem `engine="streaming"` do polars nem 9GB
+    # livres no Docker Desktop resolveram — confirmado travando duas vezes
+    # seguidas, sempre no mesmo ponto, nunca chegando a escrever
+    # prematerialized.parquet). Lotes do tamanho da escala de
+    # desenvolvimento (10.000 usuários, que sempre funcionou sem esforço)
+    # limitam o pico de memória por lote independentemente de U.
+    batch_size = 10_000
+    topm_batches = [
+        candidates_lf.filter(pl.col("user_id").is_between(lo, lo + batch_size, closed="left"))
+        .join(context_item_map.lazy(), on="item_id", how="inner")
+        .group_by(["user_id", "context_id"])
         .agg(
             pl.col("item_id").sort_by("rank").head(m).alias("item_ids"),
             pl.col("score").sort_by("rank").head(m).alias("scores"),
         )
         .collect()
-    )
+        for lo in range(0, n_users, batch_size)
+    ]
+    topm = pl.concat(topm_batches)
 
     grid = pl.DataFrame(
         {"user_id": list(range(n_users))}, schema={"user_id": pl.Int32}
