@@ -64,6 +64,12 @@ variable "data_disk_size_gb" {
   }
 }
 
+variable "data_disk_snapshot" {
+  type        = string
+  description = "Nome do snapshot pra criar o disco já carregado (infra/scripts/seed_dataset_snapshots.py, ex.: tcc-dataset-seed-postgres) — vazio cria disco em branco (comportamento padrão)."
+  default     = ""
+}
+
 # Mesma imagem/flags de docker-compose.yml — nada de configuração nova
 # inventada aqui, só traduzida para `docker run` (evita confundir a
 # comparação entre células com uma diferença acidental de configuração).
@@ -94,9 +100,9 @@ locals {
     # raiz). Nunca aparece localmente porque docker-compose.yml usa um
     # volume nomeado do Docker, não um disco bruto — confirmado rodando
     # de verdade contra uma VM real.
-    postgres   = "-p 5432:5432 -v /mnt/disks/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -e PGDATA=/var/lib/postgresql/data/pgdata"
-    valkey     = "-p 6379:6379"
-    scylla     = "-p 9042:9042 -v /mnt/disks/data:/var/lib/scylla"
+    postgres = "-p 5432:5432 -v /mnt/disks/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -e PGDATA=/var/lib/postgresql/data/pgdata"
+    valkey   = "-p 6379:6379"
+    scylla   = "-p 9042:9042 -v /mnt/disks/data:/var/lib/scylla"
     # OPENSEARCH_JAVA_OPTS precisa de aspas em volta do valor inteiro: sem
     # elas, o shell quebra "-Xms2g -Xmx2g" em dois tokens e o segundo
     # ("-Xmx2g") chega ao `docker run` como se fosse uma flag própria dele
@@ -141,6 +147,14 @@ locals {
           processors: [batch]
           exporters: [googlecloud]
     YAMLEOF
+    # Mesmo motivo do retry de docker_image[storage] mais abaixo: a primeira
+    # conexão de saída de uma VM nova pode dar timeout antes do Cloud NAT
+    # estabilizar — confirmado ao vivo (console serial: "request canceled
+    # while waiting for connection"). Sem retry aqui, essa falha sob
+    # set -euo pipefail matava o startup-script INTEIRO antes até de chegar
+    # no docker run do banco — raiz real de timeouts de wait_for_container
+    # que pareciam ser do próprio container do banco/serviço.
+    for i in 1 2 3 4 5; do docker pull otel/opentelemetry-collector-contrib:0.112.0 && break || sleep 10; done
     docker run -d --name tcc-otel-agent --restart unless-stopped \
       --pid host --network host \
       -v /:/hostfs:ro \
@@ -150,10 +164,11 @@ locals {
 }
 
 resource "google_compute_disk" "data" {
-  name = "tcc-${var.cell}-data"
-  zone = var.zone
-  size = var.data_disk_size_gb
-  type = "pd-ssd"
+  name     = "tcc-${var.cell}-data"
+  zone     = var.zone
+  size     = var.data_disk_size_gb
+  type     = "pd-ssd"
+  snapshot = var.data_disk_snapshot != "" ? var.data_disk_snapshot : null
 }
 
 resource "google_service_account" "database" {
@@ -212,7 +227,13 @@ resource "google_compute_instance" "database" {
       #!/bin/bash
       set -euo pipefail
       mkdir -p /mnt/disks/data
+      %{if var.data_disk_snapshot == ""}
+      # Só formata disco em branco — um disco restaurado de snapshot
+      # (infra/scripts/seed_dataset_snapshots.py) já tem filesystem e
+      # dados; formatar de novo apagaria a carga que acabou de ser
+      # restaurada.
       mkfs.ext4 -F /dev/disk/by-id/google-data 2>/dev/null || true
+      %{endif}
       mount /dev/disk/by-id/google-data /mnt/disks/data
       ${local.otel_collector_startup}
       %{if var.storage == "opensearch"}
@@ -267,6 +288,17 @@ resource "google_compute_instance" "database" {
 output "internal_ip" {
   description = "IP interno da VM de banco — consumido pelo módulo service."
   value       = google_compute_instance.database.network_interface[0].network_ip
+}
+
+# Numérico, não o nome (`tcc-<cell>-database`): resource.labels.instance_id
+# do Cloud Monitoring para métricas gce_instance (ex.:
+# compute.googleapis.com/instance/cpu/utilization) é o ID numérico da VM, não
+# o nome — confirmado ao vivo (filtro por nome nunca casava nenhuma série,
+# não era atraso de propagação como se pensou a princípio). Consumido por
+# infra/scripts/run_measurement_battery.py.
+output "instance_id" {
+  description = "ID numérico da VM de banco — para filtrar métricas no Cloud Monitoring."
+  value       = google_compute_instance.database.instance_id
 }
 
 output "data_disk_name" {

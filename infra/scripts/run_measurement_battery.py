@@ -53,6 +53,7 @@ import json
 import os
 import random
 import shlex
+import subprocess
 import sys
 import threading
 import time
@@ -62,6 +63,7 @@ from typing import Callable
 
 from infra.scripts.cloud_smoke_test import (
     _confirm_billable,
+    _resolve_cmd,
     _run,
     build_schema_and_fixture_steps,
     build_storage_env_flags,
@@ -149,6 +151,7 @@ def build_remote_setup_command(
     postgres_password: str | None,
     fixtures_mount: str,
     dataset_bucket: str,
+    skip_dataset_load: bool = False,
 ) -> str:
     """Schema + massa de dados COMPLETA (mode="full" — não o subconjunto do
     oráculo do smoke test: load/zipf.js amostra de toda a população real) +
@@ -157,10 +160,16 @@ def build_remote_setup_command(
     (Fase 4), sem os gates de correção/smoke, que não são responsabilidade
     desta fase. Bind-monta `fixtures_mount` para `contexts_by_tier.json`
     sobreviver e ser lido depois por cada `docker run` de
-    `load/run_battery.py`."""
+    `load/run_battery.py`.
+
+    `skip_dataset_load=True` pula schema+load_full_dataset.py inteiro —
+    usado quando o disco já veio carregado de um snapshot
+    (infra/scripts/seed_dataset_snapshots.py, main() em run_measurement_battery.py)
+    e recarregar do zero desperdiçaria horas à toa. `export_contexts_by_tier.py`
+    nunca depende do banco, então sempre roda."""
     env_flags = build_storage_env_flags(cell_id, storage, database_ip, service_ip, postgres_password)
     env_flags = [*env_flags, f"DATASET_BUCKET={dataset_bucket}"]
-    steps = build_schema_and_fixture_steps(storage, mode="full")
+    steps = [] if skip_dataset_load else build_schema_and_fixture_steps(storage, mode="full")
     steps.append("python load/export_contexts_by_tier.py")
     inner = " && ".join(steps)
 
@@ -309,7 +318,6 @@ def _generator_cpu_percent(project_id: str, loadgen_instance: str, start_time, e
     collector = GCPMonitoringCollector(
         project_id=project_id,
         instance_by_component={"loadgen": loadgen_instance},
-        memory_mb_by_component={},
         start_time=start_time,
         end_time=end_time,
     )
@@ -317,10 +325,29 @@ def _generator_cpu_percent(project_id: str, loadgen_instance: str, start_time, e
     return samples[0].cpu_percent
 
 
+def snapshot_exists(project_id: str, snapshot_name: str) -> bool:
+    """Confirma se um snapshot de dataset já semeado existe
+    (infra/scripts/seed_dataset_snapshots.py) — evita passar
+    `data_disk_snapshot` pra um nome que não existe (o `terraform apply`
+    falharia tarde, já tendo cobrado pela VM). Nunca levanta — ausência é
+    o caminho normal (banco nunca semeado, ou é valkey, que não usa
+    disco persistente)."""
+    cmd = ["gcloud", "compute", "snapshots", "describe", snapshot_name, f"--project={project_id}"]
+    print(f"+ {' '.join(cmd)}")
+    result = subprocess.run(
+        _resolve_cmd(cmd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def verify_otel_pipeline(
     project_id: str,
     instance_by_component: dict[str, str],
-    memory_mb_by_component: dict[str, float],
     wait_seconds: int = 60,
 ) -> bool:
     """Confirma que o coletor OpenTelemetry das 3 VMs (infra/modules/
@@ -333,40 +360,55 @@ def verify_otel_pipeline(
     um OK aqui vale para todas."""
     from analysis.resources import GCPMonitoringCollector
 
-    print(f"Aguardando {wait_seconds}s para o coletor publicar a primeira amostra...")
-    time.sleep(wait_seconds)
+    started_at = datetime.now(timezone.utc)
+    # Três tentativas: `compute.googleapis.com/*` (métrica padrão do Compute
+    # Engine) costuma ficar consultável rápido, mas `workload.googleapis.com/
+    # system.memory.usage` (vem do NOSSO coletor OTel — um salto a mais:
+    # hostmetrics -> exporter googlecloud -> ingestão do Cloud Monitoring)
+    # demonstrou ao vivo precisar de mais que os ~300s (60+240) que 2
+    # tentativas davam — CPU/rede já passavam nesse tempo, só memória ainda
+    # não tinha ponto na janela. Cada tentativa usa uma janela desde
+    # `started_at` (exceto a 1ª, mais estreita) para não perder a amostra
+    # que uma tentativa anterior só não esperou tempo suficiente para ver.
+    extra_waits = (wait_seconds, 240, 300)
+    attempts = len(extra_waits)
+    for attempt, extra_wait in enumerate(extra_waits, start=1):
+        print(
+            f"Aguardando {extra_wait}s para o coletor publicar uma amostra "
+            f"(tentativa {attempt}/{attempts})..."
+        )
+        time.sleep(extra_wait)
 
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(seconds=wait_seconds)
-    collector = GCPMonitoringCollector(
-        project_id, instance_by_component, memory_mb_by_component, start_time, end_time
+        end_time = datetime.now(timezone.utc)
+        start_time = started_at if attempt > 1 else end_time - timedelta(seconds=wait_seconds)
+        collector = GCPMonitoringCollector(project_id, instance_by_component, start_time, end_time)
+        try:
+            samples = collector.collect()
+        except Exception as exc:
+            print(f"FALHOU (tentativa {attempt}/{attempts}): {exc}")
+            continue
+
+        for sample in samples:
+            print(
+                f"  {sample.component}: cpu={sample.cpu_percent:.1f}% "
+                f"memory={sample.memory_mb:.0f}MB network={sample.network_mbps:.2f}Mbps"
+            )
+        print("OK: as 3 VMs estão exportando CPU/memória/rede para o Cloud Monitoring.")
+        return True
+
+    print(
+        "Diagnóstico: `gcloud compute ssh <instância> --zone=<zone> --project="
+        f"{project_id} --tunnel-through-iap` e `docker logs tcc-otel-agent` em cada VM "
+        "para ver o erro real — as duas tentativas automáticas já deram tempo de sobra para "
+        "propagação normal de métrica; se ainda assim falhou, é mais provável ser o coletor "
+        "de verdade quebrado do que atraso."
     )
-    try:
-        samples = collector.collect()
-    except Exception as exc:
-        print(f"FALHOU: {exc}")
-        print(
-            "Diagnóstico: `gcloud compute ssh <instância> --zone=<zone> --project="
-            f"{project_id} --tunnel-through-iap` e `docker logs tcc-otel-agent` em cada VM "
-            "para ver o erro real. Métricas novas (workload.googleapis.com/*) às vezes levam "
-            "alguns minutos a mais para ficar consultáveis na primeira vez — tente de novo "
-            "antes de concluir que o coletor está quebrado."
-        )
-        return False
-
-    for sample in samples:
-        print(
-            f"  {sample.component}: cpu={sample.cpu_percent:.1f}% "
-            f"memory={sample.memory_mb:.0f}MB network={sample.network_mbps:.2f}Mbps"
-        )
-    print("OK: as 3 VMs estão exportando CPU/memória/rede para o Cloud Monitoring.")
-    return True
+    return False
 
 
 def make_resource_collect_fn(
     project_id: str,
     instance_by_component: dict[str, str],
-    memory_mb_by_component: dict[str, float],
     interval_seconds: int = RESOURCE_SAMPLE_INTERVAL_SECONDS,
 ) -> Callable[[], list]:
     """Fecha sobre o contexto de uma célula e devolve uma função sem
@@ -380,9 +422,7 @@ def make_resource_collect_fn(
     def collect_fn() -> list:
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(seconds=interval_seconds)
-        collector = GCPMonitoringCollector(
-            project_id, instance_by_component, memory_mb_by_component, start_time, end_time
-        )
+        collector = GCPMonitoringCollector(project_id, instance_by_component, start_time, end_time)
         return collector.collect()
 
     return collect_fn
@@ -417,6 +457,7 @@ def make_probe_fn(
     warmup: str,
     measure: str,
     loadgen_instance: str,
+    loadgen_instance_id: str,
     zone: str,
     project_id: str,
     tools_image: str,
@@ -454,7 +495,7 @@ def make_probe_fn(
         end_time = datetime.now(timezone.utc)
 
         violated = _parse_probe_result_line(result.stdout)
-        generator_cpu = _generator_cpu_percent(project_id, loadgen_instance, start_time, end_time)
+        generator_cpu = _generator_cpu_percent(project_id, loadgen_instance_id, start_time, end_time)
 
         return ProbeResult(rate=rate, violated_slo=violated, generator_cpu_percent=generator_cpu)
 
@@ -581,6 +622,27 @@ def main(argv: list[str] | None = None) -> int:
     sweep = shuffled_sweep(build_sweep(args.phase), args.seed)
     print(f"sweep embaralhado (seed={args.seed}, fase={args.phase}): {sweep}")
 
+    # Reuso de snapshot de disco (infra/scripts/seed_dataset_snapshots.py) —
+    # a carga completa é idêntica entre todas as células de uma mesma
+    # tecnologia de banco, então um snapshot "tcc-dataset-seed-<storage>"
+    # semeado uma vez cobre as 3/4 células dessa tecnologia. Valkey fica de
+    # fora: roda 100% em memória, sem disco persistente (README.md).
+    snapshot_name = f"tcc-dataset-seed-{storage}"
+    snapshot_found = storage != "valkey" and snapshot_exists(args.project_id, snapshot_name)
+    if snapshot_found:
+        print(
+            f"snapshot '{snapshot_name}' encontrado — disco será restaurado dele, "
+            "pulando a carga completa do dataset nesta execução."
+        )
+    elif storage == "valkey":
+        print("storage=valkey não usa snapshot de disco (sem persistência) — carregando em memória.")
+    else:
+        print(
+            f"nenhum snapshot '{snapshot_name}' encontrado para storage={storage} — carregando "
+            "o dataset do zero nesta execução (rode infra/scripts/seed_dataset_snapshots.py "
+            f"{storage} pra evitar essa espera da próxima vez)."
+        )
+
     tools_image = os.environ.get("TOOLS_IMAGE")
     if not tools_image:
         print(
@@ -610,17 +672,19 @@ def main(argv: list[str] | None = None) -> int:
                 f"-backend-config=prefix=cells/{args.cell}",
             ]
         )
-        terraform(
-            [
-                "apply",
-                f"-var=project_id={args.project_id}",
-                f"-var=region={args.region}",
-                f"-var=zone={args.zone}",
-                f"-var=cell={args.cell}",
-                f"-var=storage={storage}",
-                f"-var=dataset_bucket={args.dataset_bucket}",
-            ]
-        )
+        apply_vars = [
+            "apply",
+            "-auto-approve",
+            f"-var=project_id={args.project_id}",
+            f"-var=region={args.region}",
+            f"-var=zone={args.zone}",
+            f"-var=cell={args.cell}",
+            f"-var=storage={storage}",
+            f"-var=dataset_bucket={args.dataset_bucket}",
+        ]
+        if snapshot_found:
+            apply_vars.append(f"-var=data_disk_snapshot={snapshot_name}")
+        terraform(apply_vars)
 
         outputs = terraform_output_json()
         database_ip = outputs["database_internal_ip"]
@@ -628,21 +692,27 @@ def main(argv: list[str] | None = None) -> int:
         database_instance = f"tcc-{args.cell}-database"
         service_instance = f"tcc-{args.cell}-service"
         loadgen_instance = f"tcc-{args.cell}-loadgen"
+        # IDs numéricos, não os nomes acima — confirmado ao vivo:
+        # resource.labels.instance_id do Cloud Monitoring para métricas
+        # gce_instance (ex.: compute.googleapis.com/instance/cpu/utilization)
+        # é o ID numérico da VM, não o nome. Filtrar pelo nome nunca casava
+        # nenhuma série (não era atraso de propagação, como se pensou antes
+        # de checar isso). Nomes continuam usados para SSH/wait_for_container
+        # acima — só as chamadas ao Cloud Monitoring abaixo usam os IDs.
+        loadgen_instance_id = outputs["loadgen_instance_id"]
 
         wait_for_container(database_instance, args.zone, args.project_id, "tcc-database")
         wait_for_container(service_instance, args.zone, args.project_id, "tcc-service")
 
         instance_by_component = {
-            "database": database_instance,
-            "service": service_instance,
-            "loadgen": loadgen_instance,
+            "database": outputs["database_instance_id"],
+            "service": outputs["service_instance_id"],
+            "loadgen": loadgen_instance_id,
         }
 
         if args.verify_otel:
             print("\n--- verificação do coletor OpenTelemetry/Ops Agent ---")
-            if not verify_otel_pipeline(
-                args.project_id, instance_by_component, DEFAULT_MEMORY_MB_BY_COMPONENT
-            ):
+            if not verify_otel_pipeline(args.project_id, instance_by_component):
                 print(
                     "\nAbortando antes do sweep: corrija o coletor OpenTelemetry (README.md, "
                     "'Instrumentação de gargalo') antes de comprometer horas de VM numa "
@@ -676,6 +746,7 @@ def main(argv: list[str] | None = None) -> int:
             postgres_password,
             FIXTURES_MOUNT,
             args.dataset_bucket,
+            skip_dataset_load=snapshot_found,
         )
         gcloud_ssh(loadgen_instance, args.zone, args.project_id, setup_cmd)
 
@@ -690,9 +761,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_sampling = threading.Event()
         sampling_thread = None
         if args.phase == "confirmacao":
-            collect_fn = make_resource_collect_fn(
-                args.project_id, instance_by_component, DEFAULT_MEMORY_MB_BY_COMPONENT
-            )
+            collect_fn = make_resource_collect_fn(args.project_id, instance_by_component)
             sampling_thread = threading.Thread(
                 target=sample_resources_periodically,
                 args=(collect_fn, stop_sampling, resource_samples),
@@ -725,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
                 SHORT_RAMP_WARMUP,
                 SHORT_RAMP_MEASURE,
                 loadgen_instance,
+                loadgen_instance_id,
                 args.zone,
                 args.project_id,
                 tools_image,
@@ -746,6 +816,7 @@ def main(argv: list[str] | None = None) -> int:
                     CONFIRMATION_WARMUP,
                     CONFIRMATION_MEASURE,
                     loadgen_instance,
+                    loadgen_instance_id,
                     args.zone,
                     args.project_id,
                     tools_image,
@@ -822,17 +893,19 @@ def main(argv: list[str] | None = None) -> int:
             _confirm_billable(
                 f"terraform destroy da célula '{args.cell}' — é isso que PARA a cobrança."
             )
-            terraform(
-                [
-                    "destroy",
-                    f"-var=project_id={args.project_id}",
-                    f"-var=region={args.region}",
-                    f"-var=zone={args.zone}",
-                    f"-var=cell={args.cell}",
-                    f"-var=storage={storage}",
-                    f"-var=dataset_bucket={args.dataset_bucket}",
-                ]
-            )
+            destroy_vars = [
+                "destroy",
+                "-auto-approve",
+                f"-var=project_id={args.project_id}",
+                f"-var=region={args.region}",
+                f"-var=zone={args.zone}",
+                f"-var=cell={args.cell}",
+                f"-var=storage={storage}",
+                f"-var=dataset_bucket={args.dataset_bucket}",
+            ]
+            if snapshot_found:
+                destroy_vars.append(f"-var=data_disk_snapshot={snapshot_name}")
+            terraform(destroy_vars)
 
     return 0
 

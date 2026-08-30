@@ -87,6 +87,12 @@ variable "dataset_bucket" {
   description = "Bucket com a massa de dados completa (output do bootstrap: dataset_bucket)."
 }
 
+variable "data_disk_snapshot" {
+  type        = string
+  description = "Nome do snapshot pra criar o disco de banco já carregado (infra/scripts/seed_dataset_snapshots.py) — vazio cria disco em branco."
+  default     = ""
+}
+
 provider "google" {
   project = var.project_id
   region  = var.region
@@ -105,6 +111,7 @@ module "database" {
   cell                 = var.cell
   storage              = var.storage
   subnetwork_self_link = module.network.subnetwork_self_link
+  data_disk_snapshot   = var.data_disk_snapshot
 }
 
 module "service" {
@@ -145,4 +152,19 @@ output "loadgen_internal_ip" {
 output "data_disk_name" {
   description = "Nome do disco de dados — para infra/scripts/snapshot_after_load.sh."
   value       = module.database.data_disk_name
+}
+
+output "database_instance_id" {
+  description = "ID numérico da VM de banco — para filtrar métricas no Cloud Monitoring."
+  value       = module.database.instance_id
+}
+
+output "service_instance_id" {
+  description = "ID numérico da VM de serviço — para filtrar métricas no Cloud Monitoring."
+  value       = module.service.instance_id
+}
+
+output "loadgen_instance_id" {
+  description = "ID numérico da VM do gerador de carga — para filtrar métricas no Cloud Monitoring."
+  value       = module.loadgen.instance_id
 }

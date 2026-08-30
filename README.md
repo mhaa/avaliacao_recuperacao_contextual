@@ -947,6 +947,43 @@ scripts `load_full_dataset.py` e a dependência `google-cloud-storage`, e
 infra/scripts/build_and_push_images.sh <project-id> <region>
 ```
 
+**1. Semear o dataset uma vez por banco (opcional, mas recomendado)**
+
+A carga completa (schema + `load_full_dataset.py`) é **idêntica** para
+todas as células de uma mesma tecnologia de banco — `e1-postgres`,
+`e2-postgres`, `e3-postgres` e `e4-postgres` carregam exatamente o mesmo
+conteúdo, só a estratégia do `service/` muda. Sem reuso, cada `terraform
+apply`/`destroy` de `run_measurement_battery.py` (passo seguinte) refaz
+essa carga do zero — cara em tempo, principalmente se um teste precisar
+ser repetido (ex.: uma tentativa de `--verify-otel` que falhou). Como o
+custo de disco é pequeno, vale a pena carregar uma vez e reaproveitar via
+snapshot:
+
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python -m infra.scripts.seed_dataset_snapshots postgres <project-id> us-central1 us-central1-a \
+    <terraform_state_bucket> <dataset_bucket>
+python -m infra.scripts.seed_dataset_snapshots scylla <project-id> us-central1 us-central1-a \
+    <terraform_state_bucket> <dataset_bucket>
+python -m infra.scripts.seed_dataset_snapshots opensearch <project-id> us-central1 us-central1-a \
+    <terraform_state_bucket> <dataset_bucket>
+```
+
+Cada execução sobe um root Terraform enxuto (`infra/envs/seed/` — só
+banco + loadgen, sem serviço), carrega a base completa, tira um snapshot
+de nome fixo (`tcc-dataset-seed-<storage>` — substitui o anterior, se
+existir) do disco de dados, e derruba a infraestrutura de novo (o
+snapshot sobrevive independente disso). **Valkey fica de fora**: roda
+100% em memória (`--save "" --appendonly no`, sem volume montado) — não
+há disco nenhum para tirar snapshot; suas 4 células continuam carregando
+em memória a cada execução, o que já é rápido comparado a disco.
+
+`run_measurement_battery.py` detecta o snapshot automaticamente (sem
+flag nova): se `tcc-dataset-seed-<storage>` existir para o `storage` da
+célula, o disco de dados é criado a partir dele e a carga completa é
+pulada; caso contrário, o comportamento de hoje continua (carrega do
+zero e avisa que rodar este passo evitaria a espera da próxima vez).
+
 Diferente do smoke test — que sobe, valida e derruba tudo sozinho — aqui é
 onde a bateria de medição real acontece. `infra/scripts/run_measurement_battery.py`
 é a contraparte do smoke test (passo 7) para esta fase: sobe a célula

@@ -100,6 +100,20 @@ def test_build_remote_setup_command_passes_dataset_bucket_env():
     assert "DATASET_BUCKET=my-project-tcc-dataset" in cmd
 
 
+def test_build_remote_setup_command_skip_dataset_load_drops_schema_and_loader():
+    # snapshot já semeado (infra/scripts/seed_dataset_snapshots.py) — nem
+    # o schema nem load_full_dataset.py devem rodar de novo, só o passo
+    # de contexto-por-seletividade, que nunca depende do banco.
+    cmd = build_remote_setup_command(
+        "e1-postgres", "postgres", "10.0.0.2", "10.0.0.3", "gcr.io/x/tools:1",
+        "hunter2", "/home/tcc/load-fixtures", "my-project-tcc-dataset",
+        skip_dataset_load=True,
+    )
+    assert "load_full_dataset.py" not in cmd
+    assert "apply_schema.py" not in cmd
+    assert "export_contexts_by_tier.py" in cmd
+
+
 def test_build_remote_probe_command_uses_probe_mode_and_rate():
     cmd = build_remote_probe_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "medium", 4000, "0s", "1m",

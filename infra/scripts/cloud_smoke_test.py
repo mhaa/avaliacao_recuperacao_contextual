@@ -108,7 +108,7 @@ def fetch_terraform_access_token(project_id: str) -> str:
     return result.stdout.strip()
 
 
-def terraform(args: list[str]) -> None:
+def terraform(args: list[str], tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR) -> None:
     cmd = [
         "docker",
         "compose",
@@ -121,13 +121,13 @@ def terraform(args: list[str]) -> None:
         "--entrypoint",
         "terraform",
         "tools",
-        f"-chdir={REPO_ROOT_RELATIVE_TF_DIR}",
+        f"-chdir={tf_dir}",
         *args,
     ]
     _run(cmd)
 
 
-def terraform_output_json() -> dict:
+def terraform_output_json(tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR) -> dict:
     cmd = [
         "docker",
         "compose",
@@ -140,7 +140,7 @@ def terraform_output_json() -> dict:
         "--entrypoint",
         "terraform",
         "tools",
-        f"-chdir={REPO_ROOT_RELATIVE_TF_DIR}",
+        f"-chdir={tf_dir}",
         "output",
         "-json",
     ]
@@ -368,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
         terraform(
             [
                 "apply",
+                "-auto-approve",
                 f"-var=project_id={args.project_id}",
                 f"-var=region={args.region}",
                 f"-var=zone={args.zone}",
@@ -449,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
             terraform(
                 [
                     "destroy",
+                    "-auto-approve",
                     f"-var=project_id={args.project_id}",
                     f"-var=region={args.region}",
                     f"-var=zone={args.zone}",
