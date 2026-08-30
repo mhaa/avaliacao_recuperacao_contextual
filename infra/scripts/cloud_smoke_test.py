@@ -209,20 +209,14 @@ def wait_for_container(
     raise TimeoutError(f"container '{container_name}' não subiu em {timeout_s}s")
 
 
-def build_remote_smoke_script(
-    cell_id: str,
-    storage: str,
-    database_ip: str,
-    service_ip: str,
-    tools_image: str,
-    postgres_password: str | None,
-) -> str:
-    """Monta o comando remoto como uma lista de argv (docker run ...) e usa
-    shlex.join para virar uma única string shell-segura — nunca
-    concatenação manual de strings com aspas embutidas (isso já causou um
-    bug real: um `python -c "..."` com aspas duplas internas quebrava a
-    sintaxe do `bash -c "..."` que o envolvia quando entregue via
-    `gcloud compute ssh --command=...`, ver analysis/smoke_report.py)."""
+def build_storage_env_flags(
+    cell_id: str, storage: str, database_ip: str, service_ip: str, postgres_password: str | None
+) -> list[str]:
+    """Variáveis de ambiente para o container remoto falar com o banco/serviço
+    de uma célula — mesma convenção de nomes já usada em docker-compose.yml,
+    sem inventar uma segunda fonte. Compartilhado entre o smoke test (aqui) e
+    a bateria de medição real (infra/scripts/run_measurement_battery.py,
+    Fase 5) — único lugar que sabe montar essas variáveis por storage."""
     env_flags: list[str] = [f"CELL={cell_id}", f"STORAGE_HOST={database_ip}"]
     if storage == "postgres":
         env_flags += [
@@ -238,12 +232,36 @@ def build_remote_smoke_script(
     elif storage == "opensearch":
         env_flags += [f"TEST_OPENSEARCH_HOST=http://{database_ip}:9200"]
     env_flags += [f"TEST_SERVICE_URL=http://{service_ip}:8000"]
+    return env_flags
 
+
+def build_schema_and_fixture_steps(storage: str) -> list[str]:
+    """Passos para aplicar o schema (quando existir) e carregar a fixture do
+    oráculo — mesma ordem usada pelo smoke test e pela bateria real."""
     schema_step = STORAGES_WITH_SCHEMA_APPLY.get(storage)
     steps = []
     if schema_step:
         steps.append(f"python {schema_step}")
     steps.append(f"python schemas/{storage}/load_oracle_fixture.py")
+    return steps
+
+
+def build_remote_smoke_script(
+    cell_id: str,
+    storage: str,
+    database_ip: str,
+    service_ip: str,
+    tools_image: str,
+    postgres_password: str | None,
+) -> str:
+    """Monta o comando remoto como uma lista de argv (docker run ...) e usa
+    shlex.join para virar uma única string shell-segura — nunca
+    concatenação manual de strings com aspas embutidas (isso já causou um
+    bug real: um `python -c "..."` com aspas duplas internas quebrava a
+    sintaxe do `bash -c "..."` que o envolvia quando entregue via
+    `gcloud compute ssh --command=...`, ver analysis/smoke_report.py)."""
+    env_flags = build_storage_env_flags(cell_id, storage, database_ip, service_ip, postgres_password)
+    steps = build_schema_and_fixture_steps(storage)
     # Gate 1: strategy + storage adapter em processo, sem rede — prova a
     # lógica de recuperação, mas nunca passa pelo transporte HTTP.
     steps.append(f"python -m harness.verify_cli --cell {cell_id}")

@@ -912,33 +912,60 @@ python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 
 
 ### Fase 5 — Execução dos testes de carga e captura de resultados
 
-Diferente do smoke test — que sobe, valida e derruba tudo sozinho — aqui
-você controla cada fase manualmente, porque é aqui que a bateria de
-medição real acontece (`load/run_battery.py`, depois
-`analysis/collect.py`/`stats.py`), custoso e demorado o suficiente para não
-valer a pena automatizar o ciclo de vida completo da infraestrutura.
+Diferente do smoke test — que sobe, valida e derruba tudo sozinho — aqui é
+onde a bateria de medição real acontece. `infra/scripts/run_measurement_battery.py`
+é a contraparte do smoke test (passo 7) para esta fase: sobe a célula
+(terraform init/apply), aplica schema + fixture do oráculo + fixture de
+contexto-por-seletividade, roda `load/run_battery.py` de verdade a partir da
+VM `loadgen` (via SSH/IAP — a VM de serviço não tem IP público) varrendo
+carga × seletividade conforme `CONTEXTO.md`, "Protocolo de medição", traz os
+`results/` de volta e sincroniza com o bucket de resultados do bootstrap
+(passo 2), e por fim `terraform destroy` a célula — mesma disciplina de
+confirmação antes de cada `apply`/`destroy` do smoke test.
 
-**Por célula — plan/apply**
-
-```
-infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
-  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
-  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment \
-  init -reconfigure -backend-config="bucket=<terraform_state_bucket>" -backend-config="prefix=cells/<cell>"
-infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
-  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
-  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment plan
-infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
-  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
-  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment apply   # faturável — confirmar antes
-```
-
-Depois de medir, `terraform destroy` a célula antes de aplicar a próxima,
-para não pagar por VMs ociosas (o disco/snapshot sobrevive fora do ciclo de
-vida da VM — `infra/scripts/snapshot_after_load.sh`):
+**Triagem — todas as 14 células, carga e seletividade fixas em nível
+intermediário** (`CONTEXTO.md`, "Delineamento em duas etapas" — identifica a
+fronteira de Pareto latência × custo):
 
 ```
-infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
-  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
-  run --rm --entrypoint terraform tools -chdir=infra/envs/experiment destroy   # faturável-adjacente — confirmar antes
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python -m infra.scripts.run_measurement_battery e1-postgres <project-id> us-central1 us-central1-a \
+    <terraform_state_bucket> <results_bucket> --phase triagem
 ```
+
+Repita para as outras 13 células (troque só o nome da célula). `--ramp`
+adiciona a rampa até violar o SLO ao final do sweep; `--keep-infra` pula o
+`destroy` para investigar uma falha manualmente.
+
+Depois de rodar a triagem para as 14, consolide e ache a fronteira de
+Pareto:
+
+```
+docker compose run --rm --entrypoint python tools analysis/report.py \
+    results --phase triagem --out results/report/triagem
+```
+
+**Confirmação — só as células da fronteira, varredura completa de carga ×
+seletividade + 5 repetições:**
+
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python -m infra.scripts.run_measurement_battery <cell-da-fronteira> <project-id> us-central1 us-central1-a \
+    <terraform_state_bucket> <results_bucket> --phase confirmacao
+```
+
+```
+docker compose run --rm --entrypoint python tools analysis/report.py \
+    results --phase confirmacao --out results/report/confirmacao
+```
+
+`analysis/report.py` roda `collect.py` sobre cada repetição ainda não
+coletada, agrupa as latências por célula, aplica Kruskal-Wallis → Dunn
+(Bonferroni) → epsilon-quadrado → IC de bootstrap do p99 (`CONTEXTO.md`,
+"Estatística"), escreve `report.json` + `pareto.png`; na confirmação, ainda
+roda TOST par-a-par entre as células da fronteira e gera o gráfico de
+comparação de percentis.
+
+O disco da célula sobrevive fora do ciclo de vida da VM —
+`infra/scripts/snapshot_after_load.sh <disk-name> <zone> <project-id>`, se
+quiser um snapshot antes do próximo `destroy`.

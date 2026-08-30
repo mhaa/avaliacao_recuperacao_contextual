@@ -18,9 +18,16 @@ Uso local (SMOKE apenas — CONTEXTO.md proíbe medir latência localmente):
         --cells e1-postgres --target-url http://service:8000/v1/recommendations \\
         --repetitions 1 --rate 10 --smoke
 
-Uso real (nuvem — infra/, Etapa 9): cada célula roda contra sua própria VM
+Uso real (nuvem — infra/, Fase 5): cada célula roda contra sua própria VM
 de serviço; --targets aponta um JSON {cell_id: target_url} produzido a
-partir dos outputs `service_internal_ip` de infra/envs/experiment.
+partir dos outputs `service_internal_ip` de infra/envs/experiment. Quem
+invoca isso de fato é infra/scripts/run_measurement_battery.py, um combo
+(rate, selectivity_tier) por vez, via SSH na VM `loadgen`.
+
+--ramp troca o executor de constant-arrival-rate para ramping-arrival-rate
+("rampa até violar o SLO", CONTEXTO.md) — mutuamente exclusivo com --smoke
+na prática, já que servem propósitos diferentes (nunca passar os dois numa
+mesma execução).
 """
 
 from __future__ import annotations
@@ -73,19 +80,16 @@ def _git_commit() -> str:
     return result.stdout.strip()
 
 
-def run_k6(
+def build_k6_cmd(
+    json_out: Path,
     cell_id: str,
-    repetition: int,
     target_url: str,
-    phase: str,
     rate: int,
     k: int,
     selectivity_tier: str,
     smoke: bool,
-    out_dir: Path,
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    json_out = out_dir / "k6-raw.json"
+    ramp: bool,
+) -> list[str]:
     cmd = [
         "k6",
         "run",
@@ -109,6 +113,29 @@ def run_k6(
         # SMOKE_MODE=true troca o cenário inteiro dentro de scenarios.js
         # por um curto e sem threshold de SLO (ver load/scenarios.js).
         cmd += ["-e", "SMOKE_MODE=true"]
+    if ramp:
+        # RAMP_MODE=true troca para o executor ramping-arrival-rate — "rampa
+        # até violar o SLO" (CONTEXTO.md, "Protocolo de medição"), com
+        # abortOnFail nos thresholds (load/scenarios.js).
+        cmd += ["-e", "RAMP_MODE=true"]
+    return cmd
+
+
+def run_k6(
+    cell_id: str,
+    repetition: int,
+    target_url: str,
+    phase: str,
+    rate: int,
+    k: int,
+    selectivity_tier: str,
+    smoke: bool,
+    ramp: bool,
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_out = out_dir / "k6-raw.json"
+    cmd = build_k6_cmd(json_out, cell_id, target_url, rate, k, selectivity_tier, smoke, ramp)
 
     manifest = {
         "cell_id": cell_id,
@@ -119,6 +146,7 @@ def run_k6(
         "k": k,
         "selectivity_tier": selectivity_tier,
         "smoke": smoke,
+        "ramp": ramp,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
     }
@@ -142,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         "--selectivity-tier", default="medium", choices=["high", "medium", "low"]
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--ramp", action="store_true")
     args = parser.parse_args(argv)
 
     cell_ids = args.cells or list_viable_cell_ids()
@@ -163,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             args.k,
             args.selectivity_tier,
             args.smoke,
+            args.ramp,
             out_dir,
         )
     return 0

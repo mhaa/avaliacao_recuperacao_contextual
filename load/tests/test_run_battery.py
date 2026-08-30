@@ -5,9 +5,12 @@ não ganham teste unitário para o `main()`, só para a lógica pura)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from load.run_battery import (
+    build_k6_cmd,
     build_run_plan,
     list_viable_cell_ids,
     shuffled_cell_order,
@@ -56,3 +59,27 @@ def test_target_url_for_falls_back_to_shared_url():
 def test_target_url_for_raises_without_either():
     with pytest.raises(ValueError):
         target_url_for("e1-postgres", None, None)
+
+
+def test_build_k6_cmd_plain_has_neither_smoke_nor_ramp_flag():
+    cmd = build_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", False, False
+    )
+    assert "SMOKE_MODE=true" not in cmd
+    assert "RAMP_MODE=true" not in cmd
+
+
+def test_build_k6_cmd_ramp_sets_ramp_mode_env_var():
+    cmd = build_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", False, True
+    )
+    assert "RAMP_MODE=true" in cmd
+    assert "SMOKE_MODE=true" not in cmd
+
+
+def test_build_k6_cmd_smoke_sets_smoke_mode_env_var():
+    cmd = build_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", True, False
+    )
+    assert "SMOKE_MODE=true" in cmd
+    assert "RAMP_MODE=true" not in cmd

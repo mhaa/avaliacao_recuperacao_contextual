@@ -51,7 +51,7 @@ packages = ["core", "storage", "strategies", "harness", "service", "service.prot
 
 [tool.pytest.ini_options]
 # Cresce junto com "packages" acima, conforme as próximas etapas.
-testpaths = ["core/tests", "storage/tests", "strategies/tests", "harness/tests", "cells/tests", "service/tests", "load/tests", "analysis/tests", "tests/acceptance", "infra/modules/budget_killswitch/function_src"]
+testpaths = ["core/tests", "storage/tests", "strategies/tests", "harness/tests", "cells/tests", "service/tests", "load/tests", "analysis/tests", "tests/acceptance", "infra/modules/budget_killswitch/function_src", "infra/scripts/tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: requires a running database, a generated data file (data_generation/data/), or a live service",
