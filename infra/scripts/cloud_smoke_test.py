@@ -22,7 +22,7 @@ mesma (seria circular).
 
 Uso:
     python infra/scripts/cloud_smoke_test.py <cell> <project-id> <region> <zone> \\
-        <terraform-state-bucket> [--keep-infra]
+        <terraform-state-bucket> <dataset-bucket> [--keep-infra]
 
 Cada comando faturável (terraform apply/destroy) é anunciado explicitamente
 antes de rodar e pede confirmação — mesmo com o plano já aprovado (regra
@@ -235,14 +235,20 @@ def build_storage_env_flags(
     return env_flags
 
 
-def build_schema_and_fixture_steps(storage: str) -> list[str]:
-    """Passos para aplicar o schema (quando existir) e carregar a fixture do
-    oráculo — mesma ordem usada pelo smoke test e pela bateria real."""
+def build_schema_and_fixture_steps(storage: str, mode: str = "oracle") -> list[str]:
+    """Passos para aplicar o schema (quando existir) e carregar o dado —
+    mesma ordem usada pelo smoke test (mode="oracle", default: só o
+    subconjunto de ~904 usuários referenciados pelo oráculo) e pela bateria
+    real de Fase 5 (mode="full", infra/scripts/run_measurement_battery.py:
+    a base inteira — load/zipf.js amostra de toda a população, o
+    subconjunto do oráculo corromperia silenciosamente cada latência
+    medida)."""
     schema_step = STORAGES_WITH_SCHEMA_APPLY.get(storage)
     steps = []
     if schema_step:
         steps.append(f"python {schema_step}")
-    steps.append(f"python schemas/{storage}/load_oracle_fixture.py")
+    loader = "load_oracle_fixture.py" if mode == "oracle" else "load_full_dataset.py"
+    steps.append(f"python schemas/{storage}/{loader}")
     return steps
 
 
@@ -305,6 +311,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("zone")
     parser.add_argument("terraform_state_bucket")
     parser.add_argument(
+        "dataset_bucket",
+        help="output do bootstrap (dataset_bucket) — obrigatório em infra/envs/experiment "
+        "mesmo aqui: o smoke test usa mode=\"oracle\" (nunca baixa nada do bucket), mas "
+        "module.loadgen precisa do valor pra criar a IAM binding.",
+    )
+    parser.add_argument(
         "--keep-infra",
         action="store_true",
         help="não roda terraform destroy no final (para investigar uma falha)",
@@ -361,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"-var=zone={args.zone}",
                 f"-var=cell={args.cell}",
                 f"-var=storage={storage}",
+                f"-var=dataset_bucket={args.dataset_bucket}",
             ]
         )
 
@@ -441,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"-var=zone={args.zone}",
                     f"-var=cell={args.cell}",
                     f"-var=storage={storage}",
+                    f"-var=dataset_bucket={args.dataset_bucket}",
                 ]
             )
 

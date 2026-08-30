@@ -39,6 +39,11 @@ variable "tools_image" {
   description = "Referência completa da imagem `tools` (docker/Dockerfile.tools) em Artifact Registry."
 }
 
+variable "dataset_bucket" {
+  type        = string
+  description = "Bucket com a massa de dados completa (output do bootstrap: dataset_bucket) — schemas/<db>/load_full_dataset.py baixa daqui via harness/fixtures.py:ensure_full_dataset_downloaded."
+}
+
 variable "machine_type" {
   type        = string
   description = "Tipo de máquina — n2-standard-8 (IMPLEMENTACAO.md, topologia)."
@@ -57,6 +62,16 @@ resource "google_project_iam_member" "loadgen_artifact_reader" {
   project = var.project_id
   role    = "roles/artifactregistry.reader"
   member  = "serviceAccount:${google_service_account.loadgen.email}"
+}
+
+# Leitura só — harness/fixtures.py:ensure_full_dataset_downloaded baixa,
+# nunca escreve. Resultados saem por um caminho totalmente separado
+# (infra/scripts/run_measurement_battery.py:upload_results_to_bucket, do
+# HOST com a sessão do operador, não desta SA).
+resource "google_storage_bucket_iam_member" "loadgen_dataset_reader" {
+  bucket = var.dataset_bucket
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.loadgen.email}"
 }
 
 locals {

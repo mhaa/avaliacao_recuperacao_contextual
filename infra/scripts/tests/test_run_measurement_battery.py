@@ -11,6 +11,7 @@ from infra.scripts.run_measurement_battery import (
     TRIAGEM_RATE,
     TRIAGEM_TIER,
     build_remote_battery_command,
+    build_remote_setup_command,
     build_sweep,
     shuffled_sweep,
 )
@@ -75,3 +76,22 @@ def test_build_remote_battery_command_mounts_fixtures_dir_readonly():
         100, "medium", 1, False, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
     )
     assert "-v /home/tcc/load-fixtures:/app/load/fixtures:ro" in cmd
+
+
+def test_build_remote_setup_command_uses_the_full_loader_not_the_oracle_fixture():
+    # load/zipf.js amostra de toda a população real — carregar só o
+    # subconjunto do oráculo aqui corromperia silenciosamente a medição.
+    cmd = build_remote_setup_command(
+        "e1-postgres", "postgres", "10.0.0.2", "10.0.0.3", "gcr.io/x/tools:1",
+        "hunter2", "/home/tcc/load-fixtures", "my-project-tcc-dataset",
+    )
+    assert "load_full_dataset.py" in cmd
+    assert "load_oracle_fixture.py" not in cmd
+
+
+def test_build_remote_setup_command_passes_dataset_bucket_env():
+    cmd = build_remote_setup_command(
+        "e1-postgres", "postgres", "10.0.0.2", "10.0.0.3", "gcr.io/x/tools:1",
+        "hunter2", "/home/tcc/load-fixtures", "my-project-tcc-dataset",
+    )
+    assert "DATASET_BUCKET=my-project-tcc-dataset" in cmd

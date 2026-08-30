@@ -709,14 +709,16 @@ infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
   run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
 ```
 
-3 buckets são criados — guarde os 3 outputs, usados nos passos seguintes
+4 buckets são criados — guarde os 4 outputs, usados nos passos seguintes
 (`terraform_state_bucket` no `-backend-config` de todo `envs/*`;
-`function_source_bucket` no `-var` do passo 3):
+`function_source_bucket` no `-var` do passo 3; `dataset_bucket` na Fase 5,
+passo 0):
 
 ```
 terraform_state_bucket = "<seu-projeto>-tcc-tfstate"
 results_bucket         = "<seu-projeto>-tcc-results"
 function_source_bucket = "<seu-projeto>-tcc-functions"
+dataset_bucket         = "<seu-projeto>-tcc-dataset"
 ```
 
 **3. Orçamento — antes de qualquer VM**
@@ -881,7 +883,7 @@ passo 1 nem de nenhum export manual:
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket>
+python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
 ```
 
 Cada `terraform apply`/`destroy` dentro dele é anunciado explicitamente e
@@ -897,31 +899,63 @@ tempo/dinheiro numa bateria de medição real.
 Realize o smoke test para cada um dos bancos de dados:
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python infra/scripts/cloud_smoke_test.py e1-valkey <project-id> us-central1 us-central1-a <terraform_state_bucket>
+python infra/scripts/cloud_smoke_test.py e1-valkey <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
 ```
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python infra/scripts/cloud_smoke_test.py e1-scylla <project-id> us-central1 us-central1-a <terraform_state_bucket>
+python infra/scripts/cloud_smoke_test.py e1-scylla <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
 ```
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 us-central1-a <terraform_state_bucket>
+python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
 ```
 
 ### Fase 5 — Execução dos testes de carga e captura de resultados
 
+**0. Massa de dados completa — antes de qualquer bateria real**
+
+O smoke test (passo 7) carrega só o subconjunto de ~904 usuários
+referenciados pelo oráculo — rápido, suficiente pra provar correção,
+insuficiente pra medir latência de verdade: `load/zipf.js` amostra
+usuários de **toda** a base real (U=200.948), e a maioria bateria em
+usuários sem candidato nenhum se só esse subconjunto estivesse carregado.
+
+```
+docker compose run --rm generator all --seed 42   # sem --sample-users: escala real, demora e sobrescreve o dado de dev local
+```
+
+Depois, aplique `infra/bootstrap` de novo (cria só o bucket novo, os outros
+3 já existem) e envie o dataset:
+
+```
+infra/scripts/with_terraform_credentials.sh <seu-projeto> -- \
+  docker compose -f docker-compose.yml -f docker-compose.gcp.yml \
+  run --rm --entrypoint terraform tools -chdir=infra/bootstrap apply -var="project_id=<seu-projeto>"
+infra/scripts/upload_dataset.sh <dataset_bucket>
+```
+
+Reconstrua e publique a imagem `tools` de novo (passo 4) — ela ganhou os 4
+scripts `load_full_dataset.py` e a dependência `google-cloud-storage`, e
+`oracle.parquet` também muda de escala:
+
+```
+infra/scripts/build_and_push_images.sh <project-id> <region>
+```
+
 Diferente do smoke test — que sobe, valida e derruba tudo sozinho — aqui é
 onde a bateria de medição real acontece. `infra/scripts/run_measurement_battery.py`
 é a contraparte do smoke test (passo 7) para esta fase: sobe a célula
-(terraform init/apply), aplica schema + fixture do oráculo + fixture de
-contexto-por-seletividade, roda `load/run_battery.py` de verdade a partir da
-VM `loadgen` (via SSH/IAP — a VM de serviço não tem IP público) varrendo
-carga × seletividade conforme `CONTEXTO.md`, "Protocolo de medição", traz os
-`results/` de volta e sincroniza com o bucket de resultados do bootstrap
-(passo 2), e por fim `terraform destroy` a célula — mesma disciplina de
-confirmação antes de cada `apply`/`destroy` do smoke test.
+(terraform init/apply), aplica schema + a base **completa** (baixada do
+bucket de dataset acima — nunca o fixture do oráculo, que é exclusivo do
+smoke test) + fixture de contexto-por-seletividade, roda `load/run_battery.py`
+de verdade a partir da VM `loadgen` (via SSH/IAP — a VM de serviço não tem
+IP público) varrendo carga × seletividade conforme `CONTEXTO.md`,
+"Protocolo de medição", traz os `results/` de volta e sincroniza com o
+bucket de resultados do bootstrap (passo 2), e por fim `terraform destroy`
+a célula — mesma disciplina de confirmação antes de cada `apply`/`destroy`
+do smoke test.
 
 **Triagem — todas as 14 células, carga e seletividade fixas em nível
 intermediário** (`CONTEXTO.md`, "Delineamento em duas etapas" — identifica a
@@ -930,7 +964,7 @@ fronteira de Pareto latência × custo):
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 python -m infra.scripts.run_measurement_battery e1-postgres <project-id> us-central1 us-central1-a \
-    <terraform_state_bucket> <results_bucket> --phase triagem
+    <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase triagem
 ```
 
 Repita para as outras 13 células (troque só o nome da célula). `--ramp`
@@ -951,7 +985,7 @@ seletividade + 5 repetições:**
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 python -m infra.scripts.run_measurement_battery <cell-da-fronteira> <project-id> us-central1 us-central1-a \
-    <terraform_state_bucket> <results_bucket> --phase confirmacao
+    <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase confirmacao
 ```
 
 ```

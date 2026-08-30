@@ -99,6 +99,23 @@ resource "google_storage_bucket" "function_source" {
   }
 }
 
+# Massa de dados completa (Fase 5) — candidates.parquet/prematerialized.parquet
+# em escala real, enviados uma vez por infra/scripts/upload_dataset.sh e
+# baixados por cada VM loadgen via harness/fixtures.py:
+# ensure_full_dataset_downloaded. Sem prevent_destroy: dado regenerável
+# (docker compose run --rm generator all), não resultado de experimento.
+resource "google_storage_bucket" "dataset" {
+  name                        = "${var.project_id}-tcc-dataset"
+  location                    = var.region
+  uniform_bucket_level_access = true
+
+  labels = {
+    project    = "tcc-recsys-retrieval"
+    phase      = "bootstrap"
+    managed_by = "terraform"
+  }
+}
+
 output "terraform_state_bucket" {
   description = "Nome do bucket a passar em -backend-config=\"bucket=...\" nos envs/*."
   value       = google_storage_bucket.terraform_state.name
@@ -112,4 +129,9 @@ output "results_bucket" {
 output "function_source_bucket" {
   description = "Nome do bucket para o zip da Cloud Function da trava de segurança — passar em -var=\"function_source_bucket=...\" em envs/budget."
   value       = google_storage_bucket.function_source.name
+}
+
+output "dataset_bucket" {
+  description = "Nome do bucket da massa de dados completa — infra/scripts/upload_dataset.sh envia aqui; passar em -var=\"dataset_bucket=...\" em envs/experiment."
+  value       = google_storage_bucket.dataset.name
 }

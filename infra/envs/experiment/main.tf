@@ -82,6 +82,11 @@ variable "tools_image" {
   description = "Imagem do tools/ (docker/Dockerfile.tools) em Artifact Registry, usada pela VM de loadgen."
 }
 
+variable "dataset_bucket" {
+  type        = string
+  description = "Bucket com a massa de dados completa (output do bootstrap: dataset_bucket)."
+}
+
 provider "google" {
   project = var.project_id
   region  = var.region
@@ -119,6 +124,7 @@ module "loadgen" {
   cell                 = var.cell
   subnetwork_self_link = module.network.subnetwork_self_link
   tools_image          = var.tools_image
+  dataset_bucket       = var.dataset_bucket
 }
 
 output "database_internal_ip" {

@@ -26,6 +26,11 @@ dependencies = [
     # scikit-posthocs corrigir o import (statsmodels.stats.multitest).
     "statsmodels<0.15",
     "matplotlib>=3.8",
+    # schemas/<db>/load_full_dataset.py baixa candidates.parquet/
+    # prematerialized.parquet do bucket de dataset (harness/fixtures.py:
+    # ensure_full_dataset_downloaded) — roda dentro do tools em produção
+    # (Fase 5), não só em teste, por isso aqui e não em [dev].
+    "google-cloud-storage>=2.18",
 ]
 
 [project.optional-dependencies]

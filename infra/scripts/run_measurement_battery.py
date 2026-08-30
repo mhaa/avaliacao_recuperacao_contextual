@@ -18,7 +18,7 @@ infra.scripts.cloud_smoke_test por nome absoluto, e `infra/` só existe no
 container por bind mount, nunca copiado pela imagem; `-m` garante que /app
 entra no sys.path, `python infra/scripts/run_measurement_battery.py` não):
     python -m infra.scripts.run_measurement_battery <cell> <project-id> <region> <zone> \\
-        <terraform-state-bucket> <results-bucket> --phase triagem \\
+        <terraform-state-bucket> <results-bucket> <dataset-bucket> --phase triagem \\
         [--repetitions 5] [--seed 42] [--ramp] [--keep-infra]
 
 Cada comando faturável (terraform apply/destroy) é anunciado explicitamente
@@ -97,15 +97,19 @@ def build_remote_setup_command(
     tools_image: str,
     postgres_password: str | None,
     fixtures_mount: str,
+    dataset_bucket: str,
 ) -> str:
-    """Schema + fixture do oráculo + fixture de contexto-por-seletividade,
-    antes de qualquer medição — reusa a mesma construção de env vars e
-    passos de schema/fixture do smoke test (Fase 4), sem os gates de
-    correção/smoke, que não são responsabilidade desta fase. Bind-monta
-    `fixtures_mount` para `contexts_by_tier.json` sobreviver e ser lido
-    depois por cada `docker run` de `load/run_battery.py`."""
+    """Schema + massa de dados COMPLETA (mode="full" — não o subconjunto do
+    oráculo do smoke test: load/zipf.js amostra de toda a população real) +
+    fixture de contexto-por-seletividade, antes de qualquer medição — reusa
+    a mesma construção de env vars e passos de schema/carga do smoke test
+    (Fase 4), sem os gates de correção/smoke, que não são responsabilidade
+    desta fase. Bind-monta `fixtures_mount` para `contexts_by_tier.json`
+    sobreviver e ser lido depois por cada `docker run` de
+    `load/run_battery.py`."""
     env_flags = build_storage_env_flags(cell_id, storage, database_ip, service_ip, postgres_password)
-    steps = build_schema_and_fixture_steps(storage)
+    env_flags = [*env_flags, f"DATASET_BUCKET={dataset_bucket}"]
+    steps = build_schema_and_fixture_steps(storage, mode="full")
     steps.append("python load/export_contexts_by_tier.py")
     inner = " && ".join(steps)
 
@@ -220,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("zone")
     parser.add_argument("terraform_state_bucket")
     parser.add_argument("results_bucket")
+    parser.add_argument("dataset_bucket")
     parser.add_argument("--phase", required=True, choices=["triagem", "confirmacao"])
     parser.add_argument("--repetitions", type=int, default=REPETITIONS)
     parser.add_argument("--seed", type=int, default=42)
@@ -277,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"-var=zone={args.zone}",
                 f"-var=cell={args.cell}",
                 f"-var=storage={storage}",
+                f"-var=dataset_bucket={args.dataset_bucket}",
             ]
         )
 
@@ -308,7 +314,14 @@ def main(argv: list[str] | None = None) -> int:
             postgres_password = secret_result.stdout.strip()
 
         setup_cmd = build_remote_setup_command(
-            args.cell, storage, database_ip, service_ip, tools_image, postgres_password, FIXTURES_MOUNT
+            args.cell,
+            storage,
+            database_ip,
+            service_ip,
+            tools_image,
+            postgres_password,
+            FIXTURES_MOUNT,
+            args.dataset_bucket,
         )
         gcloud_ssh(loadgen_instance, args.zone, args.project_id, setup_cmd)
 
@@ -378,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"-var=zone={args.zone}",
                     f"-var=cell={args.cell}",
                     f"-var=storage={storage}",
+                    f"-var=dataset_bucket={args.dataset_bucket}",
                 ]
             )
 
