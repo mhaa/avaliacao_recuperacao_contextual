@@ -27,10 +27,16 @@ container por bind mount, nunca copiado pela imagem; `-m` garante que /app
 entra no sys.path, `python infra/scripts/run_measurement_battery.py` não):
     python -m infra.scripts.run_measurement_battery <cell> <project-id> <region> <zone> \\
         <terraform-state-bucket> <results-bucket> <dataset-bucket> --phase triagem \\
-        [--repetitions 5] [--seed 42] [--keep-infra]
+        [--repetitions 5] [--seed 42] [--verify-otel] [--keep-infra]
+
+    # --verify-otel: só na primeira célula da triagem — confirma que o
+    # coletor OpenTelemetry das 3 VMs está exportando métricas de verdade
+    # antes de rodar as outras 13 (o módulo Terraform é idêntico nas 14).
 
     # confirmação: --saturation-start vem do report.json da triagem
-    # (aproximado ou lower_bound se a célula ficou censurada).
+    # (aproximado ou lower_bound se a célula ficou censurada). resources.csv
+    # é escrito nesta fase (amostragem periódica de 5s durante o sweep +
+    # rampa fina, CONTEXTO.md), nunca na triagem.
     python -m infra.scripts.run_measurement_battery <cell> ... --phase confirmacao \\
         --saturation-start 11000
 
@@ -48,7 +54,9 @@ import os
 import random
 import shlex
 import sys
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -95,6 +103,21 @@ CONFIRMATION_WARMUP = "2m"
 CONFIRMATION_MEASURE = "3m"
 SHORT_RAMP_WARMUP = "0s"
 SHORT_RAMP_MEASURE = "1m"
+
+# IMPLEMENTACAO.md, "Topologia": memória nominal dos tipos de máquina
+# padrão — só para converter a fração que o coletor OpenTelemetry reporta
+# em MB (analysis/resources.py:GCPMonitoringCollector), sem uma chamada
+# extra à API do Compute para descobrir o tipo de máquina em runtime. Se
+# `machine_type` for sobrescrito em terraform.tfvars, ajustar aqui também.
+DEFAULT_MEMORY_MB_BY_COMPONENT = {
+    "database": 32768.0,  # n2-standard-8
+    "service": 16384.0,  # n2-standard-4
+    "loadgen": 32768.0,  # n2-standard-8
+}
+
+# Janela de amostragem periódica de recursos durante a rampa de
+# confirmação (CONTEXTO.md: "amostrar a cada 5 segundos nas três VMs").
+RESOURCE_SAMPLE_INTERVAL_SECONDS = 5
 
 
 def build_sweep(phase: str) -> list[tuple[int, str]]:
@@ -294,6 +317,99 @@ def _generator_cpu_percent(project_id: str, loadgen_instance: str, start_time, e
     return samples[0].cpu_percent
 
 
+def verify_otel_pipeline(
+    project_id: str,
+    instance_by_component: dict[str, str],
+    memory_mb_by_component: dict[str, float],
+    wait_seconds: int = 60,
+) -> bool:
+    """Confirma que o coletor OpenTelemetry das 3 VMs (infra/modules/
+    {database,service,loadgen}/main.tf) está de fato exportando métricas
+    para o Cloud Monitoring, antes de comprometer horas de VM numa triagem
+    inteira — README.md/CONTEXTO.md sinalizam essa peça como a menos
+    testada do projeto (Ops Agent oficial do Google não roda em COS, sem
+    gerenciador de pacotes). Pensado para rodar só na primeira célula da
+    triagem (--verify-otel): o módulo Terraform é idêntico nas 14, então
+    um OK aqui vale para todas."""
+    from analysis.resources import GCPMonitoringCollector
+
+    print(f"Aguardando {wait_seconds}s para o coletor publicar a primeira amostra...")
+    time.sleep(wait_seconds)
+
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(seconds=wait_seconds)
+    collector = GCPMonitoringCollector(
+        project_id, instance_by_component, memory_mb_by_component, start_time, end_time
+    )
+    try:
+        samples = collector.collect()
+    except Exception as exc:
+        print(f"FALHOU: {exc}")
+        print(
+            "Diagnóstico: `gcloud compute ssh <instância> --zone=<zone> --project="
+            f"{project_id} --tunnel-through-iap` e `docker logs tcc-otel-agent` em cada VM "
+            "para ver o erro real. Métricas novas (workload.googleapis.com/*) às vezes levam "
+            "alguns minutos a mais para ficar consultáveis na primeira vez — tente de novo "
+            "antes de concluir que o coletor está quebrado."
+        )
+        return False
+
+    for sample in samples:
+        print(
+            f"  {sample.component}: cpu={sample.cpu_percent:.1f}% "
+            f"memory={sample.memory_mb:.0f}MB network={sample.network_mbps:.2f}Mbps"
+        )
+    print("OK: as 3 VMs estão exportando CPU/memória/rede para o Cloud Monitoring.")
+    return True
+
+
+def make_resource_collect_fn(
+    project_id: str,
+    instance_by_component: dict[str, str],
+    memory_mb_by_component: dict[str, float],
+    interval_seconds: int = RESOURCE_SAMPLE_INTERVAL_SECONDS,
+) -> Callable[[], list]:
+    """Fecha sobre o contexto de uma célula e devolve uma função sem
+    argumentos que consulta uma janela curta e recente do Cloud Monitoring
+    — usada por sample_resources_periodically. Consultar uma janela curta
+    a cada tick (em vez de pedir a série histórica inteira de uma vez ao
+    final) evita depender da granularidade exata que o Cloud Monitoring
+    retém para cada métrica."""
+    from analysis.resources import GCPMonitoringCollector
+
+    def collect_fn() -> list:
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(seconds=interval_seconds)
+        collector = GCPMonitoringCollector(
+            project_id, instance_by_component, memory_mb_by_component, start_time, end_time
+        )
+        return collector.collect()
+
+    return collect_fn
+
+
+def sample_resources_periodically(
+    collect_fn: Callable[[], list],
+    stop_event: threading.Event,
+    samples_out: list,
+    interval_seconds: int = RESOURCE_SAMPLE_INTERVAL_SECONDS,
+) -> None:
+    """Chama collect_fn() a cada interval_seconds até stop_event ser
+    sinalizado, acumulando em samples_out — roda numa thread separada,
+    em paralelo ao sweep/rampa de confirmação (CONTEXTO.md: "amostrar a
+    cada 5 segundos nas três VMs"). collect_fn isolado por injeção de
+    dependência (make_resource_collect_fn) para este loop ser testável com
+    um fake, sem precisar de Cloud Monitoring de verdade — uma falha
+    isolada de coleta (rede, métrica ainda não disponível) não derruba o
+    loop nem a medição em andamento."""
+    while not stop_event.is_set():
+        try:
+            samples_out.extend(collect_fn())
+        except Exception as exc:
+            print(f"AVISO: falha ao amostrar recursos ({exc}) — pulando esta amostra.")
+        stop_event.wait(interval_seconds)
+
+
 def make_probe_fn(
     cell_id: str,
     target_url: str,
@@ -438,6 +554,14 @@ def main(argv: list[str] | None = None) -> int:
         "rampa fina de confirmação.",
     )
     parser.add_argument(
+        "--verify-otel",
+        action="store_true",
+        help="antes do sweep, confirma que o coletor OpenTelemetry das 3 VMs está exportando "
+        "métricas de verdade para o Cloud Monitoring — recomendado só na primeira célula da "
+        "triagem (o módulo Terraform é idêntico nas 14, um OK aqui vale para todas). Aborta "
+        "(sem rodar o sweep) se a verificação falhar.",
+    )
+    parser.add_argument(
         "--keep-infra",
         action="store_true",
         help="não roda terraform destroy no final (para investigar uma falha)",
@@ -508,6 +632,24 @@ def main(argv: list[str] | None = None) -> int:
         wait_for_container(database_instance, args.zone, args.project_id, "tcc-database")
         wait_for_container(service_instance, args.zone, args.project_id, "tcc-service")
 
+        instance_by_component = {
+            "database": database_instance,
+            "service": service_instance,
+            "loadgen": loadgen_instance,
+        }
+
+        if args.verify_otel:
+            print("\n--- verificação do coletor OpenTelemetry/Ops Agent ---")
+            if not verify_otel_pipeline(
+                args.project_id, instance_by_component, DEFAULT_MEMORY_MB_BY_COMPONENT
+            ):
+                print(
+                    "\nAbortando antes do sweep: corrija o coletor OpenTelemetry (README.md, "
+                    "'Instrumentação de gargalo') antes de comprometer horas de VM numa "
+                    "triagem inteira."
+                )
+                return 1
+
         postgres_password = None
         if storage == "postgres":
             secret_result = _run(
@@ -539,6 +681,24 @@ def main(argv: list[str] | None = None) -> int:
 
         target_url = f"http://{service_ip}:8000/v1/recommendations"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+        # Amostragem periódica de recursos (CONTEXTO.md: "amostrar a cada 5
+        # segundos nas três VMs") — só durante a confirmação; a rampa curta
+        # da triagem é exploratória e nunca é arquivada, o mesmo vale para o
+        # uso de recursos dela.
+        resource_samples: list = []
+        stop_sampling = threading.Event()
+        sampling_thread = None
+        if args.phase == "confirmacao":
+            collect_fn = make_resource_collect_fn(
+                args.project_id, instance_by_component, DEFAULT_MEMORY_MB_BY_COMPONENT
+            )
+            sampling_thread = threading.Thread(
+                target=sample_resources_periodically,
+                args=(collect_fn, stop_sampling, resource_samples),
+                daemon=True,
+            )
+            sampling_thread.start()
 
         for i, (rate, tier) in enumerate(sweep, start=1):
             print(f"\n--- combinação {i}/{len(sweep)}: rate={rate} tier={tier} ---")
@@ -602,6 +762,26 @@ def main(argv: list[str] | None = None) -> int:
                     saturation, args.cell, args.phase, timestamp, filename=f"saturation_{tier}.json"
                 )
 
+        if sampling_thread is not None:
+            stop_sampling.set()
+            sampling_thread.join(timeout=RESOURCE_SAMPLE_INTERVAL_SECONDS + 10)
+            if resource_samples:
+                from analysis.resources import classify_bottleneck, write_resources_csv
+
+                resources_path = Path("results") / args.cell / args.phase / timestamp / "resources.csv"
+                write_resources_csv(resource_samples, resources_path)
+                print(f"\n{resources_path}: {len(resource_samples)} amostras de recursos escritas.")
+                try:
+                    bottleneck = classify_bottleneck(
+                        resource_samples, memory_ceiling_mb=DEFAULT_MEMORY_MB_BY_COMPONENT
+                    )
+                    print(f"Gargalo dominante ao longo da confirmação: {bottleneck}.")
+                except ValueError:
+                    pass
+            else:
+                print("\nAVISO: nenhuma amostra de recursos coletada — resources.csv não foi escrito.")
+
+        if args.phase == "confirmacao":
             # Diferente da rampa curta (exploratória, nunca arquivada), a de
             # confirmação exige "saída com distribuição completa" — traz de
             # volta as sondagens brutas para results/_saturation/, fora do

@@ -971,11 +971,39 @@ rode `pip install -e .` uma vez (além do `gcloud` CLI já exigido pela Fase
 intermediário** (`CONTEXTO.md`, "Delineamento em duas etapas" — identifica a
 fronteira de Pareto em **3 dimensões**: latência × custo × vazão de
 saturação). A rampa curta (exploratória, 1 repetição por patamar) roda
-automaticamente logo depois do sweep de carga fixa — não precisa de flag:
+automaticamente logo depois do sweep de carga fixa — não precisa de flag.
+
+**Primeira célula — com `--verify-otel`.** Antes de comprometer horas de
+VM nas 14 células, confirme que o coletor OpenTelemetry das 3 VMs
+(`infra/modules/{database,service,loadgen}/main.tf`) está de fato
+exportando métricas para o Cloud Monitoring — essa é, de longe, a parte
+menos testada do projeto (Ops Agent oficial do Google não roda em COS,
+sem gerenciador de pacotes; nada aqui foi validado contra uma VM real, só
+`terraform validate`, que não pega esse tipo de falha):
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 python -m infra.scripts.run_measurement_battery e1-postgres <project-id> us-central1 us-central1-a \
+    <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase triagem --verify-otel
+```
+
+Depois de subir as 3 VMs, o script espera ~60s e consulta o Cloud
+Monitoring; imprime `cpu=`/`memory=`/`network=` por VM e segue para o
+sweep normalmente se as 3 responderem. Se falhar, ele **aborta antes do
+sweep** (nenhum tempo de medição desperdiçado) e imprime como
+diagnosticar: `gcloud compute ssh <instância> --tunnel-through-iap` em
+cada VM e `docker logs tcc-otel-agent` para ver o erro real — métricas
+novas (`workload.googleapis.com/*`) às vezes levam alguns minutos a mais
+para ficar consultáveis na primeira vez, então tente de novo uma vez antes
+de concluir que o coletor está quebrado. O módulo Terraform é idêntico nas
+14 células, então um OK aqui vale para todas — **não repita `--verify-otel`
+nas outras 13**, só atrasaria cada uma em ~1 minuto à toa.
+
+Demais células:
+
+```
+export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python -m infra.scripts.run_measurement_battery e1-valkey <project-id> us-central1 us-central1-a \
     <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase triagem
 ```
 
@@ -1044,14 +1072,19 @@ distribuição completa exigida por essa etapa, ao contrário da curta, que
 nunca é arquivada) ficam em `results/_saturation/<cell>/` — fora do
 namespace que `analysis/report.py` varre por padrão.
 
-**Instrumentação de gargalo** — durante a rampa de confirmação,
-`resources.csv` registra CPU/memória/rede das 3 VMs a cada 5s
-(`analysis/resources.py:GCPMonitoringCollector`, via um coletor
-OpenTelemetry rodando como contêiner em cada VM — Ops Agent oficial do
-Google não roda em COS, sem gerenciador de pacotes). **Esta é a parte
-menos testada do projeto** — só validada por `terraform validate`, nunca
-contra uma VM real; recomenda-se rodar a triagem de uma única célula
-primeiro e conferir `resources.csv` antes de rodar as 14.
+**Instrumentação de gargalo** — durante toda a fase de confirmação (o
+sweep de carga fixa e a rampa fina de saturação), uma thread em segundo
+plano consulta o Cloud Monitoring a cada 5s
+(`infra/scripts/run_measurement_battery.py:sample_resources_periodically`)
+e escreve `results/<cell>/confirmacao/<timestamp>/resources.csv` com
+CPU/memória/rede das 3 VMs — nunca na triagem, cuja rampa curta é
+exploratória e não é arquivada. Ao final, `analysis/resources.py:
+classify_bottleneck` aponta qual `<VM>_<recurso>` esteve mais perto do
+próprio teto (`database_cpu`, `service_memory`, `loadgen_network`, ...),
+impresso no terminal. Os dados vêm de um coletor OpenTelemetry rodando
+como contêiner em cada VM — Ops Agent oficial do Google não roda em COS,
+sem gerenciador de pacotes; valide esse pipeline com `--verify-otel` na
+primeira célula da triagem (acima) antes de confiar nele aqui.
 
 O disco da célula sobrevive fora do ciclo de vida da VM —
 `infra/scripts/snapshot_after_load.sh <disk-name> <zone> <project-id>`, se

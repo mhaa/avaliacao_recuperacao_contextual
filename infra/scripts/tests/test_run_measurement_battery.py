@@ -6,6 +6,7 @@ infra/scripts/cloud_smoke_test.py:main() (exige projeto GCP real)."""
 from __future__ import annotations
 
 import json
+import threading
 
 from infra.scripts.run_measurement_battery import (
     RATES,
@@ -18,6 +19,7 @@ from infra.scripts.run_measurement_battery import (
     build_remote_probe_command,
     build_remote_setup_command,
     build_sweep,
+    sample_resources_periodically,
     shuffled_sweep,
 )
 from load.saturation import SaturationSearchResult
@@ -141,3 +143,51 @@ def test_write_saturation_json_round_trips(tmp_path, monkeypatch):
     payload = json.loads(out.read_text())
     assert payload["approx_throughput"] == 11000.0
     assert payload["censored"] is False
+
+
+def test_sample_resources_periodically_stops_when_event_is_set():
+    stop_event = threading.Event()
+    calls = []
+
+    def fake_collect_fn():
+        calls.append(1)
+        if len(calls) >= 3:
+            stop_event.set()
+        return [{"component": "database", "cpu_percent": 10.0}]
+
+    samples_out: list = []
+    sample_resources_periodically(fake_collect_fn, stop_event, samples_out, interval_seconds=0)
+
+    assert len(calls) == 3
+    assert len(samples_out) == 3
+
+
+def test_sample_resources_periodically_tolerates_a_failing_collect_fn():
+    stop_event = threading.Event()
+    calls = []
+
+    def flaky_collect_fn():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("Cloud Monitoring indisponível")
+        stop_event.set()
+        return []
+
+    samples_out: list = []
+    sample_resources_periodically(flaky_collect_fn, stop_event, samples_out, interval_seconds=0)
+
+    assert len(calls) == 2  # a exceção não travou o loop
+
+
+def test_sample_resources_periodically_never_calls_when_already_stopped():
+    stop_event = threading.Event()
+    stop_event.set()
+    calls = []
+
+    def fake_collect_fn():
+        calls.append(1)
+        return []
+
+    sample_resources_periodically(fake_collect_fn, stop_event, [], interval_seconds=0)
+
+    assert calls == []
