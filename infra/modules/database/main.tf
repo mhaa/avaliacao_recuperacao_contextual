@@ -74,11 +74,17 @@ variable "data_disk_snapshot" {
 # inventada aqui, só traduzida para `docker run` (evita confundir a
 # comparação entre células com uma diferença acidental de configuração).
 locals {
+  # mirror.gcr.io/... em vez do Docker Hub direto: mirror público e gratuito
+  # do Google, sem autenticação extra (continua anônimo, só troca de onde
+  # vem) — confirmado ao vivo que o Docker Hub direto começou a recusar TODAS
+  # as 5 tentativas do retry loop com "context deadline exceeded" numa VM
+  # nova, provável rate limit de pulls anônimos por IP (o projeto criou
+  # dezenas de VMs hoje, todas saindo pelo mesmo Cloud NAT).
   docker_image = {
-    postgres   = "postgres:16-alpine"
-    valkey     = "valkey/valkey:8-alpine"
-    scylla     = "scylladb/scylla:6.2"
-    opensearch = "opensearchproject/opensearch:2.18.0"
+    postgres   = "mirror.gcr.io/library/postgres:16-alpine"
+    valkey     = "mirror.gcr.io/valkey/valkey:8-alpine"
+    scylla     = "mirror.gcr.io/scylladb/scylla:6.2"
+    opensearch = "mirror.gcr.io/opensearchproject/opensearch:2.18.0"
   }
   # /mnt/disks/data, não /mnt/data: no COS a raiz é somente-leitura
   # (dm-verity) — só /mnt/disks (e /var, /home) são graváveis. Confirmado
@@ -176,12 +182,12 @@ locals {
     # set -euo pipefail matava o startup-script INTEIRO antes até de chegar
     # no docker run do banco — raiz real de timeouts de wait_for_container
     # que pareciam ser do próprio container do banco/serviço.
-    for i in 1 2 3 4 5; do docker pull otel/opentelemetry-collector-contrib:0.112.0 && break || sleep 10; done
+    for i in 1 2 3 4 5; do docker pull mirror.gcr.io/otel/opentelemetry-collector-contrib:0.112.0 && break || sleep 10; done
     docker run -d --name tcc-otel-agent --restart unless-stopped \
       --pid host --network host \
       -v /:/hostfs:ro \
       -v /etc/otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro \
-      otel/opentelemetry-collector-contrib:0.112.0
+      mirror.gcr.io/otel/opentelemetry-collector-contrib:0.112.0
   OTELEOT
 }
 

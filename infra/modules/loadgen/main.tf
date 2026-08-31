@@ -130,12 +130,12 @@ locals {
     # no docker login/pull do loadgen — raiz real de timeouts de
     # wait_for_container que pareciam ser do próprio container do banco/
     # serviço.
-    for i in 1 2 3 4 5; do docker pull otel/opentelemetry-collector-contrib:0.112.0 && break || sleep 10; done
+    for i in 1 2 3 4 5; do docker pull mirror.gcr.io/otel/opentelemetry-collector-contrib:0.112.0 && break || sleep 10; done
     docker run -d --name tcc-otel-agent --restart unless-stopped \
       --pid host --network host \
       -v /:/hostfs:ro \
       -v /etc/otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro \
-      otel/opentelemetry-collector-contrib:0.112.0
+      mirror.gcr.io/otel/opentelemetry-collector-contrib:0.112.0
   OTELEOT
 }
 
