@@ -931,6 +931,16 @@ def main(argv: list[str] | None = None) -> int:
             _confirm_billable(
                 f"terraform destroy da célula '{args.cell}' — é isso que PARA a cobrança."
             )
+            # Reminta o token: o token impersonado dura só ~1h (fetch_terraform_
+            # access_token), e uma bateria real (5 repetições x 7min de k6 +
+            # busca de saturação) pode facilmente ultrapassar isso — confirmado
+            # ao vivo: o destroy final falhou com "Error 401: invalid
+            # authentication credentials" em VÁRIOS recursos, deixando VMs
+            # presas cobrando até uma intervenção manual. Sem isso, exatamente
+            # o cenário que este script deveria evitar (custo esquecido rodando)
+            # acontecia justo na etapa que deveria parar a cobrança.
+            print("Remintando token de acesso antes do destroy (o anterior pode ter expirado)...")
+            os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = fetch_terraform_access_token(args.project_id)
             destroy_vars = [
                 "destroy",
                 "-auto-approve",
