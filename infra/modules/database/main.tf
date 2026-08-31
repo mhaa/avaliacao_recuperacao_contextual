@@ -116,9 +116,20 @@ locals {
     opensearch = "-p 9200:9200 -v /mnt/disks/data:/usr/share/opensearch/data -e discovery.type=single-node -e bootstrap.memory_lock=true -e OPENSEARCH_JAVA_OPTS=\"-Xms2g -Xmx2g\" -e DISABLE_SECURITY_PLUGIN=true"
   }
   docker_command_args = {
-    postgres   = "-c shared_buffers=1GB -c work_mem=64MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
-    valkey     = "--save \"\" --appendonly no --maxmemory 24gb --maxmemory-policy noeviction"
-    scylla     = "--smp 1 --memory 2G --overprovisioned 1 --developer-mode 1 --skip-wait-for-gossip-to-settle 0"
+    postgres = "-c shared_buffers=1GB -c work_mem=64MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
+    valkey   = "--save \"\" --appendonly no --maxmemory 24gb --maxmemory-policy noeviction"
+    # --smp 7 --memory 28G, não --smp 1 --memory 2G (valor herdado do
+    # docker-compose.yml LOCAL, CLAUDE.md: "só correção, nunca medição de
+    # desempenho"): confirmado ao vivo — na VM de nuvem (n2-standard-8, 8
+    # vCPUs/32GB), o Scylla ficava preso a 1 core e 2GB, usando só ~13% de
+    # CPU real, carregando o dataset completo em mais de 1 hora quando
+    # deveria ser questão de minutos. Além de lento, isso corrompe a
+    # REPRESENTATIVIDADE da medição de latência real — a VM inteira é
+    # exclusiva do Scylla, não faz sentido sufocá-lo do mesmo jeito que no
+    # dev local compartilhado. --overprovisioned/--developer-mode mantidos
+    # (não são o gargalo de performance, e mexer neles arrisca o Scylla
+    # recusar iniciar no COS sem o tuning completo de I/O de produção).
+    scylla     = "--smp 7 --memory 28G --overprovisioned 1 --developer-mode 1 --skip-wait-for-gossip-to-settle 0"
     opensearch = ""
   }
 }
