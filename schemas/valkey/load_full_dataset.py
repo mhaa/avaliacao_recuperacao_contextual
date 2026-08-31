@@ -17,6 +17,15 @@ import valkey
 from harness import fixtures
 
 URL = os.environ.get("TEST_VALKEY_URL", "redis://valkey:6379/0")
+# Flush a cada N comandos enfileirados no pipeline, não só no final — sem
+# isso, o cliente acumula TODOS os comandos da base completa (~100,5M
+# candidatos + ~4M linhas pré-materializadas em escala real) em memória
+# antes de mandar qualquer coisa pro servidor, e o processo morre por OOM
+# (confirmado ao vivo: "Killed" na VM loadgen). schemas/postgres/
+# load_full_dataset.py nunca teve esse problema porque `COPY ... FROM
+# STDIN` já transmite linha a linha (streaming de verdade); pipeline do
+# redis/valkey não — precisa de execute() periódico pra ter o mesmo efeito.
+BATCH_SIZE = 5000
 
 
 def main() -> None:
@@ -31,27 +40,40 @@ def main() -> None:
     inverted_lists = fixtures.load_inverted_lists()
 
     pipe = client.pipeline(transaction=False)
+    pending = 0
+
+    def queue() -> None:
+        nonlocal pending
+        pending += 1
+        if pending >= BATCH_SIZE:
+            pipe.execute()
+            pending = 0
 
     for user_id, group in candidates.group_by("user_id"):
         (uid,) = user_id
         mapping = {str(row["item_id"]): row["score"] for row in group.iter_rows(named=True)}
         pipe.hset(f"candidates:{uid}", mapping=mapping)
+        queue()
         pipe.sadd(f"candidates_set:{uid}", *mapping.keys())
+        queue()
 
     for item_id, group in item_contexts.group_by("item_id"):
         (iid,) = item_id
         context_ids = group["context_id"].to_list()
         pipe.sadd(f"item_contexts:{iid}", *[str(c) for c in context_ids])
+        queue()
 
     for (user_id, context_id), group in prematerialized.group_by(["user_id", "context_id"]):
         mapping = {str(row["item_id"]): row["score"] for row in group.iter_rows(named=True)}
         if mapping:
             pipe.hset(f"prematerialized:{user_id}:{context_id}", mapping=mapping)
+            queue()
 
     for row in inverted_lists.iter_rows(named=True):
         item_ids = row["item_ids"]
         if item_ids:
             pipe.sadd(f"inverted:{row['context_id']}", *[str(i) for i in item_ids])
+            queue()
 
     pipe.execute()
 

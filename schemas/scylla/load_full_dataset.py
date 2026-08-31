@@ -70,7 +70,16 @@ def main() -> None:
         "INSERT INTO candidates_by_context (context_id, user_id, rank, item_id, score) "
         "VALUES (?, ?, ?, ?, ?)"
     )
-    batches = []
+    # Flush a cada _BATCHES_FLUSH_SIZE BatchStatements, não só no final —
+    # `by_context` é um join (candidates x item_contexts), maior ainda que
+    # candidates sozinho em escala real; acumular TODOS os BatchStatement
+    # antes de um único execute_concurrent() no final corre o mesmo risco de
+    # OOM já confirmado ao vivo em schemas/valkey/load_full_dataset.py
+    # (pipeline inteiro em memória antes de mandar qualquer coisa pro
+    # servidor) — correção proativa, nunca chegou a estourar aqui de
+    # verdade, mas é a mesma causa.
+    _BATCHES_FLUSH_SIZE = 2000
+    batches: list = []
     for (context_id, user_id), group in by_context.group_by(["context_id", "user_id"]):
         rows = group.select(["rank", "item_id", "score"]).rows()
         for chunk in _chunked(rows, _BATCH_CHUNK_SIZE):
@@ -78,7 +87,11 @@ def main() -> None:
             for rank, item_id, score in chunk:
                 batch.add(insert_by_context, (context_id, user_id, rank, item_id, score))
             batches.append((batch, None))
-    execute_concurrent(session, batches, concurrency=10)
+            if len(batches) >= _BATCHES_FLUSH_SIZE:
+                execute_concurrent(session, batches, concurrency=10)
+                batches = []
+    if batches:
+        execute_concurrent(session, batches, concurrency=10)
 
     insert_prematerialized = session.prepare(
         "INSERT INTO prematerialized (user_id, context_id, rank, item_id, score) "
