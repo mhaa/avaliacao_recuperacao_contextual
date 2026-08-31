@@ -113,10 +113,30 @@ locals {
     # elas, o shell quebra "-Xms2g -Xmx2g" em dois tokens e o segundo
     # ("-Xmx2g") chega ao `docker run` como se fosse uma flag própria dele
     # ("unknown shorthand flag: 'X'") — confirmado rodando de verdade.
-    opensearch = "-p 9200:9200 -v /mnt/disks/data:/usr/share/opensearch/data -e discovery.type=single-node -e bootstrap.memory_lock=true -e OPENSEARCH_JAVA_OPTS=\"-Xms2g -Xmx2g\" -e DISABLE_SECURITY_PLUGIN=true"
+    #
+    # Heap 16g (50% dos 32GB da VM, teto recomendado pelo próprio
+    # Elasticsearch/OpenSearch — acima de ~32GB perde-se compressed oops),
+    # não 2g (valor de dev local, mesmo padrão de sub-provisionamento já
+    # encontrado no Scylla — nunca chegou a rodar de verdade em nuvem pra
+    # ter sido pego antes). --ulimit memlock=-1:-1 adicionado junto: com
+    # bootstrap.memory_lock=true e um heap bem maior, é bem mais provável
+    # esbarrar no ulimit padrão do container e falhar o mlockall na
+    # inicialização — exigido pela própria documentação do OpenSearch
+    # quando memory_lock está ligado.
+    opensearch = "-p 9200:9200 -v /mnt/disks/data:/usr/share/opensearch/data -e discovery.type=single-node -e bootstrap.memory_lock=true -e OPENSEARCH_JAVA_OPTS=\"-Xms16g -Xmx16g\" -e DISABLE_SECURITY_PLUGIN=true --ulimit memlock=-1:-1"
   }
   docker_command_args = {
-    postgres = "-c shared_buffers=1GB -c work_mem=64MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
+    # shared_buffers=8GB (25% dos 32GB — orientação padrão do Postgres),
+    # effective_cache_size=24GB (avisa o planner quanto de cache de SO
+    # esperar, sem alocar nada) e work_mem=256MB, não os valores de dev
+    # local (1GB/64MB) — mesmo padrão de sub-provisionamento do Scylla/
+    # OpenSearch, encontrado numa auditoria proativa depois de achar os
+    # outros dois. Menos severo que Scylla/OpenSearch (Postgres ainda se
+    # beneficia do cache de página do próprio SO mesmo com shared_buffers
+    # pequeno, diferente de motores que travam memória exclusiva), mas
+    # ainda deixa memória real da VM sem uso. e1-postgres já tinha dado
+    # real coletado com o valor antigo — precisa ser remedido com este.
+    postgres = "-c shared_buffers=8GB -c effective_cache_size=24GB -c work_mem=256MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
     valkey   = "--save \"\" --appendonly no --maxmemory 24gb --maxmemory-policy noeviction"
     # --smp 7 --memory 28G, não --smp 1 --memory 2G (valor herdado do
     # docker-compose.yml LOCAL, CLAUDE.md: "só correção, nunca medição de
