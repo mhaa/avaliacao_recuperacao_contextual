@@ -139,6 +139,15 @@ locals {
 }
 
 resource "google_compute_instance" "service" {
+  # depends_on explícito na concessão de IAM: mesmo raciocínio de
+  # infra/modules/loadgen/main.tf — o bloco service_account abaixo só
+  # referencia google_service_account.service.email, então o Terraform
+  # garante apenas que a SERVICE ACCOUNT existe antes da VM, não que a
+  # concessão roles/artifactregistry.reader já foi criada. Sem isso, a VM
+  # pode nascer (e já tentar `docker pull` de service_image, que é
+  # privada) em paralelo com a concessão de IAM ainda propagando.
+  depends_on = [google_project_iam_member.service_artifact_reader]
+
   name         = "tcc-${var.cell}-service"
   zone         = var.zone
   machine_type = var.machine_type

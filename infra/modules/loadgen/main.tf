@@ -140,6 +140,19 @@ locals {
 }
 
 resource "google_compute_instance" "loadgen" {
+  # depends_on explícito na concessão de IAM: o bloco service_account
+  # abaixo só referencia google_service_account.loadgen.email, então o
+  # Terraform garante apenas que a SERVICE ACCOUNT existe antes da VM —
+  # não que a CONCESSÃO roles/artifactregistry.reader já foi criada (são
+  # recursos irmãos, sem ordem implícita entre si). O startup-script tenta
+  # `docker pull` autenticado logo no boot; se ganhar a corrida contra a
+  # concessão (ou sua propagação de IAM), toda a janela de retry esbarra
+  # numa permissão que ainda nem existe. Causa raiz real, confirmada ao
+  # vivo, de "denied: Unauthenticated request ...
+  # artifactregistry.repositories.downloadArtifacts" persistente mesmo após
+  # ampliar o retry de 5x10s para 10x15s.
+  depends_on = [google_project_iam_member.loadgen_artifact_reader]
+
   name         = "tcc-${var.cell}-loadgen"
   zone         = var.zone
   machine_type = var.machine_type
