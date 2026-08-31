@@ -25,11 +25,40 @@ KEYSPACE = "recsys"
 # load_oracle_fixture.py, mais crítico ainda em escala real (partições bem
 # maiores por contexto de alta seletividade).
 _BATCH_CHUNK_SIZE = 100
+# Linhas por chamada de execute_concurrent_with_args — ver
+# _execute_concurrent_batched abaixo para o motivo real (não é só limitar
+# concorrência, é limitar o que o driver materializa em memória).
+_CONCURRENT_ARGS_BATCH_SIZE = 20_000
 
 
 def _chunked(rows: list, size: int):
     for i in range(0, len(rows), size):
         yield rows[i : i + size]
+
+
+def _execute_concurrent_batched(session, statement, rows_iter, concurrency: int) -> None:
+    """`execute_concurrent_with_args()` do driver Cassandra/Scylla NÃO faz
+    streaming de verdade, apesar de aceitar um iterador como `parameters` —
+    a implementação do driver materializa TODOS os parâmetros numa lista
+    (`list(enumerate(...))`) antes de despachar qualquer requisição,
+    independente do valor de `concurrency` (que só limita quantas
+    requisições ficam em voo ao mesmo tempo, não o que já foi carregado em
+    memória). Em escala real (~100,5M linhas de candidates) isso mata o
+    processo por OOM — confirmado ao vivo rodando e1-scylla pela primeira
+    vez, mesmo depois do fix já aplicado em candidates_by_context (que usa
+    execute_concurrent, não execute_concurrent_with_args, mas tinha o mesmo
+    problema de acumular tudo antes de executar). Chamar
+    execute_concurrent_with_args repetidamente em fatias pequenas do
+    próprio iterador mantém a memória limitada, independente do tamanho
+    total do dataset."""
+    batch: list = []
+    for row in rows_iter:
+        batch.append(row)
+        if len(batch) >= _CONCURRENT_ARGS_BATCH_SIZE:
+            execute_concurrent_with_args(session, statement, batch, concurrency=concurrency)
+            batch = []
+    if batch:
+        execute_concurrent_with_args(session, statement, batch, concurrency=concurrency)
 
 
 def main() -> None:
@@ -49,7 +78,7 @@ def main() -> None:
     insert_candidates = session.prepare(
         "INSERT INTO candidates (user_id, rank, item_id, score) VALUES (?, ?, ?, ?)"
     )
-    execute_concurrent_with_args(
+    _execute_concurrent_batched(
         session,
         insert_candidates,
         candidates.select(["user_id", "rank", "item_id", "score"]).iter_rows(),
@@ -59,7 +88,7 @@ def main() -> None:
     insert_item_contexts = session.prepare(
         "INSERT INTO item_contexts (item_id, context_id) VALUES (?, ?)"
     )
-    execute_concurrent_with_args(
+    _execute_concurrent_batched(
         session, insert_item_contexts, item_contexts.iter_rows(), concurrency=100
     )
 
@@ -97,7 +126,7 @@ def main() -> None:
         "INSERT INTO prematerialized (user_id, context_id, rank, item_id, score) "
         "VALUES (?, ?, ?, ?, ?)"
     )
-    execute_concurrent_with_args(
+    _execute_concurrent_batched(
         session,
         insert_prematerialized,
         prematerialized.select(
