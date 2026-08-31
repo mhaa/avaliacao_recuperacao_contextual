@@ -97,7 +97,7 @@ locals {
     cat > /etc/otel-config.yaml <<'YAMLEOF'
     receivers:
       hostmetrics:
-        collection_interval: 5s
+        collection_interval: 60s
         root_path: /hostfs
         scrapers:
           memory:
@@ -105,6 +105,13 @@ locals {
           network:
     processors:
       batch:
+      # resourcedetection é obrigatório — ver infra/modules/database/main.tf
+      # para o motivo completo (sem ele, as 3 VMs colidem no mesmo recurso
+      # "generic_node" em branco no Cloud Monitoring, causando "written too
+      # frequently"/"points out of order" — confirmado ao vivo).
+      resourcedetection:
+        detectors: [gcp]
+        timeout: 10s
     exporters:
       googlecloud:
         project: "${var.project_id}"
@@ -112,9 +119,18 @@ locals {
       pipelines:
         metrics:
           receivers: [hostmetrics]
-          processors: [batch]
+          processors: [resourcedetection, batch]
           exporters: [googlecloud]
     YAMLEOF
+    # Mesmo motivo do retry de docker pull mais abaixo (imagem tools): a
+    # primeira conexão de saída de uma VM nova pode dar timeout antes do
+    # Cloud NAT estabilizar — confirmado ao vivo (console serial: "request
+    # canceled while waiting for connection"). Sem retry aqui, essa falha sob
+    # set -euo pipefail matava o startup-script INTEIRO antes até de chegar
+    # no docker login/pull do loadgen — raiz real de timeouts de
+    # wait_for_container que pareciam ser do próprio container do banco/
+    # serviço.
+    for i in 1 2 3 4 5; do docker pull otel/opentelemetry-collector-contrib:0.112.0 && break || sleep 10; done
     docker run -d --name tcc-otel-agent --restart unless-stopped \
       --pid host --network host \
       -v /:/hostfs:ro \
@@ -178,4 +194,11 @@ resource "google_compute_instance" "loadgen" {
 output "internal_ip" {
   description = "IP interno da VM do gerador de carga."
   value       = google_compute_instance.loadgen.network_interface[0].network_ip
+}
+
+# Numérico, não o nome — mesmo motivo de infra/modules/database/main.tf:
+# resource.labels.instance_id do Cloud Monitoring é o ID numérico da VM.
+output "instance_id" {
+  description = "ID numérico da VM do gerador de carga — para filtrar métricas no Cloud Monitoring."
+  value       = google_compute_instance.loadgen.instance_id
 }

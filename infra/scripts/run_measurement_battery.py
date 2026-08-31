@@ -270,8 +270,16 @@ def build_remote_probe_command(
     steps: list[str] = []
     ndjson_paths: list[str] = []
     for rep in range(repetitions):
-        json_out = f"/app/results/{remote_subdir}/rep{rep}/k6-raw.json"
+        rep_dir = f"/app/results/{remote_subdir}/rep{rep}"
+        json_out = f"{rep_dir}/k6-raw.json"
         ndjson_paths.append(json_out)
+        # k6 não cria o diretório de --out sozinho (diferente de
+        # load/run_battery.py:run_k6, que faz out_dir.mkdir(parents=True)
+        # em Python antes de chamar o k6) — confirmado ao vivo: "open
+        # .../k6-raw.json: no such file or directory" na 1ª sondagem de
+        # saturação real, um caminho _saturation/<cell>/<probe>/rep<N>/
+        # nunca criado antes.
+        steps.append(shlex.join(["mkdir", "-p", rep_dir]))
         k6_argv = build_probe_k6_cmd(json_out, cell_id, target_url, rate, tier, warmup, measure)
         steps.append(shlex.join(str(a) for a in k6_argv))
     steps.append("python analysis/probe_report.py " + shlex.join(ndjson_paths))
@@ -321,8 +329,27 @@ def _generator_cpu_percent(project_id: str, loadgen_instance: str, start_time, e
         start_time=start_time,
         end_time=end_time,
     )
-    samples = collector.collect()
-    return samples[0].cpu_percent
+    try:
+        return collector.collect()[0].cpu_percent
+    except ValueError:
+        # Mesmo atraso de ingestão do Cloud Monitoring já visto em
+        # verify_otel_pipeline, mas aqui sem a folga de minutos que aquela
+        # função dá — a janela é sempre a duração de UMA sondagem (~1min),
+        # recém-terminada. Sem retry, uma sondagem perfeitamente válida
+        # (violou SLO ou não) abortava a busca de saturação inteira só
+        # porque o Cloud Monitoring ainda não processou o ponto — confirmado
+        # ao vivo. Uma tentativa extra depois de uma espera curta; se ainda
+        # assim falhar, assume 0% (não bloqueia a busca — só a checagem de
+        # gargalo do gerador fica sem dado para este patamar específico).
+        time.sleep(30)
+        try:
+            return collector.collect()[0].cpu_percent
+        except ValueError as exc:
+            print(
+                f"AVISO: não foi possível consultar CPU do gerador nesta sondagem ({exc}) — "
+                "assumindo 0% (não bloqueia a busca de saturação)."
+            )
+            return 0.0
 
 
 def snapshot_exists(project_id: str, snapshot_name: str) -> bool:
@@ -562,13 +589,18 @@ def sync_results_from_loadgen(
 
 
 def upload_results_to_bucket(local_dir: Path, results_bucket: str, cell_id: str) -> None:
+    # str(local_dir) sozinho copiava o DIRETÓRIO em si como subpasta do
+    # destino (gcloud storage cp --recursive <dir> <dest>/ replica <dir>,
+    # não seu conteúdo) — confirmado no resultado real: gs://.../e1-postgres/
+    # e1-postgres/triagem/..., nome da célula duplicado. "/*" copia só o
+    # conteúdo de local_dir para dentro do destino.
     _run(
         [
             "gcloud",
             "storage",
             "cp",
             "--recursive",
-            str(local_dir),
+            f"{local_dir.as_posix()}/*",
             f"gs://{results_bucket}/{cell_id}/",
         ]
     )
@@ -859,22 +891,28 @@ def main(argv: list[str] | None = None) -> int:
             # namespace results/<cell>/<phase>/ que analysis/report.py varre
             # (nunca entra por engano numa tabela de medição comum).
             local_saturation_dir = Path("results") / "_saturation" / args.cell
+            # local_dir = PAI de local_saturation_dir, não ela mesma: `gcloud
+            # compute scp --recurse origem destino` recria a pasta de origem
+            # dentro do destino — passar o mesmo nome final duas vezes
+            # duplicava o caminho (mesmo bug de upload_results_to_bucket,
+            # confirmado no resultado real).
             sync_results_from_loadgen(
                 loadgen_instance,
                 args.zone,
                 args.project_id,
                 f"{RESULTS_MOUNT}/_saturation/{args.cell}",
-                str(local_saturation_dir),
+                str(local_saturation_dir.parent),
             )
             upload_results_to_bucket(local_saturation_dir, args.results_bucket, f"_saturation/{args.cell}")
 
         local_results_dir = Path("results") / args.cell
+        # local_dir = PAI, mesmo motivo do sync de _saturation acima.
         sync_results_from_loadgen(
             loadgen_instance,
             args.zone,
             args.project_id,
             f"{RESULTS_MOUNT}/{args.cell}",
-            str(local_results_dir),
+            str(local_results_dir.parent),
         )
         upload_results_to_bucket(local_results_dir, args.results_bucket, args.cell)
 

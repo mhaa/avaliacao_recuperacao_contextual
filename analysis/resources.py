@@ -97,34 +97,40 @@ class GCPMonitoringCollector:
     nenhuma para a janela pedida, e `collect()` deixa o `ValueError` da
     API subir em vez de inventar um valor.
 
-    `memory_mb_by_component` converte a fração (0-1) que o `hostmetrics`
-    reporta para MB usando a memória nominal do tipo de máquina de cada VM
-    (já conhecida em infra/modules/*/main.tf, sem precisar de uma segunda
-    chamada à API do Compute para descobrir o tipo de máquina em tempo de
-    execução).
+    Memória já vem em MB direto de `_MEMORY_METRIC` (bytes, convertidos
+    abaixo) — nenhuma conversão de fração por tipo de máquina é necessária.
     """
 
     _CPU_METRIC = "compute.googleapis.com/instance/cpu/utilization"
     _NETWORK_RECEIVED_METRIC = "compute.googleapis.com/instance/network/received_bytes_count"
     _NETWORK_SENT_METRIC = "compute.googleapis.com/instance/network/sent_bytes_count"
-    # OTel `system.memory.utilization` é uma fração (0-1) por estado
-    # (used/free/buffered/cached) — só "used" interessa aqui; nome/label
-    # exatos ainda sem validação contra uma VM real (ver README.md,
-    # "Riscos conhecidos").
-    _MEMORY_METRIC = "workload.googleapis.com/system.memory.utilization"
+    # `system.memory.utilization` (fração 0-1) NÃO existe no exporter
+    # `googlecloud` do OTel Collector Contrib 0.112.0 — confirmado ao vivo
+    # listando os metric descriptors reais de `workload.googleapis.com/*`
+    # deste projeto: o hostmetrics receiver exporta `system.memory.usage`
+    # (bytes em uso, por estado — used/free/buffered/cached/slab), não uma
+    # utilização. Usar o nome errado gerava 404 "metric not found" (nunca
+    # existiu, não era atraso de criação de descritor como parecia a
+    # princípio). Valor é INT64 (bytes), não DOUBLE — ver `_mean_value`.
+    _MEMORY_METRIC = "workload.googleapis.com/system.memory.usage"
     _MEMORY_STATE_FILTER = 'metric.labels.state = "used"'
 
     def __init__(
         self,
         project_id: str,
         instance_by_component: dict[str, str],
-        memory_mb_by_component: dict[str, float],
         start_time: datetime,
         end_time: datetime,
     ):
+        """`instance_by_component` precisa do ID NUMÉRICO de cada VM (ex.:
+        `google_compute_instance.<x>.instance_id` no Terraform,
+        `outputs["database_instance_id"]` em run_measurement_battery.py), não
+        o nome (`tcc-<cell>-database`) — `resource.labels.instance_id` do
+        Cloud Monitoring para métricas `gce_instance` usa o ID numérico.
+        Passar o nome faz `_mean_value` nunca casar nenhuma série temporal
+        (confirmado ao vivo — parecia atraso de propagação, não era)."""
         self._project_id = project_id
         self._instance_by_component = instance_by_component
-        self._memory_mb_by_component = memory_mb_by_component
         self._start_time = start_time
         self._end_time = end_time
 
@@ -152,7 +158,7 @@ class GCPMonitoringCollector:
             sent_bytes = self._mean_value(
                 client, project_name, self._NETWORK_SENT_METRIC, instance_name, interval
             )
-            memory_fraction = self._mean_value(
+            memory_bytes = self._mean_value(
                 client,
                 project_name,
                 self._MEMORY_METRIC,
@@ -160,21 +166,41 @@ class GCPMonitoringCollector:
                 interval,
                 extra_filter=self._MEMORY_STATE_FILTER,
             )
-            memory_capacity_mb = self._memory_mb_by_component[component]
             samples.append(
                 ResourceSample(
                     component=component,
                     cpu_percent=cpu_fraction * 100.0,
-                    memory_mb=memory_fraction * memory_capacity_mb,
+                    memory_mb=memory_bytes / (1024**2),
                     network_mbps=(received_bytes + sent_bytes) * 8 / 1_000_000 / window_seconds,
                     timestamp=self._end_time,
                 )
             )
         return samples
 
+    @staticmethod
+    def _point_value(value) -> float:
+        """`TypedValue` é um `oneof` — métricas de utilização (CPU) vêm como
+        DOUBLE, mas contagens/bytes (rede, `system.memory.usage`) vêm como
+        INT64. Ler sempre `.double_value` devolve 0.0 silenciosamente para
+        as INT64 (campo não populado do oneof, default de proto3) — bug real
+        encontrado ao vivo: a memória sempre dava 0 sem erro nenhum, só
+        depois de comparar contra o descritor real (`value_type: INT64`) da
+        métrica é que apareceu."""
+        if "int64_value" in value:
+            return float(value.int64_value)
+        return value.double_value
+
     def _mean_value(
         self, client, project_name, metric_type, instance_name, interval, extra_filter: str = ""
     ) -> float:
+        # Mesmo motivo do import tardio em collect(): _mean_value é um método
+        # próprio, não herda o `monitoring_v3` importado localmente lá — sem
+        # isso, toda chamada real batia em `NameError: name 'monitoring_v3' is
+        # not defined` (nunca pego pelos testes, que usam um client fake sem
+        # passar por aqui de verdade; só uma invocação real contra o Cloud
+        # Monitoring expôs isso).
+        from google.cloud import monitoring_v3
+
         filter_str = (
             f'metric.type = "{metric_type}" AND resource.labels.instance_id = "{instance_name}"'
         )
@@ -188,14 +214,53 @@ class GCPMonitoringCollector:
                 "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
             }
         )
-        points = [p.value.double_value for series in results for p in series.points]
+        points = [self._point_value(p.value) for series in results for p in series.points]
         if not points:
+            hint = ""
+            if metric_type.startswith("workload.googleapis.com/"):
+                hint = self._diagnose_generic_node_collision(client, project_name, metric_type, interval)
             raise ValueError(
                 f"nenhuma série temporal para {metric_type!r} em {instance_name!r} na janela "
                 f"pedida — para a métrica de memória, confirme que o Ops Agent está rodando "
-                f"nessa VM (infra/modules/*/main.tf)."
+                f"nessa VM (infra/modules/*/main.tf).{hint}"
             )
         return sum(points) / len(points)
+
+    @staticmethod
+    def _diagnose_generic_node_collision(client, project_name, metric_type, interval) -> str:
+        """Consulta extra, só quando a principal não achou nada — filtra por
+        `resource.type = "generic_node"` (sem `instance_id`: esse tipo de
+        recurso nem tem esse label, por isso a consulta principal nunca casa
+        nada quando esse bug ocorre, em vez de reportar "recurso errado").
+        Detecta rapidamente o bug real encontrado ao vivo: o coletor OTel sem
+        o processor `resourcedetection` faz TODAS as VMs caírem no mesmo
+        recurso "genérico" em branco, causando colisões de escrita entre elas
+        (ver infra/modules/database/main.tf). Best-effort: qualquer erro
+        nesta consulta de diagnóstico é engolido — nunca deve mascarar o
+        ValueError original por uma falha na checagem extra."""
+        from google.cloud import monitoring_v3
+
+        try:
+            results = client.list_time_series(
+                request={
+                    "name": project_name,
+                    "filter": f'metric.type = "{metric_type}" AND resource.type = "generic_node"',
+                    "interval": interval,
+                    "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.HEADERS,
+                }
+            )
+            if any(True for _ in results):
+                return (
+                    " DIAGNÓSTICO: existem séries dessa métrica sob resource.type="
+                    "'generic_node' (não 'gce_instance') — o coletor OTel está sem o "
+                    "processor `resourcedetection` (detectors: [gcp]) no pipeline, ou "
+                    "ele não conseguiu falar com o metadata server. Isso faz várias VMs "
+                    "colidirem na mesma identidade de recurso em branco no Cloud "
+                    "Monitoring (ver infra/modules/database/main.tf)."
+                )
+        except Exception:
+            pass
+        return ""
 
 
 # Tetos usados por classify_bottleneck() para decidir "perto/além do

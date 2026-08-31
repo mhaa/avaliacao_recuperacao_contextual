@@ -42,6 +42,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CELLS_DIR = Path("cells")
+# .as_posix() nos usos abaixo, nunca str(): este processo às vezes roda no
+# host (Windows, via run_measurement_battery.py:build_probe_k6_cmd, montado
+# localmente e enviado por SSH como string) e às vezes dentro do container
+# remoto (Linux, quando este próprio arquivo roda via `python
+# load/run_battery.py`) — str(Path(...)) usa o separador nativo do SO onde
+# roda, e o k6 do lado de lá é sempre Linux. Confirmado ao vivo: a sondagem
+# de saturação (montada no host Windows) quebrava com "load\scenarios.js"
+# não encontrado, enquanto a combinação principal (montada dentro do
+# container Linux) sempre funcionou — mesma constante, dois separadores.
 SCENARIOS_SCRIPT = Path("load/scenarios.js")
 RESULTS_DIR = Path("results")
 
@@ -93,7 +102,7 @@ def build_k6_cmd(
     cmd = [
         "k6",
         "run",
-        str(SCENARIOS_SCRIPT),
+        SCENARIOS_SCRIPT.as_posix(),
         "--out",
         f"json={json_out}",
         "-e",
@@ -132,7 +141,7 @@ def build_probe_k6_cmd(
     return [
         "k6",
         "run",
-        str(SCENARIOS_SCRIPT),
+        SCENARIOS_SCRIPT.as_posix(),
         "--out",
         f"json={json_out}",
         "-e",
@@ -180,7 +189,24 @@ def run_k6(
         "git_commit": _git_commit(),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, check=False)
+    if result.returncode == 99:
+        # k6 usa o exit code 99 especificamente para "o teste rodou até o
+        # fim, mas um ou mais thresholds (load/scenarios.js: p99<200ms,
+        # error rate<1%) não passaram" — documentado pelo próprio k6, não é
+        # um crash. É exatamente o resultado esperado de uma célula
+        # dominada/mais lenta sob a carga fixa da triagem: um resultado de
+        # medição válido, não um erro. Tratar como fatal (como antes,
+        # check=True) abortava a bateria inteira e descartava o
+        # k6-raw.json já escrito — confirmado ao vivo rodando e1-postgres,
+        # que não aguenta 1000 req/s (89.88% de falha, p95=16s).
+        print(
+            f"AVISO: thresholds de SLO não atingidos para {cell_id} rep{repetition} "
+            "(k6 exit 99) — resultado válido (célula não atende ao SLO sob esta carga), "
+            "não interrompe a bateria."
+        )
+    elif result.returncode != 0:
+        result.check_returncode()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -58,6 +58,18 @@ def storage_for_cell(cell_id: str) -> str:
     return cell_id.split("-", 1)[1]
 
 
+def _print_safe(text: str) -> None:
+    """`print()` puro quebra com `UnicodeEncodeError` no console do Windows
+    (cp1252) quando o texto (stdout/stderr capturado de um comando remoto
+    Linux) tem caracteres fora dessa codificação — confirmado ao vivo: o
+    próprio `print` de diagnóstico de erro de `_run` (abaixo) mascarava a
+    causa raiz real ao travar tentando exibi-la. Reencodar com
+    errors="replace" contra a codificação real do stdout evita isso sem
+    perder a legibilidade do texto original."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(text.encode(encoding, errors="replace").decode(encoding))
+
+
 def _resolve_cmd(cmd: list[str]) -> list[str]:
     """No Windows, `gcloud`/`docker` são wrappers `.cmd`/`.exe` — CreateProcess
     (usado por subprocess.run com shell=False) não os acha pelo nome puro,
@@ -80,7 +92,21 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
         # contra e1-opensearch).
         kwargs.setdefault("encoding", "utf-8")
         kwargs.setdefault("errors", "replace")
-    return subprocess.run(_resolve_cmd(cmd), check=True, **kwargs)
+    try:
+        return subprocess.run(_resolve_cmd(cmd), check=True, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        # Sem isso, um `gcloud compute ssh --command=...` que falha do lado
+        # remoto (ex.: load/run_battery.py quebrando dentro do container)
+        # nunca mostra POR QUE — capture_output=True guarda stdout/stderr no
+        # CompletedProcess, mas o traceback padrão de CalledProcessError só
+        # imprime "returned non-zero exit status", nunca o conteúdo real.
+        # Confirmado ao vivo: uma falha remota real ficou completamente sem
+        # pista nenhuma até este fix.
+        if exc.stdout:
+            _print_safe(f"--- stdout do comando que falhou ---\n{exc.stdout}")
+        if exc.stderr:
+            _print_safe(f"--- stderr do comando que falhou ---\n{exc.stderr}")
+        raise
 
 
 def _confirm_billable(message: str) -> None:

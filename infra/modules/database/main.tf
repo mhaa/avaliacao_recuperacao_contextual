@@ -129,7 +129,11 @@ locals {
     cat > /etc/otel-config.yaml <<'YAMLEOF'
     receivers:
       hostmetrics:
-        collection_interval: 5s
+        # 60s: mínimo que o Cloud Monitoring aceita entre pontos de uma
+        # métrica customizada (workload.googleapis.com/*) — mantido mesmo
+        # depois de achar a causa raiz abaixo, é boa prática documentada
+        # pelo próprio Google independente dela.
+        collection_interval: 60s
         root_path: /hostfs
         scrapers:
           memory:
@@ -137,6 +141,24 @@ locals {
           network:
     processors:
       batch:
+      # SEM ISSO, o exporter googlecloud não sabe que está rodando numa VM
+      # específica do Compute Engine — cai no fallback resource.type=
+      # "generic_node" com labels EM BRANCO (node_id="", namespace="",
+      # location="global"). Como as 3 VMs (banco/serviço/loadgen) caem
+      # todas nesse mesmo recurso "em branco", o Cloud Monitoring recebe
+      # escritas de fontes diferentes como se fossem a MESMA série temporal
+      # — confirmado ao vivo via `docker logs tcc-otel-agent` + SSH: a 5s
+      # de intervalo dava "written more frequently than the maximum
+      # sampling period" (colisão rápida entre VMs), a 60s dava "Points
+      # must be written in order" (uma VM escrevendo um timestamp mais
+      # velho que o que outra VM acabou de escrever pro mesmo recurso
+      # colapsado) — dois sintomas da MESMA causa, não dois bugs
+      # diferentes. `resourcedetection` com o detector `gcp` faz cada
+      # coletor se identificar como o `gce_instance` certo (via metadata
+      # server, alcançável por --network host), eliminando a colisão.
+      resourcedetection:
+        detectors: [gcp]
+        timeout: 10s
     exporters:
       googlecloud:
         project: "${var.project_id}"
@@ -144,7 +166,7 @@ locals {
       pipelines:
         metrics:
           receivers: [hostmetrics]
-          processors: [batch]
+          processors: [resourcedetection, batch]
           exporters: [googlecloud]
     YAMLEOF
     # Mesmo motivo do retry de docker_image[storage] mais abaixo: a primeira
