@@ -1161,3 +1161,38 @@ results/<cell>/<phase>/<timestamp>/
 - **Baixar resultados do bucket** (ex.: de outra máquina, ou depois de um
   `results/` local perdido): `gcloud storage cp --recursive
   gs://<results_bucket>/<cell>/ results/<cell>/`.
+
+**Equivalência de infraestrutura entre células** — justiça de comparação exige
+hardware idêntico entre as 14 células; a diferença de desempenho medida deve vir da
+estratégia/tecnologia sob teste, nunca de uma célula ter ganhado mais máquina.
+
+Hardware idêntico, verificado no código (nenhum `cells/*.yaml` nem
+`infra/envs/experiment` sobrescreve isso — todas usam o default de
+`infra/modules/*`):
+
+| VM | Tipo | vCPU / RAM |
+|---|---|---|
+| banco | `n2-standard-8` | 8 / 32 GB |
+| serviço | `n2-standard-4` | 4 / 16 GB |
+| loadgen | `n2-standard-8` | 8 / 32 GB |
+| disco de dados | `pd-ssd`, 200 GB | — |
+
+A configuração *interna* de cada banco é deliberadamente diferente — mesma fração
+idiomática da máquina, não o mesmo número bruto (que não seria justo entre
+arquiteturas de memória tão diferentes):
+
+| Tecnologia | Alocação | Fração de 32 GB | Motivo |
+|---|---|---|---|
+| ScyllaDB | `--smp 7 --memory 28G` | 87,5% explícito (CPU e RAM) | Seastar (shard-per-core) exige declaração explícita — não existe "usa o que sobrar" |
+| OpenSearch | heap JVM `-Xmx16g` | 50% explícito + resto via cache de página do SO (Lucene off-heap) | Teto recomendado pelo próprio Elasticsearch/OpenSearch (acima disso perde compressed oops) |
+| PostgreSQL | `shared_buffers=8GB` | 25% explícito + resto via cache de página do SO | Orientação padrão de tuning do Postgres |
+| Valkey | `--maxmemory 24gb` | 75% explícito, CPU inerentemente de 1 thread no caminho principal | Característica arquitetural do Valkey/Redis, não sub-provisionamento |
+
+**Lição de implementação** (relevante para limitações/ameaças à validade do TCC): as
+configurações de Scylla e OpenSearch foram inicialmente herdadas, sem mudança, do
+`docker-compose.yml` de desenvolvimento local (`--smp 1 --memory 2G` e heap
+`-Xmx2g`) — adequadas para correção em U=10.000 local, mas sub-provisionando
+severamente a VM de nuvem real. Só descoberto rodando a bateria de medição pela
+primeira vez contra cada tecnologia: o Scylla usava ~13% de CPU (1 de 8 núcleos) e
+levava mais de 1h pra carregar a base completa. Reforça nunca confiar em
+configuração copiada do ambiente de correção local para o de medição de desempenho.
