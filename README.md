@@ -1126,3 +1126,38 @@ primeira célula da triagem (acima) antes de confiar nele aqui.
 O disco da célula sobrevive fora do ciclo de vida da VM —
 `infra/scripts/snapshot_after_load.sh <disk-name> <zone> <project-id>`, se
 quiser um snapshot antes do próximo `destroy`.
+
+**Extraindo e lendo os resultados de uma execução**
+
+Cada execução de `run_measurement_battery.py` grava em
+`results/<cell>/<phase>/<timestamp>/` (local) e sincroniza a mesma estrutura
+para `gs://<results_bucket>/<cell>/<phase>/<timestamp>/` — os dois lados
+ficam idênticos, sem duplicar `<cell>` no caminho.
+
+```
+results/<cell>/<phase>/<timestamp>/
+├── saturation.json          # só na triagem — resultado legível direto
+├── saturation_<tier>.json   # só na confirmação, um por seletividade
+├── resources.csv            # só na confirmação — CPU/memória/rede das 3 VMs
+└── rep<N>/
+    ├── manifest.json        # metadados legíveis: célula, taxa, seletividade, timestamp, commit
+    └── k6-raw.json           # dump bruto do k6 (uma linha JSON por métrica) — não é pra ler direto
+```
+
+- **Leitura rápida de uma célula só**, sem processar nada: abra
+  `saturation.json` (traz `approx_throughput`/`censored`/`loadgen_bottleneck`
+  e a lista de sondagens) e `rep<N>/manifest.json` diretamente — são JSON
+  pequenos, dá pra ler no editor.
+- **`k6-raw.json` nunca deve ser lido à mão** — são milhares de linhas, uma
+  por métrica coletada pelo k6. É *insumo* de `analysis/collect.py`, que o
+  transforma em `latencies.parquet` (uma linha por requisição, com
+  percentis) — chamado automaticamente por `analysis/report.py` abaixo, não
+  precisa rodar `collect.py` na mão.
+- **Resumo estatístico entre células** (o que realmente importa pro TCC —
+  percentis, Kruskal-Wallis/Dunn, fronteira de Pareto): os comandos
+  `analysis/report.py` já documentados acima, um para triagem e outro para
+  confirmação. Rodar de novo depois de mais células é seguro — só reprocessa
+  repetições ainda não coletadas.
+- **Baixar resultados do bucket** (ex.: de outra máquina, ou depois de um
+  `results/` local perdido): `gcloud storage cp --recursive
+  gs://<results_bucket>/<cell>/ results/<cell>/`.
