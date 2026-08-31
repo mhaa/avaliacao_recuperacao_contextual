@@ -200,8 +200,17 @@ def gcloud_ssh(
 
 
 def wait_for_container(
-    instance: str, zone: str, project_id: str, container_name: str, timeout_s: int = 300
+    instance: str, zone: str, project_id: str, container_name: str, timeout_s: int = 600
 ) -> None:
+    # 600s, não 300s: confirmado ao vivo com e1-scylla — este check só
+    # confirma que o CONTAINER está "running", não que o banco por trás dele
+    # já aceita conexões de verdade. Scylla (motor JVM/nativo) demora mais
+    # que Postgres/Valkey pra terminar seu próprio bootstrap interno; nesse
+    # meio tempo o container `tcc-service` (que conecta assim que sobe, sem
+    # esperar o banco) cai com `NoHostAvailable` e reinicia via `--restart
+    # unless-stopped` até o Scylla ficar pronto — o serviço realmente ficou
+    # saudável, só que depois da janela de 300s ter esgotado por azar de
+    # timing entre o ciclo de crash-reinício e o polling deste check.
     print(f"Aguardando container '{container_name}' em {instance}...")
     deadline = time.monotonic() + timeout_s
     check_cmd = f"docker ps --filter name={container_name} --filter status=running -q"
