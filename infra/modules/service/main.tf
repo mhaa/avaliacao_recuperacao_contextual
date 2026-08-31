@@ -188,7 +188,9 @@ resource "google_compute_instance" "service" {
       # reproduzindo 2x seguidas contra o Docker Hub (mesmo mecanismo,
       # ainda que aqui seja Artifact Registry). Retry evita destruir e
       # tentar de novo manualmente por causa disso.
-      for i in 1 2 3 4 5; do docker pull ${var.service_image} && break || sleep 10; done
+      # 10x15s, mesmo motivo do módulo loadgen — pull autenticado no
+      # Artifact Registry sofre do mesmo risco de propagação de IAM lenta.
+      for i in 1 2 3 4 5 6 7 8 9 10; do docker pull ${var.service_image} && break || sleep 15; done
       docker run -d --name tcc-service --restart unless-stopped \
         -e CELL=${var.cell} \
         -e STORAGE_HOST=${var.database_internal_ip} \

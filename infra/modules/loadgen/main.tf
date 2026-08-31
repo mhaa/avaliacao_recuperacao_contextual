@@ -179,7 +179,13 @@ resource "google_compute_instance" "loadgen" {
       # do Cloud NAT/rede estabilizar (~20-30s de boot) — confirmado
       # reproduzindo 2x seguidas contra o Docker Hub. Retry evita destruir
       # e tentar de novo manualmente por causa disso.
-      for i in 1 2 3 4 5; do docker pull ${var.tools_image} && break || sleep 10; done
+      # 10x15s (150s), não 5x10s (50s): confirmado ao vivo, 3 falhas
+      # consecutivas com "artifactregistry.repositories.downloadArtifacts"
+      # negado numa região nunca usada antes pelo projeto (us-east4) — a
+      # concessão de roles/artifactregistry.reader pra uma service account
+      # recém-criada (recriada do zero a cada tentativa, já que o nome é
+      # fixo por storage) às vezes leva mais que 50s pra propagar.
+      for i in 1 2 3 4 5 6 7 8 9 10; do docker pull ${var.tools_image} && break || sleep 15; done
     EOT
   }
 
