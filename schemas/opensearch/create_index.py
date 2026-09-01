@@ -15,6 +15,20 @@ HOSTS = [os.environ.get("TEST_OPENSEARCH_HOST", "http://opensearch:9200")]
 INDEX = "candidates"
 
 _MAPPING = {
+    # number_of_shards é imutável após a criação (só muda via reindex) —
+    # por isso decidido aqui, não como um ajuste de runtime do loader. 4
+    # shards para a VM de nuvem (n2-standard-8, 8 vCPUs): 1 shard só
+    # concentraria toda escrita/busca num único índice Lucene, deixando a
+    # maior parte dos vCPUs ociosa durante a carga (mesmo efeito prático
+    # de um `concurrency=1` no lado do servidor). number_of_replicas=0:
+    # cluster de nó único (discovery.type=single-node, local e nuvem) nunca
+    # aloca a réplica mesmo com o default de 1 — deixa explícito e evita o
+    # health "yellow" permanente sem custo real (dado descartável, recarga
+    # é o próprio load_full_dataset.py).
+    "settings": {
+        "number_of_shards": 4,
+        "number_of_replicas": 0,
+    },
     "mappings": {
         "properties": {
             "user_id": {"type": "integer"},
@@ -22,7 +36,7 @@ _MAPPING = {
             "score": {"type": "float"},
             "context_ids": {"type": "integer"},
         }
-    }
+    },
 }
 
 

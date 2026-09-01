@@ -150,7 +150,14 @@ locals {
     # (não são o gargalo de performance, e mexer neles arrisca o Scylla
     # recusar iniciar no COS sem o tuning completo de I/O de produção).
     scylla     = "--smp 7 --memory 28G --overprovisioned 1 --developer-mode 1 --skip-wait-for-gossip-to-settle 0"
-    opensearch = ""
+    # indices.memory.index_buffer_size é setting estático (só via config no
+    # boot, não muda em runtime pela API) — default é 10% do heap (1.6GB
+    # com os 16GB configurados acima). 25% (4GB) reduz a frequência de
+    # flush de segmento durante a carga de ~100M documentos (schemas/
+    # opensearch/load_full_dataset.py); `-E` é o mecanismo suportado pela
+    # própria imagem oficial do OpenSearch para passar overrides de
+    # settings estáticos via CMD, sem editar opensearch.yml.
+    opensearch = "-Eindices.memory.index_buffer_size=25%"
   }
 }
 

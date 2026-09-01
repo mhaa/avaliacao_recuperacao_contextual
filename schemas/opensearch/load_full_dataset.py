@@ -13,21 +13,40 @@ from __future__ import annotations
 import os
 
 from opensearchpy import OpenSearch
-from opensearchpy.helpers import bulk
+from opensearchpy.helpers import parallel_bulk
 
 from harness import fixtures
 
 HOSTS = [os.environ.get("TEST_OPENSEARCH_HOST", "http://opensearch:9200")]
 INDEX = "candidates"
 
+# Lotes em paralelo via parallel_bulk (thread pool no cliente), não bulk()
+# sequencial — bulk() espera a resposta de um lote antes de mandar o
+# próximo, deixando o threadpool `write` do OpenSearch (dimensionado para
+# os 8 vCPUs da VM de nuvem, n2-standard-8) majoritariamente ocioso.
+# Default 8 casa com esse threadpool; ajustável sem alterar código, mesmo
+# padrão do TEST_SCYLLA_LOAD_CONCURRENCY.
+_THREAD_COUNT = int(os.environ.get("TEST_OPENSEARCH_LOAD_THREADS", "8"))
+_CHUNK_SIZE = 2000
+
 
 def main() -> None:
     fixtures.ensure_full_dataset_downloaded()
 
-    client = OpenSearch(hosts=HOSTS, use_ssl=False, verify_certs=False)
+    # timeout maior que o default de 10s: lotes concorrentes (parallel_bulk)
+    # competem pelo mesmo threadpool `write` do servidor, então um lote
+    # individual pode legitimamente demorar mais sob carga real do que em
+    # execução sequencial sem que isso indique um problema.
+    client = OpenSearch(hosts=HOSTS, use_ssl=False, verify_certs=False, timeout=60)
     client.delete_by_query(
         index=INDEX, body={"query": {"match_all": {}}}, conflicts="proceed", refresh=True
     )
+
+    # Desliga refresh automático (default 1s) durante a carga — cada
+    # refresh cria um segmento Lucene novo pesquisável, custo real
+    # multiplicado por hora de carga em ~100M documentos. Reativado no
+    # default depois, com um refresh explícito (já existia antes).
+    client.indices.put_settings(index=INDEX, body={"index": {"refresh_interval": "-1"}})
 
     candidates = fixtures.load_candidates()
     item_contexts = fixtures.load_item_contexts()
@@ -37,8 +56,8 @@ def main() -> None:
         context_ids_by_item.setdefault(row["item_id"], []).append(row["context_id"])
 
     def _actions():
-        # Print periódico por documento enviado — sem isso, bulk() consome
-        # o gerador inteiro em silêncio até acabar (mesmo raciocínio de
+        # Print periódico por documento enviado — sem isso, parallel_bulk()
+        # consome o gerador inteiro em silêncio até acabar (mesmo raciocínio de
         # schemas/scylla/load_full_dataset.py: só o print no fim de main()
         # não dá nenhum sinal de vida durante uma carga real de dezenas de
         # milhões de documentos). Contagem de envio, não de indexação
@@ -59,7 +78,14 @@ def main() -> None:
                 print(f"candidates: {sent} documentos enviados para indexação", flush=True)
         print(f"candidates: {sent} documentos enviados para indexação (final)", flush=True)
 
-    success, _errors = bulk(client, _actions(), chunk_size=2000)
+    success = 0
+    for ok, _info in parallel_bulk(
+        client, _actions(), chunk_size=_CHUNK_SIZE, thread_count=_THREAD_COUNT
+    ):
+        if ok:
+            success += 1
+
+    client.indices.put_settings(index=INDEX, body={"index": {"refresh_interval": "1s"}})
     client.indices.refresh(index=INDEX)
 
     print(f"Carregado: {success} documentos indexados (base completa)")
