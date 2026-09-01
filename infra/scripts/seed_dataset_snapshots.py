@@ -225,6 +225,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"terraform destroy do root de seed (storage={args.storage}) — é isso que PARA "
                 "a cobrança. O snapshot já criado sobrevive independente disso."
             )
+            # Re-minta o token (~1h de validade) antes do destroy final: a
+            # carga completa do dataset (setup_cmd acima) pode facilmente
+            # levar mais que isso — confirmado ao vivo, o destroy falhou com
+            # HTTP 401 ("Authentication required") no backend GCS do
+            # Terraform depois de ~3h30 de carga, deixando as VMs de
+            # seed-scylla no ar e cobrando até serem destruídas manualmente.
+            # Mesmo fix já aplicado em run_measurement_battery.py.
+            os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = fetch_terraform_access_token(args.project_id)
             terraform(
                 [
                     "destroy",

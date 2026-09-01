@@ -196,7 +196,20 @@ def gcloud_ssh(
         "--tunnel-through-iap",
         f"--command={remote_command}",
     ]
-    return _run(cmd, capture_output=True, text=True)
+    # input="y\n": no Windows, `gcloud compute ssh` usa plink.exe, que pede
+    # confirmação interativa ("Store key in cache?") na PRIMEIRA conexão a
+    # cada VM nova (cada célula/seed cria VMs com nome novo, então isso
+    # acontece toda vez). Sem stdin real anexado (rodando via subprocess a
+    # partir de um script Python em background), esse prompt nunca é
+    # respondido e o plink derruba a conexão sozinho após ficar pendurado —
+    # confirmado ao vivo: a sessão ficou ~3h30 "rodando" em silêncio antes
+    # de morrer com "Remote side unexpectedly closed network connection",
+    # bem no meio da carga completa do dataset no Scylla em us-east4.
+    # "y\n" aceita a host key automaticamente (equivalente a
+    # StrictHostKeyChecking=accept-new do OpenSSH); é inofensivo em
+    # conexões subsequentes, onde a chave já está em cache e o prompt não
+    # aparece — a entrada extra não é lida por ninguém.
+    return _run(cmd, capture_output=True, text=True, input="y\n")
 
 
 def wait_for_container(
