@@ -160,6 +160,16 @@ resource "google_compute_instance" "loadgen" {
   boot_disk {
     initialize_params {
       image = "cos-cloud/cos-stable"
+      # Sem `size`, cai no mínimo padrão da imagem COS (bem pequeno) — os 5
+      # k6-raw.json da bateria principal já somam ~1GB (~220MB cada); a
+      # busca de saturação (doubling até o teto de 50.000 req/s) grava um
+      # k6-raw.json POR sondagem, sem limpar os intermediários, e uma
+      # busca longa soma vários GB fácil. Sem espaço sobrando, k6 escreve
+      # NDJSON truncado, que quebra o parse do veredito de SLO —
+      # confirmado ao vivo em e2-opensearch ("no space left on device" +
+      # JSONDecodeError logo em seguida). 100GB é folga generosa e barata
+      # (pd-standard, cobrado só pelas horas reais da VM).
+      size = 100
     }
   }
 
