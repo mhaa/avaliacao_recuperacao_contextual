@@ -53,6 +53,7 @@ import json
 import os
 import random
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -953,6 +954,16 @@ def main(argv: list[str] | None = None) -> int:
             # dentro do destino — passar o mesmo nome final duas vezes
             # duplicava o caminho (mesmo bug de upload_results_to_bucket,
             # confirmado no resultado real).
+            # rmtree ANTES do sync: sem isso, dado de uma execução anterior
+            # (outro dia, às vezes outra região) fica acumulado aqui e é
+            # reenviado ao bucket junto com o novo, ressuscitando dado que
+            # já tinha sido apagado de propósito — confirmado ao vivo em
+            # e1-postgres (timestamps de 31/08 em us-central1 reapareceram
+            # no bucket depois de rodar de novo em us-east4, 01/09). A VM
+            # remota é sempre nova por célula, então o lado remoto nunca
+            # tem esse problema — só o diretório local sobrevive entre
+            # execuções.
+            shutil.rmtree(local_saturation_dir, ignore_errors=True)
             sync_results_from_loadgen(
                 loadgen_instance,
                 args.zone,
@@ -964,6 +975,10 @@ def main(argv: list[str] | None = None) -> int:
 
         local_results_dir = Path("results") / args.cell
         # local_dir = PAI, mesmo motivo do sync de _saturation acima.
+        # rmtree ANTES do sync — mesmo motivo do rmtree de
+        # local_saturation_dir acima (raiz do bug real que ressuscitou o
+        # e1-postgres de us-central1 no bucket).
+        shutil.rmtree(local_results_dir, ignore_errors=True)
         sync_results_from_loadgen(
             loadgen_instance,
             args.zone,
