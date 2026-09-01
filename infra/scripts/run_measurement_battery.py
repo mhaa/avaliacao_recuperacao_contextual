@@ -843,6 +843,18 @@ def main(argv: list[str] | None = None) -> int:
         target_url = f"http://{service_ip}:8000/v1/recommendations"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
+        # Limpa os diretórios locais AGORA, antes de qualquer coisa desta
+        # execução escrever neles — não logo antes do sync no final (era o
+        # bug real: a rampa de saturação já tinha escrito saturation.json
+        # aqui embaixo, ANTES do sync, e um rmtree feito só ali apagava o
+        # próprio arquivo que esta mesma execução tinha acabado de gerar,
+        # confirmado ao vivo em e1-scylla). Sem isso, dado de uma execução
+        # anterior (outro dia, às vezes outra região) ficava acumulado e
+        # era reenviado ao bucket junto com o novo — a VM remota é sempre
+        # nova por célula, então só o lado local sobrevive entre execuções.
+        shutil.rmtree(Path("results") / args.cell, ignore_errors=True)
+        shutil.rmtree(Path("results") / "_saturation" / args.cell, ignore_errors=True)
+
         # Amostragem periódica de recursos (CONTEXTO.md: "amostrar a cada 5
         # segundos nas três VMs") — só durante a confirmação; a rampa curta
         # da triagem é exploratória e nunca é arquivada, o mesmo vale para o
@@ -953,17 +965,11 @@ def main(argv: list[str] | None = None) -> int:
             # compute scp --recurse origem destino` recria a pasta de origem
             # dentro do destino — passar o mesmo nome final duas vezes
             # duplicava o caminho (mesmo bug de upload_results_to_bucket,
-            # confirmado no resultado real).
-            # rmtree ANTES do sync: sem isso, dado de uma execução anterior
-            # (outro dia, às vezes outra região) fica acumulado aqui e é
-            # reenviado ao bucket junto com o novo, ressuscitando dado que
-            # já tinha sido apagado de propósito — confirmado ao vivo em
-            # e1-postgres (timestamps de 31/08 em us-central1 reapareceram
-            # no bucket depois de rodar de novo em us-east4, 01/09). A VM
-            # remota é sempre nova por célula, então o lado remoto nunca
-            # tem esse problema — só o diretório local sobrevive entre
-            # execuções.
-            shutil.rmtree(local_saturation_dir, ignore_errors=True)
+            # confirmado no resultado real). Limpeza do diretório local já
+            # aconteceu mais acima, uma única vez, antes de qualquer coisa
+            # desta execução escrever nele (ver comentário perto de
+            # `timestamp = ...`) — não aqui, para não apagar o que a rampa
+            # de saturação acabou de escrever nesta mesma execução.
             sync_results_from_loadgen(
                 loadgen_instance,
                 args.zone,
@@ -975,10 +981,9 @@ def main(argv: list[str] | None = None) -> int:
 
         local_results_dir = Path("results") / args.cell
         # local_dir = PAI, mesmo motivo do sync de _saturation acima.
-        # rmtree ANTES do sync — mesmo motivo do rmtree de
-        # local_saturation_dir acima (raiz do bug real que ressuscitou o
-        # e1-postgres de us-central1 no bucket).
-        shutil.rmtree(local_results_dir, ignore_errors=True)
+        # Limpeza já aconteceu mais acima (ver comentário perto de
+        # `timestamp = ...`), antes da rampa de saturação escrever
+        # saturation.json aqui dentro — não repetir aqui.
         sync_results_from_loadgen(
             loadgen_instance,
             args.zone,
