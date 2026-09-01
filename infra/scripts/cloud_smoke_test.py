@@ -212,6 +212,29 @@ def gcloud_ssh(
     return _run(cmd, capture_output=True, text=True, input="y\n")
 
 
+def tail_remote_file(
+    instance: str, zone: str, project_id: str, path: str, lines: int = 40
+) -> str:
+    """Poll leve e não-bloqueante do progresso de um comando remoto ainda
+    em andamento (ex.: build_remote_setup_command com carga completa, que
+    grava em `path` via `tee` — ver run_measurement_battery.py). Abre uma
+    sessão SSH SEPARADA da principal — múltiplas sessões concorrentes pela
+    mesma VM via IAP funcionam normalmente — só para ler as últimas linhas
+    do log, sem esperar o comando principal (que pode levar horas)
+    terminar. Existe porque gcloud_ssh()/capture_output=True só devolve
+    stdout quando o processo SSH inteiro sai, então sem isso não há como
+    diferenciar "ainda trabalhando" de "travado" enquanto o comando
+    principal está bloqueado — exatamente o problema que derrubou ~3h30 de
+    carga do e1-scylla em us-east4 sem nenhum sinal de vida."""
+    result = gcloud_ssh(
+        instance,
+        zone,
+        project_id,
+        f"tail -n {lines} {path} 2>/dev/null || echo '(log ainda não existe)'",
+    )
+    return result.stdout
+
+
 def wait_for_container(
     instance: str, zone: str, project_id: str, container_name: str, timeout_s: int = 600
 ) -> None:

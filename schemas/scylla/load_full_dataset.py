@@ -36,7 +36,9 @@ def _chunked(rows: list, size: int):
         yield rows[i : i + size]
 
 
-def _execute_concurrent_batched(session, statement, rows_iter, concurrency: int) -> None:
+def _execute_concurrent_batched(
+    session, statement, rows_iter, concurrency: int, label: str = ""
+) -> None:
     """`execute_concurrent_with_args()` do driver Cassandra/Scylla NÃO faz
     streaming de verdade, apesar de aceitar um iterador como `parameters` —
     a implementação do driver materializa TODOS os parâmetros numa lista
@@ -50,15 +52,28 @@ def _execute_concurrent_batched(session, statement, rows_iter, concurrency: int)
     problema de acumular tudo antes de executar). Chamar
     execute_concurrent_with_args repetidamente em fatias pequenas do
     próprio iterador mantém a memória limitada, independente do tamanho
-    total do dataset."""
+    total do dataset.
+
+    `label`, quando dado, imprime uma linha de progresso a cada fatia —
+    sem isso, a carga inteira (~horas em escala real) roda muda até o
+    único print no fim de main(). Confirmado ao vivo: sem heartbeat
+    nenhum, uma sessão SSH que trava no meio fica indistinguível de uma
+    que só está demorando, e ninguém percebe até horas depois."""
     batch: list = []
+    total = 0
     for row in rows_iter:
         batch.append(row)
         if len(batch) >= _CONCURRENT_ARGS_BATCH_SIZE:
             execute_concurrent_with_args(session, statement, batch, concurrency=concurrency)
+            total += len(batch)
+            if label:
+                print(f"{label}: {total} linhas gravadas", flush=True)
             batch = []
     if batch:
         execute_concurrent_with_args(session, statement, batch, concurrency=concurrency)
+        total += len(batch)
+        if label:
+            print(f"{label}: {total} linhas gravadas (final)", flush=True)
 
 
 def main() -> None:
@@ -83,13 +98,18 @@ def main() -> None:
         insert_candidates,
         candidates.select(["user_id", "rank", "item_id", "score"]).iter_rows(),
         concurrency=20,
+        label="candidates",
     )
 
     insert_item_contexts = session.prepare(
         "INSERT INTO item_contexts (item_id, context_id) VALUES (?, ?)"
     )
     _execute_concurrent_batched(
-        session, insert_item_contexts, item_contexts.iter_rows(), concurrency=100
+        session,
+        insert_item_contexts,
+        item_contexts.iter_rows(),
+        concurrency=100,
+        label="item_contexts",
     )
 
     by_context = candidates.select(["user_id", "item_id", "rank", "score"]).join(
@@ -109,6 +129,7 @@ def main() -> None:
     # verdade, mas é a mesma causa.
     _BATCHES_FLUSH_SIZE = 2000
     batches: list = []
+    context_rows_done = 0
     for (context_id, user_id), group in by_context.group_by(["context_id", "user_id"]):
         rows = group.select(["rank", "item_id", "score"]).rows()
         for chunk in _chunked(rows, _BATCH_CHUNK_SIZE):
@@ -116,11 +137,18 @@ def main() -> None:
             for rank, item_id, score in chunk:
                 batch.add(insert_by_context, (context_id, user_id, rank, item_id, score))
             batches.append((batch, None))
+            context_rows_done += len(chunk)
             if len(batches) >= _BATCHES_FLUSH_SIZE:
                 execute_concurrent(session, batches, concurrency=10)
+                # Heartbeat: candidates_by_context é o maior dos 4 (join
+                # com item_contexts) e, sem isso, é a fase mais longa sem
+                # nenhuma linha impressa — mesmo motivo do `label` em
+                # _execute_concurrent_batched acima.
+                print(f"candidates_by_context: ~{context_rows_done} linhas gravadas", flush=True)
                 batches = []
     if batches:
         execute_concurrent(session, batches, concurrency=10)
+        print(f"candidates_by_context: ~{context_rows_done} linhas gravadas (final)", flush=True)
 
     insert_prematerialized = session.prepare(
         "INSERT INTO prematerialized (user_id, context_id, rank, item_id, score) "
@@ -133,6 +161,7 @@ def main() -> None:
             ["user_id", "context_id", "rank", "item_id", "score"]
         ).iter_rows(),
         concurrency=20,
+        label="prematerialized",
     )
 
     cluster.shutdown()

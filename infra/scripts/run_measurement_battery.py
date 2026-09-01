@@ -166,12 +166,28 @@ def build_remote_setup_command(
     usado quando o disco já veio carregado de um snapshot
     (infra/scripts/seed_dataset_snapshots.py, main() em run_measurement_battery.py)
     e recarregar do zero desperdiçaria horas à toa. `export_contexts_by_tier.py`
-    nunca depende do banco, então sempre roda."""
+    nunca depende do banco, então sempre roda.
+
+    Quando a carga completa roda (`skip_dataset_load=False`), o comando
+    inteiro é envolvido com `tee` para um log dentro de `fixtures_mount`
+    (sobrevive ao --rm do container, fica no disco da VM loadgen) — sem
+    isso, uma carga real (~horas em escala grande) fica muda até a sessão
+    SSH inteira terminar: gcloud_ssh() usa capture_output=True, que só
+    entrega stdout quando o processo remoto sai, então "ainda carregando"
+    e "travou há 3 horas" ficam indistinguíveis vistos de fora — confirmado
+    ao vivo com e1-scylla em us-east4. Uma segunda sessão SSH leve
+    (cloud_smoke_test.tail_remote_file), concorrente com esta, consegue ler
+    esse log a qualquer momento sem esperar o comando principal terminar.
+    PYTHONUNBUFFERED=1 é o outro lado disso: sem ele, o próprio Python
+    remoto bufferiza stdout inteiro (não está preso a um terminal), e nem
+    o tee veria as linhas de progresso até o processo sair."""
     env_flags = build_storage_env_flags(cell_id, storage, database_ip, service_ip, postgres_password)
-    env_flags = [*env_flags, f"DATASET_BUCKET={dataset_bucket}"]
+    env_flags = [*env_flags, f"DATASET_BUCKET={dataset_bucket}", "PYTHONUNBUFFERED=1"]
     steps = [] if skip_dataset_load else build_schema_and_fixture_steps(storage, mode="full")
     steps.append("python load/export_contexts_by_tier.py")
     inner = " && ".join(steps)
+    if not skip_dataset_load:
+        inner = f"set -o pipefail; ({inner}) 2>&1 | tee /app/load/fixtures/setup.log"
 
     docker_argv = [
         "docker",
