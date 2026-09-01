@@ -32,6 +32,7 @@ permanente pedida pelo usuário).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shlex
@@ -186,6 +187,21 @@ def terraform_output_json(tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR) -> dict:
 def gcloud_ssh(
     instance: str, zone: str, project_id: str, remote_command: str
 ) -> subprocess.CompletedProcess:
+    # base64 + "bash -c 'echo ... | base64 -d | bash'": blinda o valor de
+    # --command= contra o cmd.exe do Windows, que a invocação de
+    # gcloud.CMD (um wrapper .bat) força no meio do caminho (Python ->
+    # cmd.exe -> plink.exe -> sshd remoto). cmd.exe trata &, &&, ;, {, }
+    # como separadores de comando mesmo dentro do que o Python considera
+    # "um único argumento" — aspas simples do bash não protegem nada
+    # disso, só aspas duplas (e só parcialmente). Confirmado ao vivo: um
+    # remote_command com esses caracteres soltos fora de um único bloco
+    # `-c '...'` chegava fragmentado — parte interpretada localmente pelo
+    # cmd.exe ("'{' não é reconhecido..."), parte corrompida no bash
+    # remoto ("sleep: invalid time interval"). base64 não tem nenhum
+    # caractere especial de shell, então nada sobra pro cmd.exe mangle
+    # antes de chegar no bash remoto, que decodifica e executa de volta.
+    encoded = base64.b64encode(remote_command.encode()).decode()
+    wrapped_command = shlex.join(["bash", "-c", f"echo {encoded} | base64 -d | bash"])
     cmd = [
         "gcloud",
         "compute",
@@ -194,7 +210,7 @@ def gcloud_ssh(
         f"--zone={zone}",
         f"--project={project_id}",
         "--tunnel-through-iap",
-        f"--command={remote_command}",
+        f"--command={wrapped_command}",
     ]
     # input="y\n": no Windows, `gcloud compute ssh` usa plink.exe, que pede
     # confirmação interativa ("Store key in cache?") na PRIMEIRA conexão a
