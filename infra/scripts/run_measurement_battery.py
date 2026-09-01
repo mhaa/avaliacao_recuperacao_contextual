@@ -203,7 +203,48 @@ def build_remote_setup_command(
     for flag in env_flags:
         docker_argv += ["-e", flag]
     docker_argv += [tools_image, "-c", inner]
-    return shlex.join(docker_argv)
+    return f"{_remote_pull_with_login(tools_image)} && {shlex.join(docker_argv)}"
+
+
+def _remote_pull_with_login(image: str, retries: int = 20, sleep_s: int = 20) -> str:
+    """Login + pull explícito, com retry generoso, imediatamente antes do
+    `docker run` real — não confia no pre-pull feito pelo startup-script da
+    VM no boot (infra/modules/loadgen/main.tf). Esse pre-pull roda em
+    paralelo com a propagação da concessão roles/artifactregistry.reader
+    recém-criada (o depends_on do Terraform garante que a concessão foi
+    CRIADA antes da VM, não que já tenha PROPAGADO no backend de IAM do
+    Google), e falha em silêncio: o loop `... || sleep N; done` do boot
+    nunca verifica se alguma tentativa deu certo. Confirmado ao vivo em
+    us-east4, duas vezes seguidas mesmo já com o fix de depends_on: o pull
+    de boot nunca completou, e só descobrimos minutos depois, aqui, com
+    "Unable to find image ... locally" seguido do mesmo erro de auth —
+    exatamente o tipo de falha tardia e confusa que este login+pull
+    dedicado, rodado no momento exato em que a imagem é necessária (não no
+    boot, sem relação com o resto do que a VM está fazendo), evita."""
+    registry_host = image.split("/", 1)[0]
+    token_cmd = (
+        "curl -sf -H 'Metadata-Flavor: Google' "
+        "'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' "
+        "| sed -n 's/.*\"access_token\": *\"\\([^\"]*\\)\".*/\\1/p'"
+    )
+    login_cmd = (
+        f"export DOCKER_CONFIG=/tmp/.docker-setup && "
+        f"{token_cmd} | docker login -u oauth2accesstoken --password-stdin https://{registry_host}"
+    )
+    # for ((...)) em vez de `seq`: não é garantido que `seq` exista na
+    # imagem mínima do Container-Optimized OS, e o loop bash builtin não
+    # depende de nenhum binário externo. `ok=1`/checagem no final: sem
+    # isso, o loop "sempre dá certo" como statement bash (a última
+    # iteração roda `sleep` ou `break`, ambos saem 0) mesmo se NENHUM pull
+    # funcionar — exatamente o bug do loop equivalente no startup-script
+    # (infra/modules/loadgen/main.tf), que deixa a falha real silenciosa
+    # até aparecer, confusa, no `docker run` mais adiante.
+    pull_loop = (
+        f"ok=0; for ((i=0; i<{retries}; i++)); do "
+        f"docker pull {image} && ok=1 && break || sleep {sleep_s}; done; "
+        f'[ "$ok" = 1 ] || {{ echo "ERRO: falha ao puxar {image} apos {retries} tentativas" >&2; exit 1; }}'
+    )
+    return f"{login_cmd} && {pull_loop}"
 
 
 def build_remote_battery_command(
