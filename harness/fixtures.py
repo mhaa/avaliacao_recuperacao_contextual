@@ -36,29 +36,45 @@ def ensure_full_dataset_downloaded() -> None:
     `--network host`, então o cliente enxerga o metadata server da VM e
     minta um token da conta de serviço automaticamente, sem repetir o
     padrão curl+token já usado nos startup scripts do Terraform."""
+    # Prints de início/fim (não progresso byte-a-byte: download_to_filename
+    # não expõe isso) — sem eles, esta função e as de parse abaixo formam
+    # um trecho inteiro do pipeline sem nenhum sinal de vida, mesmo com o
+    # heartbeat já existente em schemas/<db>/load_full_dataset.py — a carga
+    # completa passa minutos aqui, em silêncio, antes da primeira escrita
+    # no banco. Confirmado ao vivo: ~1h de CPU alta na VM loadgen sem
+    # nenhuma linha em setup.log, e sem isso não dava pra saber se era essa
+    # fase (normal) ou algo travado.
     bucket_name = os.environ["DATASET_BUCKET"]
     client = storage.Client()
     bucket = client.bucket(bucket_name)
 
     prematerialized_path = f"{DATA_DIR}/prematerialized.parquet"
     if not os.path.exists(prematerialized_path):
+        print("Baixando prematerialized.parquet do bucket...", flush=True)
         bucket.blob("dataset/prematerialized.parquet").download_to_filename(
             prematerialized_path
         )
+        print("prematerialized.parquet baixado.", flush=True)
 
     candidates_dir = f"{DATA_DIR}/candidates.parquet"
     os.makedirs(candidates_dir, exist_ok=True)
     if not os.listdir(candidates_dir):
-        for blob in bucket.list_blobs(prefix="dataset/candidates.parquet/"):
+        blobs = list(bucket.list_blobs(prefix="dataset/candidates.parquet/"))
+        print(f"Baixando candidates.parquet ({len(blobs)} arquivo(s))...", flush=True)
+        for i, blob in enumerate(blobs, start=1):
             filename = blob.name.rsplit("/", 1)[-1]
             blob.download_to_filename(f"{candidates_dir}/{filename}")
+            print(f"candidates.parquet: {i}/{len(blobs)} arquivo(s) baixado(s)", flush=True)
 
 
 def load_candidates(user_ids: list[int] | None = None) -> pl.DataFrame:
+    print("Lendo candidates.parquet...", flush=True)
     lf = pl.scan_parquet(f"{DATA_DIR}/candidates.parquet/*.parquet")
     if user_ids is not None:
         lf = lf.filter(pl.col("user_id").is_in(user_ids))
-    return lf.collect()
+    df = lf.collect()
+    print(f"candidates.parquet lido: {df.height} linhas", flush=True)
+    return df
 
 
 def load_prematerialized(user_ids: list[int] | None = None) -> pl.DataFrame:
@@ -66,11 +82,12 @@ def load_prematerialized(user_ids: list[int] | None = None) -> pl.DataFrame:
     por par usuário-contexto, já ordenadas por rank — ver
     data_generation/README.md); explode em uma linha por item, com rank =
     posição na lista."""
+    print("Lendo prematerialized.parquet...", flush=True)
     df = pl.read_parquet(f"{DATA_DIR}/prematerialized.parquet")
     if user_ids is not None:
         df = df.filter(pl.col("user_id").is_in(user_ids))
     df = df.with_columns(pl.int_ranges(1, pl.col("item_ids").list.len() + 1).alias("ranks"))
-    return (
+    result = (
         df.explode(["item_ids", "scores", "ranks"])
         .filter(pl.col("item_ids").is_not_null())
         .select(
@@ -81,6 +98,8 @@ def load_prematerialized(user_ids: list[int] | None = None) -> pl.DataFrame:
             pl.col("scores").alias("score"),
         )
     )
+    print(f"prematerialized.parquet lido: {result.height} linhas", flush=True)
+    return result
 
 
 def load_item_contexts() -> pl.DataFrame:
@@ -91,6 +110,7 @@ def load_item_contexts() -> pl.DataFrame:
     mesma regra AND de generator/contexts.py, recalculada aqui (nunca lida
     de inverted_lists.parquet/prematerialized.parquet, que são os próprios
     artefatos de E-3/E-4 a serem testados contra este oráculo)."""
+    print("Calculando pertença item-contexto...", flush=True)
     items = pl.read_parquet(f"{DATA_DIR}/items.parquet").select(["item_id", "genres"])
     contexts = pl.read_parquet(f"{DATA_DIR}/contexts.parquet").select(["context_id", "genre_ids"])
 
@@ -98,7 +118,7 @@ def load_item_contexts() -> pl.DataFrame:
     contexts_exploded = contexts.explode("genre_ids").rename({"genre_ids": "genre_id"})
     context_sizes = contexts.with_columns(pl.col("genre_ids").list.len().alias("n_genres"))
 
-    return (
+    result = (
         items_exploded.join(contexts_exploded, on="genre_id", how="inner")
         .group_by(["item_id", "context_id"])
         .agg(pl.len().alias("matched_genres"))
@@ -106,6 +126,8 @@ def load_item_contexts() -> pl.DataFrame:
         .filter(pl.col("matched_genres") == pl.col("n_genres"))
         .select(["item_id", "context_id"])
     )
+    print(f"pertença item-contexto calculada: {result.height} linhas", flush=True)
+    return result
 
 
 def load_inverted_lists() -> pl.DataFrame:
