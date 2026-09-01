@@ -19,6 +19,22 @@ from harness import fixtures
 CONNINFO = os.environ.get("TEST_POSTGRES_DSN", "postgresql://tcc:tcc@postgres:5432/recsys")
 
 
+def _copy_rows(copy, rows_iter, label: str, interval: int) -> None:
+    """Envolve `copy.write_row()` com print periódico de progresso — sem
+    isso, COPY transmite em silêncio total até acabar. Numa carga real
+    (dezenas de milhões de linhas) isso é indistinguível de travado visto
+    de fora; mesmo raciocínio do `label` em
+    schemas/scylla/load_full_dataset.py._execute_concurrent_batched."""
+    count = 0
+    for row in rows_iter:
+        copy.write_row(row)
+        count += 1
+        if count % interval == 0:
+            print(f"{label}: {count} linhas gravadas", flush=True)
+    if count:
+        print(f"{label}: {count} linhas gravadas (final)", flush=True)
+
+
 def main() -> None:
     fixtures.ensure_full_dataset_downloaded()
 
@@ -30,18 +46,27 @@ def main() -> None:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE candidates, item_contexts, prematerialized")
             with cur.copy("COPY candidates (user_id, item_id, rank, score) FROM STDIN") as copy:
-                for row in candidates.select(["user_id", "item_id", "rank", "score"]).iter_rows():
-                    copy.write_row(row)
+                _copy_rows(
+                    copy,
+                    candidates.select(["user_id", "item_id", "rank", "score"]).iter_rows(),
+                    label="candidates",
+                    interval=2_000_000,
+                )
             with cur.copy("COPY item_contexts (item_id, context_id) FROM STDIN") as copy:
-                for row in item_contexts.iter_rows():
-                    copy.write_row(row)
+                _copy_rows(
+                    copy, item_contexts.iter_rows(), label="item_contexts", interval=500_000
+                )
             with cur.copy(
                 "COPY prematerialized (user_id, context_id, item_id, rank, score) FROM STDIN"
             ) as copy:
-                for row in prematerialized.select(
-                    ["user_id", "context_id", "item_id", "rank", "score"]
-                ).iter_rows():
-                    copy.write_row(row)
+                _copy_rows(
+                    copy,
+                    prematerialized.select(
+                        ["user_id", "context_id", "item_id", "rank", "score"]
+                    ).iter_rows(),
+                    label="prematerialized",
+                    interval=500_000,
+                )
 
     print(
         f"Carregado: {len(candidates)} candidatos, {len(item_contexts)} pertences "

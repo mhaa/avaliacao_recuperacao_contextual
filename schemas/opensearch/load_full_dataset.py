@@ -37,6 +37,13 @@ def main() -> None:
         context_ids_by_item.setdefault(row["item_id"], []).append(row["context_id"])
 
     def _actions():
+        # Print periódico por documento enviado — sem isso, bulk() consome
+        # o gerador inteiro em silêncio até acabar (mesmo raciocínio de
+        # schemas/scylla/load_full_dataset.py: só o print no fim de main()
+        # não dá nenhum sinal de vida durante uma carga real de dezenas de
+        # milhões de documentos). Contagem de envio, não de indexação
+        # confirmada — aproximação suficiente para heartbeat.
+        sent = 0
         for row in candidates.iter_rows(named=True):
             yield {
                 "_index": INDEX,
@@ -47,6 +54,10 @@ def main() -> None:
                     "context_ids": context_ids_by_item.get(row["item_id"], []),
                 },
             }
+            sent += 1
+            if sent % 500_000 == 0:
+                print(f"candidates: {sent} documentos enviados para indexação", flush=True)
+        print(f"candidates: {sent} documentos enviados para indexação (final)", flush=True)
 
     success, _errors = bulk(client, _actions(), chunk_size=2000)
     client.indices.refresh(index=INDEX)
