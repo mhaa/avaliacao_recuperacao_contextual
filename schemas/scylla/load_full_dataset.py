@@ -21,6 +21,16 @@ from harness import fixtures
 HOSTS = os.environ.get("TEST_SCYLLA_HOSTS", "scylla").split(",")
 KEYSPACE = "recsys"
 
+# Requisições em voo por execute_concurrent(). Default pensado para o nó
+# único de nuvem (n2-standard-8, `--smp 7` — ver infra/modules/database/
+# main.tf): ~8-10x o número de shards mantém os 7 ocupados sem estourar
+# timeout de escrita. No Scylla local de correção (`--smp 1`, dev-mode)
+# esse mesmo valor também funciona, só sem ganho adicional (1 shard só).
+# Ajustável sem alterar código para recalibrar contra CPU real da VM de
+# banco (ver infra/scripts/run_measurement_battery.py:_generator_cpu_percent
+# para o mesmo tipo de coleta, aplicável aqui via GCP Monitoring).
+_CONCURRENCY = int(os.environ.get("TEST_SCYLLA_LOAD_CONCURRENCY", "64"))
+
 # Linhas por lote dentro de uma mesma partição — mesmo motivo de
 # load_oracle_fixture.py, mais crítico ainda em escala real (partições bem
 # maiores por contexto de alta seletividade).
@@ -103,7 +113,7 @@ def main() -> None:
         candidates,
         partition_cols=["user_id"],
         other_cols=["rank", "item_id", "score"],
-        concurrency=20,
+        concurrency=_CONCURRENCY,
         label="candidates",
     )
 
@@ -116,7 +126,7 @@ def main() -> None:
         item_contexts,
         partition_cols=["item_id"],
         other_cols=["context_id"],
-        concurrency=20,
+        concurrency=_CONCURRENCY,
         label="item_contexts",
     )
 
@@ -133,7 +143,7 @@ def main() -> None:
         by_context,
         partition_cols=["context_id", "user_id"],
         other_cols=["rank", "item_id", "score"],
-        concurrency=20,
+        concurrency=_CONCURRENCY,
         label="candidates_by_context",
     )
 
@@ -147,7 +157,7 @@ def main() -> None:
         prematerialized,
         partition_cols=["user_id", "context_id"],
         other_cols=["rank", "item_id", "score"],
-        concurrency=20,
+        concurrency=_CONCURRENCY,
         label="prematerialized",
     )
 
