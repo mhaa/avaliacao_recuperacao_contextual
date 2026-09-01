@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 
 from cassandra.cluster import Cluster
-from cassandra.concurrent import execute_concurrent, execute_concurrent_with_args
+from cassandra.concurrent import execute_concurrent
 from cassandra.query import BatchStatement, BatchType
 
 from harness import fixtures
@@ -25,10 +25,6 @@ KEYSPACE = "recsys"
 # load_oracle_fixture.py, mais crítico ainda em escala real (partições bem
 # maiores por contexto de alta seletividade).
 _BATCH_CHUNK_SIZE = 100
-# Linhas por chamada de execute_concurrent_with_args — ver
-# _execute_concurrent_batched abaixo para o motivo real (não é só limitar
-# concorrência, é limitar o que o driver materializa em memória).
-_CONCURRENT_ARGS_BATCH_SIZE = 20_000
 
 
 def _chunked(rows: list, size: int):
@@ -36,44 +32,52 @@ def _chunked(rows: list, size: int):
         yield rows[i : i + size]
 
 
-def _execute_concurrent_batched(
-    session, statement, rows_iter, concurrency: int, label: str = ""
+def _execute_partitioned_batches(
+    session,
+    statement,
+    df,
+    partition_cols: list[str],
+    other_cols: list[str],
+    concurrency: int,
+    label: str,
+    flush_size: int = 2000,
 ) -> None:
-    """`execute_concurrent_with_args()` do driver Cassandra/Scylla NÃO faz
-    streaming de verdade, apesar de aceitar um iterador como `parameters` —
-    a implementação do driver materializa TODOS os parâmetros numa lista
-    (`list(enumerate(...))`) antes de despachar qualquer requisição,
-    independente do valor de `concurrency` (que só limita quantas
-    requisições ficam em voo ao mesmo tempo, não o que já foi carregado em
-    memória). Em escala real (~100,5M linhas de candidates) isso mata o
-    processo por OOM — confirmado ao vivo rodando e1-scylla pela primeira
-    vez, mesmo depois do fix já aplicado em candidates_by_context (que usa
-    execute_concurrent, não execute_concurrent_with_args, mas tinha o mesmo
-    problema de acumular tudo antes de executar). Chamar
-    execute_concurrent_with_args repetidamente em fatias pequenas do
-    próprio iterador mantém a memória limitada, independente do tamanho
-    total do dataset.
+    """Agrupa `df` pela(s) coluna(s) de partição e grava um BatchStatement
+    por partição (nunca cruzando partições — Cassandra/Scylla trata batch
+    de partição única com eficiência real, ao contrário de um batch
+    espalhado). Isso importa MUITO em escala real: `candidates` sozinho
+    tem ~100M linhas mas só ~200 mil usuários — inserir linha a linha (uma
+    requisição de rede por linha, como antes) significa ~100M idas-e-
+    voltas; agrupando por `user_id` (a própria chave de partição da
+    tabela, PRIMARY KEY (user_id, rank)) vira ~200 mil lotes de até ~500
+    linhas cada. Confirmado ao vivo: com a versão linha-a-linha, a carga
+    real do e1-scylla passava horas com o processo Python saturado de CPU
+    mesmo com o driver C-acelerado (cmurmur3/deserializers Cython
+    presentes, verificado) — o gargalo era puramente o número de
+    despachos Python por linha, não rede nem servidor. `candidates_by_context`
+    já usava esse padrão (é o único motivo dele não ter o mesmo problema);
+    generalizado aqui para as outras 3 tabelas.
 
-    `label`, quando dado, imprime uma linha de progresso a cada fatia —
-    sem isso, a carga inteira (~horas em escala real) roda muda até o
-    único print no fim de main(). Confirmado ao vivo: sem heartbeat
-    nenhum, uma sessão SSH que trava no meio fica indistinguível de uma
-    que só está demorando, e ninguém percebe até horas depois."""
-    batch: list = []
-    total = 0
-    for row in rows_iter:
-        batch.append(row)
-        if len(batch) >= _CONCURRENT_ARGS_BATCH_SIZE:
-            execute_concurrent_with_args(session, statement, batch, concurrency=concurrency)
-            total += len(batch)
-            if label:
-                print(f"{label}: {total} linhas gravadas", flush=True)
-            batch = []
-    if batch:
-        execute_concurrent_with_args(session, statement, batch, concurrency=concurrency)
-        total += len(batch)
-        if label:
-            print(f"{label}: {total} linhas gravadas (final)", flush=True)
+    Flush a cada `flush_size` BatchStatements, não só no final — acumular
+    tudo antes de um único execute_concurrent() no final arrisca OOM em
+    escala real (~100M linhas)."""
+    batches: list = []
+    rows_done = 0
+    for key, group in df.group_by(partition_cols):
+        rows = group.select(other_cols).rows()
+        for chunk in _chunked(rows, _BATCH_CHUNK_SIZE):
+            batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+            for row in chunk:
+                batch.add(statement, (*key, *row))
+            batches.append((batch, None))
+            rows_done += len(chunk)
+            if len(batches) >= flush_size:
+                execute_concurrent(session, batches, concurrency=concurrency)
+                print(f"{label}: ~{rows_done} linhas gravadas", flush=True)
+                batches = []
+    if batches:
+        execute_concurrent(session, batches, concurrency=concurrency)
+        print(f"{label}: ~{rows_done} linhas gravadas (final)", flush=True)
 
 
 def main() -> None:
@@ -93,10 +97,12 @@ def main() -> None:
     insert_candidates = session.prepare(
         "INSERT INTO candidates (user_id, rank, item_id, score) VALUES (?, ?, ?, ?)"
     )
-    _execute_concurrent_batched(
+    _execute_partitioned_batches(
         session,
         insert_candidates,
-        candidates.select(["user_id", "rank", "item_id", "score"]).iter_rows(),
+        candidates,
+        partition_cols=["user_id"],
+        other_cols=["rank", "item_id", "score"],
         concurrency=20,
         label="candidates",
     )
@@ -104,11 +110,13 @@ def main() -> None:
     insert_item_contexts = session.prepare(
         "INSERT INTO item_contexts (item_id, context_id) VALUES (?, ?)"
     )
-    _execute_concurrent_batched(
+    _execute_partitioned_batches(
         session,
         insert_item_contexts,
-        item_contexts.iter_rows(),
-        concurrency=100,
+        item_contexts,
+        partition_cols=["item_id"],
+        other_cols=["context_id"],
+        concurrency=20,
         label="item_contexts",
     )
 
@@ -119,47 +127,26 @@ def main() -> None:
         "INSERT INTO candidates_by_context (context_id, user_id, rank, item_id, score) "
         "VALUES (?, ?, ?, ?, ?)"
     )
-    # Flush a cada _BATCHES_FLUSH_SIZE BatchStatements, não só no final —
-    # `by_context` é um join (candidates x item_contexts), maior ainda que
-    # candidates sozinho em escala real; acumular TODOS os BatchStatement
-    # antes de um único execute_concurrent() no final corre o mesmo risco de
-    # OOM já confirmado ao vivo em schemas/valkey/load_full_dataset.py
-    # (pipeline inteiro em memória antes de mandar qualquer coisa pro
-    # servidor) — correção proativa, nunca chegou a estourar aqui de
-    # verdade, mas é a mesma causa.
-    _BATCHES_FLUSH_SIZE = 2000
-    batches: list = []
-    context_rows_done = 0
-    for (context_id, user_id), group in by_context.group_by(["context_id", "user_id"]):
-        rows = group.select(["rank", "item_id", "score"]).rows()
-        for chunk in _chunked(rows, _BATCH_CHUNK_SIZE):
-            batch = BatchStatement(batch_type=BatchType.UNLOGGED)
-            for rank, item_id, score in chunk:
-                batch.add(insert_by_context, (context_id, user_id, rank, item_id, score))
-            batches.append((batch, None))
-            context_rows_done += len(chunk)
-            if len(batches) >= _BATCHES_FLUSH_SIZE:
-                execute_concurrent(session, batches, concurrency=10)
-                # Heartbeat: candidates_by_context é o maior dos 4 (join
-                # com item_contexts) e, sem isso, é a fase mais longa sem
-                # nenhuma linha impressa — mesmo motivo do `label` em
-                # _execute_concurrent_batched acima.
-                print(f"candidates_by_context: ~{context_rows_done} linhas gravadas", flush=True)
-                batches = []
-    if batches:
-        execute_concurrent(session, batches, concurrency=10)
-        print(f"candidates_by_context: ~{context_rows_done} linhas gravadas (final)", flush=True)
+    _execute_partitioned_batches(
+        session,
+        insert_by_context,
+        by_context,
+        partition_cols=["context_id", "user_id"],
+        other_cols=["rank", "item_id", "score"],
+        concurrency=20,
+        label="candidates_by_context",
+    )
 
     insert_prematerialized = session.prepare(
         "INSERT INTO prematerialized (user_id, context_id, rank, item_id, score) "
         "VALUES (?, ?, ?, ?, ?)"
     )
-    _execute_concurrent_batched(
+    _execute_partitioned_batches(
         session,
         insert_prematerialized,
-        prematerialized.select(
-            ["user_id", "context_id", "rank", "item_id", "score"]
-        ).iter_rows(),
+        prematerialized,
+        partition_cols=["user_id", "context_id"],
+        other_cols=["rank", "item_id", "score"],
         concurrency=20,
         label="prematerialized",
     )
