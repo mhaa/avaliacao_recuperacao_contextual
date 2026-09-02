@@ -106,7 +106,25 @@ locals {
     # raiz). Nunca aparece localmente porque docker-compose.yml usa um
     # volume nomeado do Docker, não um disco bruto — confirmado rodando
     # de verdade contra uma VM real.
-    postgres = "-p 5432:5432 -v /mnt/disks/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -e PGDATA=/var/lib/postgresql/data/pgdata"
+    # --shm-size=2g: o /dev/shm padrão de um container Docker é 64MB, e o
+    # Postgres usa dynamic shared memory para coordenar parallel workers.
+    # Confirmado ao vivo na semeadura em us-east4: o VACUUM ANALYZE ao fim
+    # da carga completa (138.640.226 linhas em prematerialized) paralelizou
+    # e morreu com `could not resize shared memory segment ... to 67128896
+    # bytes: No space left on device` — 67128896 é 64,02MB, ou seja, pediu
+    # um triz mais que TODO o /dev/shm. Não é o disco de dados (200GB, que
+    # tinha espaço de sobra).
+    #
+    # docker-compose.yml já declarava `shm_size: 1gb` para o postgres local
+    # desde sempre; era a NUVEM que tinha ficado para trás, herdando o
+    # default de 64MB do Docker. Mais um caso do mesmo padrão de divergência
+    # local↔nuvem já documentado abaixo em --smp/--memory do Scylla e no
+    # heap do OpenSearch. 2g (e não 1g como no local) pelo mesmo motivo de
+    # todos os outros valores daqui: a VM é exclusiva do banco e tem 32GB.
+    #
+    # Vale além do VACUUM: com o teto de 64MB, qualquer plano paralelo
+    # durante a própria medição correria o mesmo risco.
+    postgres = "-p 5432:5432 --shm-size=2g -v /mnt/disks/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -e PGDATA=/var/lib/postgresql/data/pgdata"
     valkey   = "-p 6379:6379"
     # --cap-add SYS_NICE: exigido por --overprovisioned 0 (ver
     # docker_command_args abaixo) — sem ele o Seastar não consegue fazer
@@ -141,7 +159,15 @@ locals {
     # pequeno, diferente de motores que travam memória exclusiva), mas
     # ainda deixa memória real da VM sem uso. e1-postgres já tinha dado
     # real coletado com o valor antigo — precisa ser remedido com este.
-    postgres = "-c shared_buffers=8GB -c effective_cache_size=24GB -c work_mem=256MB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
+    # maintenance_work_mem=2GB: parâmetro SEPARADO de work_mem (que vale só
+    # para consultas) — é o que VACUUM/ANALYZE/CREATE INDEX usam. No default
+    # de 64MB, o VACUUM ANALYZE do fim da carga completa varre os índices de
+    # centenas de milhões de linhas em várias passadas, transformando o
+    # último passo da semeadura em horas. A VM tem 32GB e é exclusiva do
+    # banco; 2GB aqui é folgado mesmo com os 3 autovacuum workers padrão
+    # (autovacuum_work_mem herda este valor) somados aos 8GB de
+    # shared_buffers.
+    postgres = "-c shared_buffers=8GB -c effective_cache_size=24GB -c work_mem=256MB -c maintenance_work_mem=2GB -c max_connections=200 -c random_page_cost=1.1 -c track_io_timing=on"
     valkey   = "--save \"\" --appendonly no --maxmemory 24gb --maxmemory-policy noeviction"
     # --smp 7 --memory 28G, não --smp 1 --memory 2G (valor herdado do
     # docker-compose.yml LOCAL, CLAUDE.md: "só correção, nunca medição de
