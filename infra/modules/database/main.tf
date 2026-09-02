@@ -108,7 +108,12 @@ locals {
     # de verdade contra uma VM real.
     postgres = "-p 5432:5432 -v /mnt/disks/data:/var/lib/postgresql/data -e POSTGRES_USER=tcc -e POSTGRES_DB=recsys -e PGDATA=/var/lib/postgresql/data/pgdata"
     valkey   = "-p 6379:6379"
-    scylla   = "-p 9042:9042 -v /mnt/disks/data:/var/lib/scylla"
+    # --cap-add SYS_NICE: exigido por --overprovisioned 0 (ver
+    # docker_command_args abaixo) — sem ele o Seastar não consegue fazer
+    # mbind/afinidade das shards e avisa "unable to mbind shard memory;
+    # performance may suffer", justamente o que --overprovisioned 0 quer
+    # habilitar. Confirmado localmente: com a capability o aviso some.
+    scylla = "-p 9042:9042 --cap-add SYS_NICE -v /mnt/disks/data:/var/lib/scylla"
     # OPENSEARCH_JAVA_OPTS precisa de aspas em volta do valor inteiro: sem
     # elas, o shell quebra "-Xms2g -Xmx2g" em dois tokens e o segundo
     # ("-Xmx2g") chega ao `docker run` como se fosse uma flag própria dele
@@ -149,7 +154,31 @@ locals {
     # dev local compartilhado. --overprovisioned/--developer-mode mantidos
     # (não são o gargalo de performance, e mexer neles arrisca o Scylla
     # recusar iniciar no COS sem o tuning completo de I/O de produção).
-    scylla     = "--smp 7 --memory 28G --overprovisioned 1 --developer-mode 1 --skip-wait-for-gossip-to-settle 0"
+    # --overprovisioned 0 (explícito, não omitido): afirma que a VM é
+    # EXCLUSIVA do banco, ligando afinidade de CPU e polling agressivo —
+    # a mesma premissa que já justifica --smp 7 --memory 28G. Antes estava
+    # --overprovisioned 1, que afirma o contrário e contradizia o resto da
+    # linha. Exige --cap-add SYS_NICE em docker_run_flags: sem isso o
+    # Seastar falha o mbind das shards ("unable to mbind shard memory;
+    # performance may suffer") — confirmado localmente.
+    #
+    # ATENÇÃO ao valor "0": omitir a flag NÃO desliga nada. O parser da
+    # própria imagem (/commandlineparser.py) tem default '1' para
+    # --developer-mode e, para --overprovisioned, "roda em modo
+    # overprovisioned por padrão a menos que --cpuset seja especificado" —
+    # ou seja, simplesmente apagar as flags mantinha os dois LIGADOS,
+    # silenciosamente. Confirmado lendo a linha de comando real no log.
+    #
+    # --developer-mode continua 1 por ora, apesar de a documentação do
+    # Scylla desaconselhar avaliar desempenho com ele: desligar exige o
+    # diretório de dados em XFS (o iotune recusa outro filesystem: "did
+    # not pass validation tests, it may not be on XFS"), e o disco aqui é
+    # formatado ext4 mais abaixo. Trocar para XFS implicaria também
+    # re-gerar o snapshot semeado do Scylla (que carrega o filesystem
+    # dentro) e uma ferramenta de mkfs.xfs, ausente tanto no COS quanto na
+    # imagem do Scylla. Testado localmente: com --developer-mode 0 o
+    # container morre no boot exatamente com esse erro.
+    scylla = "--smp 7 --memory 28G --overprovisioned 0 --skip-wait-for-gossip-to-settle 0"
     # indices.memory.index_buffer_size é setting estático (só via config no
     # boot, não muda em runtime pela API) — default é 10% do heap (1.6GB
     # com os 16GB configurados acima). 25% (4GB) reduz a frequência de
