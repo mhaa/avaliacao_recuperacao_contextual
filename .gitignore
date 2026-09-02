@@ -25,6 +25,12 @@ load/fixtures/*
 results/*
 !results/.gitkeep
 
+# Execuções arquivadas por serem inválidas (mediram o gargalo do serviço,
+# não os bancos — ver commits 6347fdb/55ac52a). Ficam fora de results/ para
+# o glob de analysis/report.py não misturá-las no relatório, e fora do git
+# pelo mesmo motivo que results/: são ~12 GB de saída bruta do k6.
+resultados-invalidos-pre-correcao/
+
 # infra/ (Terraform, Etapa 9) — cache de provedores, estado (mesmo o local
 # de infra/bootstrap) e variáveis reais nunca são versionados.
 # .terraform.lock.hcl FICA versionado (IMPLEMENTACAO.md) — não entra aqui.
