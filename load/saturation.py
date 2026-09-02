@@ -5,7 +5,10 @@ triagem) ou incrementos de 10% (rampa de confirmação), busca binária de até
 alcançado sem violação, e checagem obrigatória do gerador de carga (CPU <
 60%, CONTEXTO.md) a cada patamar — se o gerador saturar antes da célula, a
 execução inteira é inválida (`loadgen_bottleneck=True`), nunca interpretada
-como vazão da célula.
+como vazão da célula. Uma sondagem SEM leitura de CPU
+(`generator_cpu_percent=None`) não aborta a busca, mas marca
+`generator_cpu_unmeasured=True`: "não deu pra avaliar o portão" é estado
+próprio, nunca confundido com "gerador ocioso".
 
 Lógica pura, sem I/O de rede: quem chama fecha sobre a execução real de um
 patamar (infra/scripts/run_measurement_battery.py) e passa aqui só como
@@ -29,7 +32,16 @@ BINARY_SEARCH_ITERATIONS = 3
 class ProbeResult:
     rate: int
     violated_slo: bool
-    generator_cpu_percent: float
+    # `None` = não foi POSSÍVEL medir a CPU do gerador nesta sondagem (Cloud
+    # Monitoring sem ponto na janela — ver run_measurement_battery.py:
+    # _generator_cpu_percent), estado distinto de 0.0 = medido e ocioso.
+    # Antes, falha de telemetria virava 0.0 e passava calada pelo portão dos
+    # 60% do CONTEXTO.md: results/e1-postgres/triagem/20260901T144228Z/
+    # saturation.json tem 0.0 nas 4 sondagens enquanto o gerador empurrava
+    # 1000 req/s — implausível, o portão foi vacuoso naquela execução
+    # inteira. Mesma disciplina de analysis/resources.py:classify_bottleneck
+    # (ausente != zero).
+    generator_cpu_percent: float | None
 
 
 @dataclass(frozen=True)
@@ -38,7 +50,29 @@ class SaturationSearchResult:
     censored: bool
     lower_bound: float | None  # só quando censurado (= teto alcançado)
     loadgen_bottleneck: bool  # execução inválida — nunca usar como dado
+    # True se ao menos uma sondagem ficou sem leitura de CPU do gerador: o
+    # resultado NÃO é inválido, mas também não está validado — o portão dos
+    # 60% não pôde ser avaliado naquelas sondagens. Quem lê decide.
+    generator_cpu_unmeasured: bool = False
     probes: list[ProbeResult] = field(default_factory=list)  # trilha de auditoria
+
+
+def _generator_saturated(result: ProbeResult) -> bool:
+    """Portão de validade do CONTEXTO.md (CPU do gerador < 60%): só dispara
+    com uma LEITURA acima do limiar. `None` não é gargalo confirmado e não
+    aborta a busca — abortar por atraso de ingestão do Cloud Monitoring já
+    foi bug confirmado ao vivo (ver o retry em run_measurement_battery.py:
+    _generator_cpu_percent). Fica registrado em
+    SaturationSearchResult.generator_cpu_unmeasured: não medido é visível,
+    não fatal."""
+    return (
+        result.generator_cpu_percent is not None
+        and result.generator_cpu_percent >= GENERATOR_CPU_THRESHOLD
+    )
+
+
+def _any_cpu_unmeasured(probes: list[ProbeResult]) -> bool:
+    return any(p.generator_cpu_percent is None for p in probes)
 
 
 def doubling_sequence(start: int, ceiling: int = CEILING_RPS) -> Iterator[int]:
@@ -81,7 +115,7 @@ def _binary_search(
             break
         result = probe_fn(mid)
         probes.append(result)
-        if result.generator_cpu_percent >= GENERATOR_CPU_THRESHOLD:
+        if _generator_saturated(result):
             break
         if result.violated_slo:
             high = mid
@@ -119,23 +153,25 @@ def run_saturation_search(
         result = probe_fn(rate)
         probes.append(result)
 
-        if result.generator_cpu_percent >= GENERATOR_CPU_THRESHOLD:
+        if _generator_saturated(result):
             return SaturationSearchResult(
                 approx_throughput=None,
                 censored=False,
                 lower_bound=None,
                 loadgen_bottleneck=True,
+                generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
                 probes=probes,
             )
 
         if result.violated_slo:
             approx = _binary_search(probe_fn, last_valid, rate, binary_search_iterations, probes)
-            if probes[-1].generator_cpu_percent >= GENERATOR_CPU_THRESHOLD:
+            if _generator_saturated(probes[-1]):
                 return SaturationSearchResult(
                     approx_throughput=None,
                     censored=False,
                     lower_bound=None,
                     loadgen_bottleneck=True,
+                    generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
                     probes=probes,
                 )
             return SaturationSearchResult(
@@ -143,6 +179,7 @@ def run_saturation_search(
                 censored=False,
                 lower_bound=None,
                 loadgen_bottleneck=False,
+                generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
                 probes=probes,
             )
 
@@ -153,5 +190,6 @@ def run_saturation_search(
         censored=True,
         lower_bound=float(ceiling),
         loadgen_bottleneck=False,
+        generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
         probes=probes,
     )

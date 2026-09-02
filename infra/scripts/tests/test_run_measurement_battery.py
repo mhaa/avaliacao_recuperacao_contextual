@@ -22,7 +22,7 @@ from infra.scripts.run_measurement_battery import (
     sample_resources_periodically,
     shuffled_sweep,
 )
-from load.saturation import SaturationSearchResult
+from load.saturation import ProbeResult, SaturationSearchResult
 
 
 def test_build_sweep_triagem_is_a_single_mid_level_combination():
@@ -157,6 +157,28 @@ def test_write_saturation_json_round_trips(tmp_path, monkeypatch):
     payload = json.loads(out.read_text())
     assert payload["approx_throughput"] == 11000.0
     assert payload["censored"] is False
+    assert payload["generator_cpu_unmeasured"] is False
+
+
+def test_write_saturation_json_records_an_unmeasured_probe_as_null(tmp_path, monkeypatch):
+    # Uma sondagem sem leitura de CPU precisa chegar ao arquivo como `null`,
+    # não como 0.0 — é o que permite, meses depois, distinguir "gerador
+    # ocioso" de "portão dos 60% nunca avaliado" numa medição arquivada.
+    monkeypatch.chdir(tmp_path)
+    result = SaturationSearchResult(
+        approx_throughput=11000.0,
+        censored=False,
+        lower_bound=None,
+        loadgen_bottleneck=False,
+        generator_cpu_unmeasured=True,
+        probes=[ProbeResult(rate=1000, violated_slo=False, generator_cpu_percent=None)],
+    )
+    _write_saturation_json(result, "e1-postgres", "triagem", "20260101T000000Z")
+
+    out = tmp_path / "results" / "e1-postgres" / "triagem" / "20260101T000000Z" / "saturation.json"
+    payload = json.loads(out.read_text())
+    assert payload["generator_cpu_unmeasured"] is True
+    assert payload["probes"][0]["generator_cpu_percent"] is None
 
 
 def test_sample_resources_periodically_stops_when_event_is_set():

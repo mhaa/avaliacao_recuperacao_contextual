@@ -68,3 +68,33 @@ def test_run_saturation_search_stops_immediately_when_generator_saturates():
     assert result.approx_throughput is None
     assert result.censored is False
     assert len(calls) == 2  # nunca sonda um 3º patamar depois do gerador saturar
+
+
+def test_unmeasured_generator_cpu_does_not_abort_the_search_and_is_flagged():
+    # Falha de telemetria do Cloud Monitoring (None) não pode ser fatal —
+    # abortar por atraso de ingestão já foi bug confirmado ao vivo — mas
+    # também não pode passar calada como se fosse 0% (gerador ocioso).
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        cpu = None if len(calls) == 2 else 30.0
+        return ProbeResult(rate=rate, violated_slo=rate > 11_000, generator_cpu_percent=cpu)
+
+    result = run_saturation_search(probe_fn, start_rate=1_000)
+
+    assert result.loadgen_bottleneck is False  # não medido != gargalo
+    assert result.generator_cpu_unmeasured is True  # mas fica visível
+    assert result.approx_throughput == 11_000.0  # a busca foi até o fim
+    assert len(calls) > 2
+
+
+def test_measured_zero_cpu_is_not_reported_as_unmeasured():
+    # 0.0 é uma LEITURA (gerador ocioso); só None é ausência de leitura.
+    def idle_generator(rate: int) -> ProbeResult:
+        return ProbeResult(rate=rate, violated_slo=rate > 4_000, generator_cpu_percent=0.0)
+
+    result = run_saturation_search(idle_generator, start_rate=1_000)
+
+    assert result.generator_cpu_unmeasured is False
+    assert result.loadgen_bottleneck is False

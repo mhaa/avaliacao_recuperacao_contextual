@@ -984,6 +984,20 @@ célula, o disco de dados é criado a partir dele e a carga completa é
 pulada; caso contrário, o comportamento de hoje continua (carrega do
 zero e avisa que rodar este passo evitaria a espera da próxima vez).
 
+> **Mudou o schema? O snapshot precisa ser refeito.** Quando o snapshot
+> existe, `run_measurement_battery.py` pula a carga **e o schema junto** —
+> `skip_dataset_load=snapshot_found` faz `build_remote_setup_command`
+> descartar os dois passos, então `schemas/<storage>/apply_schema.py` (ou
+> `create_index.py`) **não roda**. Um índice novo em
+> `schemas/postgres/001_schema.sql`, uma mudança de `compaction` em
+> `schemas/scylla/apply_schema.py` ou um `VACUUM ANALYZE` acrescentado ao
+> loader simplesmente não existiriam na medição, sem nenhum aviso — o
+> snapshot carrega o schema antigo junto com os dados. Depois de qualquer
+> alteração em `schemas/`, rode de novo o `seed_dataset_snapshots.py` do
+> storage afetado (ele substitui o snapshot anterior) antes de medir.
+> Mudança só no lado da consulta (`storage/<db>.py`) não exige re-semear:
+> essa parte vem da imagem `service`, não do disco.
+
 Diferente do smoke test — que sobe, valida e derruba tudo sozinho — aqui é
 onde a bateria de medição real acontece. `infra/scripts/run_measurement_battery.py`
 é a contraparte do smoke test (passo 7) para esta fase: sobe a célula
@@ -1057,6 +1071,19 @@ pula o `destroy` para investigar uma falha manualmente. Se a rampa reportar
 vazão dessa célula fica sem dado — escale o tipo de máquina do gerador
 (`infra/modules/loadgen`) e repita só a rampa antes de confiar no
 resultado; latência/custo já medidos continuam válidos.
+
+`generator_cpu_unmeasured: true` é diferente disso: significa que ao menos
+uma sondagem ficou **sem leitura** de CPU do gerador (Cloud Monitoring sem
+ponto na janela), então o portão dos 60% não pôde ser avaliado ali. A vazão
+continua no relatório — não é gargalo confirmado, seria desperdício jogar
+fora dado provavelmente bom por causa de telemetria —, mas **não está
+validada** nessa dimensão: rode `--verify-otel` e repita a rampa antes de
+usar esse número na dissertação. Atenção ao ler medições **arquivadas antes
+desta mudança**: naquelas, uma falha de telemetria era gravada como
+`generator_cpu_percent: 0.0`, indistinguível de "gerador ocioso" — trate
+`0.0` em arquivo antigo como não medido (é o caso de
+`results/e1-postgres/triagem/20260901T144228Z/`, com 0.0 nas 4 sondagens sob
+1000 req/s).
 
 Depois de rodar a triagem para as 14, consolide e ache a fronteira de
 Pareto (agora considerando a vazão de saturação — células dentro de 20%
@@ -1145,9 +1172,10 @@ results/<cell>/<phase>/<timestamp>/
 ```
 
 - **Leitura rápida de uma célula só**, sem processar nada: abra
-  `saturation.json` (traz `approx_throughput`/`censored`/`loadgen_bottleneck`
-  e a lista de sondagens) e `rep<N>/manifest.json` diretamente — são JSON
-  pequenos, dá pra ler no editor.
+  `saturation.json` (traz `approx_throughput`/`censored`/`loadgen_bottleneck`/
+  `generator_cpu_unmeasured` e a lista de sondagens, cada uma com
+  `generator_cpu_percent` — `null` ali significa sem leitura, nunca 0%) e
+  `rep<N>/manifest.json` diretamente — são JSON pequenos, dá pra ler no editor.
 - **`k6-raw.json` nunca deve ser lido à mão** — são milhares de linhas, uma
   por métrica coletada pelo k6. É *insumo* de `analysis/collect.py`, que o
   transforma em `latencies.parquet` (uma linha por requisição, com

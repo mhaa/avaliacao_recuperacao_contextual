@@ -75,6 +75,7 @@ from infra.scripts.cloud_smoke_test import (
     terraform,
     terraform_output_json,
     wait_for_container,
+    wait_for_service_ready,
 )
 from load.run_battery import build_probe_k6_cmd
 from load.saturation import GENERATOR_CPU_THRESHOLD, ProbeResult, run_saturation_search
@@ -375,7 +376,9 @@ def _parse_probe_result_line(stdout: str) -> bool:
     )
 
 
-def _generator_cpu_percent(project_id: str, loadgen_instance: str, start_time, end_time) -> float:
+def _generator_cpu_percent(
+    project_id: str, loadgen_instance: str, start_time, end_time
+) -> float | None:
     """CPU da VM loadgen na janela de uma sondagem, via Cloud Monitoring —
     CONTEXTO.md: "válido só se CPU do gerador < 60%", checado a cada
     patamar da busca de saturação, não só ao final."""
@@ -397,7 +400,7 @@ def _generator_cpu_percent(project_id: str, loadgen_instance: str, start_time, e
         # (violou SLO ou não) abortava a busca de saturação inteira só
         # porque o Cloud Monitoring ainda não processou o ponto — confirmado
         # ao vivo. Uma tentativa extra depois de uma espera curta; se ainda
-        # assim falhar, assume 0% (não bloqueia a busca — só a checagem de
+        # assim falhar, devolve None (não bloqueia a busca — só a checagem de
         # gargalo do gerador fica sem dado para este patamar específico).
         time.sleep(30)
         try:
@@ -405,9 +408,14 @@ def _generator_cpu_percent(project_id: str, loadgen_instance: str, start_time, e
         except ValueError as exc:
             print(
                 f"AVISO: não foi possível consultar CPU do gerador nesta sondagem ({exc}) — "
-                "assumindo 0% (não bloqueia a busca de saturação)."
+                "registrada como NÃO MEDIDA (null), não como 0%. Assumir 0% fazia a falha de "
+                "telemetria passar pelo portão dos 60% do CONTEXTO.md como se o gerador "
+                "estivesse ocioso (confirmado ao vivo em results/e1-postgres/triagem/"
+                "20260901T144228Z/saturation.json, com 0.0 nas 4 sondagens sob 1000 req/s). "
+                "A busca continua — só o portão desta sondagem fica sem avaliação, e "
+                "saturation.json marca isso em generator_cpu_unmeasured."
             )
-            return 0.0
+            return None
 
 
 def snapshot_exists(project_id: str, snapshot_name: str) -> bool:
@@ -605,6 +613,18 @@ def _report_saturation(saturation, label: str = "") -> None:
     else:
         print(f"{prefix}vazão de saturação aproximada: {saturation.approx_throughput:.0f} req/s.")
 
+    # Bloco independente do veredito acima: "não medido" pode coexistir com
+    # censurada ou com uma vazão aproximada perfeitamente boa.
+    unmeasured = sum(1 for p in saturation.probes if p.generator_cpu_percent is None)
+    if unmeasured:
+        print(
+            f"{prefix}ATENÇÃO: {unmeasured} de {len(saturation.probes)} sondagens ficaram sem "
+            f"leitura de CPU do gerador — o portão de validade do CONTEXTO.md (CPU < "
+            f"{GENERATOR_CPU_THRESHOLD:.0f}%) NÃO pôde ser avaliado nelas. Não é o mesmo que "
+            "gerador ocioso: este resultado não está validado nessa dimensão. Confira o coletor "
+            "OTel do loadgen (--verify-otel) antes de usar esta vazão na dissertação."
+        )
+
 
 def _write_saturation_json(
     saturation, cell_id: str, phase: str, timestamp: str, filename: str = "saturation.json"
@@ -616,6 +636,7 @@ def _write_saturation_json(
         "censored": saturation.censored,
         "lower_bound": saturation.lower_bound,
         "loadgen_bottleneck": saturation.loadgen_bottleneck,
+        "generator_cpu_unmeasured": saturation.generator_cpu_unmeasured,
         "probes": [
             {
                 "rate": p.rate,
@@ -839,6 +860,13 @@ def main(argv: list[str] | None = None) -> int:
             skip_dataset_load=snapshot_found,
         )
         gcloud_ssh(loadgen_instance, args.zone, args.project_id, setup_cmd)
+
+        # Depois do schema/carga, não antes: numa VM sem snapshot o banco só
+        # passa a responder consulta de verdade quando as tabelas existem.
+        # Sonda o caminho completo (gerador -> serviço -> banco) até vir 200,
+        # para o warmup do k6 ser aquecimento real e não os primeiros ~90s de
+        # HTTP 500 de um cluster ainda subindo — ver wait_for_service_ready.
+        wait_for_service_ready(loadgen_instance, args.zone, args.project_id, service_ip)
 
         target_url = f"http://{service_ip}:8000/v1/recommendations"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

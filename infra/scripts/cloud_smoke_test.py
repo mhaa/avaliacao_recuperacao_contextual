@@ -228,6 +228,58 @@ def gcloud_ssh(
     return _run(cmd, capture_output=True, text=True, input="y\n")
 
 
+def wait_for_service_ready(
+    instance: str, zone: str, project_id: str, service_ip: str, timeout_s: int = 600
+) -> None:
+    """Espera o serviço RESPONDER, não só o container existir.
+
+    `wait_for_container` confirma que o processo subiu; isso não é a mesma
+    coisa que o banco por trás dele já servir consultas. Confirmado ao vivo
+    no OpenSearch: nos primeiros ~70-90s de cada deploy novo, 100% das
+    requisições voltavam HTTP 500 (cluster ainda alocando shards) — em
+    e1-opensearch as falhas iam de 21:09:17 até 21:10:31, quando veio o
+    primeiro 200. Ficava tudo dentro do cenário `warmup`, que
+    analysis/collect.py descarta, então os percentis não eram corrompidos;
+    mas os 2 min de aquecimento viravam ~40s de aquecimento real, e um
+    startup um pouco mais lento faria o erro vazar para o cenário
+    `measurement`.
+
+    Genérico de propósito (não um remendo só do OpenSearch): exercita
+    exatamente o caminho que o gerador vai usar — POST no endpoint real,
+    através do serviço, até o banco. Um usuário sem candidatos devolve 200
+    com lista vazia, então serve como sonda de prontidão para as quatro
+    tecnologias sem depender de qual dado foi carregado.
+    """
+    print(f"Aguardando o serviço em {service_ip}:8000 responder a uma requisição real...")
+    deadline = time.monotonic() + timeout_s
+    payload = '{"user_id":1,"context":[],"exclude":[],"k":20}'
+    # `|| echo 000`: sem isso, curl sai != 0 enquanto o serviço ainda não
+    # aceita conexão e o _run(check=True) de gcloud_ssh derrubaria a
+    # execução inteira no primeiro poll — o normal no começo do boot.
+    check_cmd = (
+        f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 "
+        f"-X POST http://{service_ip}:8000/v1/recommendations "
+        f"-H 'Content-Type: application/json' -d '{payload}' || echo 000"
+    )
+    last_status = "(nenhuma resposta ainda)"
+    while time.monotonic() < deadline:
+        try:
+            result = gcloud_ssh(instance, zone, project_id, check_cmd)
+            out = result.stdout.strip()
+            last_status = out.splitlines()[-1] if out else "(vazio)"
+            if last_status.endswith("200"):
+                print("  serviço respondendo 200 a uma requisição real.")
+                return
+        except Exception as exc:  # noqa: BLE001 — SSH falha transitoriamente no boot
+            last_status = f"(SSH falhou: {exc})"
+        time.sleep(10)
+    raise TimeoutError(
+        f"serviço em {service_ip}:8000 não respondeu 200 em {timeout_s}s "
+        f"(último status: {last_status}). Verifique `docker logs tcc-service` na VM de serviço "
+        "e `docker logs tcc-database` na VM de banco."
+    )
+
+
 def tail_remote_file(
     instance: str, zone: str, project_id: str, path: str, lines: int = 40
 ) -> str:

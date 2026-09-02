@@ -138,6 +138,12 @@ def build_report(
                 "saturation_throughput_approx": saturation.get("approx_throughput"),
                 "saturation_censored": saturation.get("censored", False),
                 "saturation_lower_bound": saturation.get("lower_bound"),
+                # .get com default: saturation.json arquivado ANTES desta
+                # chave existir continua legível (naqueles, 0.0 é ambíguo
+                # entre "ocioso" e "não medido" — ver README, Fase 5).
+                "saturation_generator_cpu_unmeasured": saturation.get(
+                    "generator_cpu_unmeasured", False
+                ),
             }
         )
         ci = bootstrap_percentile_ci(latencies, percentile=0.99)
@@ -208,6 +214,20 @@ def main(argv: list[str] | None = None) -> int:
             "gerador ser escalado e a rampa repetida. Latência/custo continuam válidos."
         )
         saturation_by_cell.pop(cell_id, None)
+
+    # generator_cpu_unmeasured NÃO é gargalo confirmado — é o portão de
+    # validade (CPU do gerador < 60%) que ficou SEM avaliação naquela rampa.
+    # Diferente de loadgen_bottleneck, a vazão medida continua no relatório:
+    # descartá-la jogaria fora dado provavelmente bom por causa de uma falha
+    # de telemetria. Mas vai avisada aqui e marcada célula a célula em
+    # report.json, para nunca ser lida como validada.
+    for cell_id, s in saturation_by_cell.items():
+        if s.get("generator_cpu_unmeasured"):
+            print(
+                f"AVISO: {cell_id} — ao menos uma sondagem da rampa ficou sem leitura de CPU do "
+                "gerador; a vazão está no relatório, mas o portão dos 60% não foi avaliado nela. "
+                "Trate como não validada nessa dimensão."
+            )
 
     report = build_report(groups, saturation_by_cell)
     args.out.mkdir(parents=True, exist_ok=True)
