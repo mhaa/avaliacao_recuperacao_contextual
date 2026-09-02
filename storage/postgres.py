@@ -12,15 +12,20 @@ vs. interseção de conjuntos via `intarray`/bitmap); ajustar a técnica SQL
 de `intersect` fica para quando a comparação de latência entrar em cena,
 sem mudar a interface pública.
 
-Abre uma conexão por chamada (sem pool) — aceitável nesta etapa, focada em
-corretude; pooling é uma otimização de performance que pode ser adicionada
-depois sem mudar a interface.
+Usa um `AsyncConnectionPool` (não uma conexão por chamada): medido ao vivo
+na nuvem, abrir uma conexão nova por requisição estourava
+`max_connections=200` do Postgres sob carga real (centenas de VUs
+concorrentes no k6, cada um tentando abrir sua própria conexão) — a maioria
+das requisições voltava HTTP 500 ("too many clients already") em vez de
+medir latência de verdade. `max_size` fica bem abaixo de 200: cada célula
+tem um único serviço falando com o banco, então isso já dá folga larga de
+concorrência sem arriscar esgotar o limite do servidor.
 """
 
 from __future__ import annotations
 
-import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from core.contract import Candidate
 
@@ -67,13 +72,24 @@ class PostgresAdapter(StorageAdapter):
         {GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED, INTERSECT}
     )
 
-    def __init__(self, conninfo: str):
-        self._conninfo = conninfo
+    # max_connections=200 no Postgres (docker-compose.yml / infra/modules/
+    # database) — max_size fica bem abaixo disso de propósito, ver
+    # docstring do módulo.
+    def __init__(self, conninfo: str, min_size: int = 4, max_size: int = 50):
+        self._pool = AsyncConnectionPool(
+            conninfo,
+            min_size=min_size,
+            max_size=max_size,
+            open=False,
+            kwargs={"row_factory": dict_row},
+        )
+
+    async def close(self) -> None:
+        await self._pool.close()
 
     async def get_candidates(self, user_id: int) -> list[Candidate]:
-        async with await psycopg.AsyncConnection.connect(
-            self._conninfo, row_factory=dict_row
-        ) as conn:
+        await self._pool.open()
+        async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(_GET_CANDIDATES_SQL, {"user_id": user_id})
                 rows = await cur.fetchall()
@@ -89,9 +105,8 @@ class PostgresAdapter(StorageAdapter):
     async def get_candidates_filtered(self, user_id: int, context: list[int]) -> list[Candidate]:
         if not context:
             return await self.get_candidates(user_id)
-        async with await psycopg.AsyncConnection.connect(
-            self._conninfo, row_factory=dict_row
-        ) as conn:
+        await self._pool.open()
+        async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     _GET_CANDIDATES_FILTERED_SQL,
@@ -105,9 +120,8 @@ class PostgresAdapter(StorageAdapter):
         return [Candidate(item_id=row["item_id"], score=row["score"]) for row in rows]
 
     async def get_prematerialized(self, user_id: int, context_key: str) -> list[Candidate]:
-        async with await psycopg.AsyncConnection.connect(
-            self._conninfo, row_factory=dict_row
-        ) as conn:
+        await self._pool.open()
+        async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     _GET_PREMATERIALIZED_SQL,
@@ -117,9 +131,8 @@ class PostgresAdapter(StorageAdapter):
         return [Candidate(item_id=row["item_id"], score=row["score"]) for row in rows]
 
     async def intersect(self, user_id: int, context: list[int], limit: int) -> list[Candidate]:
-        async with await psycopg.AsyncConnection.connect(
-            self._conninfo, row_factory=dict_row
-        ) as conn:
+        await self._pool.open()
+        async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     _INTERSECT_SQL,

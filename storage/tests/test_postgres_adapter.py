@@ -68,14 +68,24 @@ def seeded_user():
     _cleanup()
 
 
-async def test_get_candidates_ordered_by_rank(seeded_user):
+@pytest.fixture
+async def adapter():
+    # Fecha o pool ao final de cada teste: pytest-asyncio dá um event loop
+    # novo por função de teste (function scope), e um AsyncConnectionPool
+    # aberto num loop que já fechou trava o próximo teste indefinidamente
+    # (workers de fundo do pool anterior ficam presos ao loop morto) —
+    # confirmado travando de verdade antes deste fixture existir.
     adapter = PostgresAdapter(CONNINFO)
+    yield adapter
+    await adapter.close()
+
+
+async def test_get_candidates_ordered_by_rank(adapter, seeded_user):
     result = await adapter.get_candidates(seeded_user)
     assert [c.item_id for c in result] == _TEST_ITEM_IDS
 
 
-async def test_get_candidates_carries_context_membership(seeded_user):
-    adapter = PostgresAdapter(CONNINFO)
+async def test_get_candidates_carries_context_membership(adapter, seeded_user):
     result = await adapter.get_candidates(seeded_user)
     context_ids_by_item = {c.item_id: c.context_ids for c in result}
     assert context_ids_by_item[_TEST_ITEM_IDS[0]] == frozenset({1})
@@ -83,25 +93,21 @@ async def test_get_candidates_carries_context_membership(seeded_user):
     assert context_ids_by_item[_TEST_ITEM_IDS[2]] == frozenset({1, 2})
 
 
-async def test_get_candidates_filtered_returns_only_matching_context(seeded_user):
-    adapter = PostgresAdapter(CONNINFO)
+async def test_get_candidates_filtered_returns_only_matching_context(adapter, seeded_user):
     result = await adapter.get_candidates_filtered(seeded_user, [1])
     assert {c.item_id for c in result} == {_TEST_ITEM_IDS[0], _TEST_ITEM_IDS[2]}
 
 
-async def test_get_candidates_filtered_is_and_across_contexts(seeded_user):
-    adapter = PostgresAdapter(CONNINFO)
+async def test_get_candidates_filtered_is_and_across_contexts(adapter, seeded_user):
     result = await adapter.get_candidates_filtered(seeded_user, [1, 2])
     assert {c.item_id for c in result} == {_TEST_ITEM_IDS[2]}
 
 
-async def test_get_candidates_filtered_empty_context_returns_everything(seeded_user):
-    adapter = PostgresAdapter(CONNINFO)
+async def test_get_candidates_filtered_empty_context_returns_everything(adapter, seeded_user):
     result = await adapter.get_candidates_filtered(seeded_user, [])
     assert {c.item_id for c in result} == set(_TEST_ITEM_IDS)
 
 
-async def test_unknown_user_returns_empty_list_not_error():
-    adapter = PostgresAdapter(CONNINFO)
+async def test_unknown_user_returns_empty_list_not_error(adapter):
     result = await adapter.get_candidates(999_999_999)
     assert result == []
