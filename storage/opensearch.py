@@ -50,9 +50,23 @@ class OpenSearchAdapter(StorageAdapter):
         return await asyncio.to_thread(self._search, user_id, context, limit)
 
     def _search(self, user_id: int, context: list[int], size: int) -> list[Candidate]:
-        must = [{"term": {"user_id": user_id}}]
-        must.extend({"term": {"context_ids": context_id}} for context_id in context)
-        body = {"query": {"bool": {"must": must}}, "size": size}
+        # `filter`, não `must`: a semântica de correspondência é idêntica
+        # (o predicado continua sendo resolvido pelo índice invertido, que é
+        # o que define E-2 aqui), mas contexto de filtro pula o cálculo de
+        # relevância BM25 e é cacheável. O `_score` do Lucene era descartado
+        # de qualquer forma — quem ordena é core/ordering.py:rank_candidates,
+        # pelo campo `score` (ALS) armazenado no documento.
+        # track_total_hits=False evita contar todos os documentos que casam
+        # além dos `size` devolvidos; `_source` enxuto evita trazer campo
+        # que o adaptador não lê.
+        filters = [{"term": {"user_id": user_id}}]
+        filters.extend({"term": {"context_ids": context_id}} for context_id in context)
+        body = {
+            "query": {"bool": {"filter": filters}},
+            "size": size,
+            "track_total_hits": False,
+            "_source": ["item_id", "score", "context_ids"],
+        }
         response = self._client.search(index=INDEX, body=body)
         return [
             Candidate(

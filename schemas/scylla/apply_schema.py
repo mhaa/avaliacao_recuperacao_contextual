@@ -20,6 +20,16 @@ from cassandra.cluster import Cluster
 HOSTS = os.environ.get("TEST_SCYLLA_HOSTS", "scylla").split(",")
 KEYSPACE = "recsys"
 
+# LeveledCompactionStrategy, não o default SizeTieredCompactionStrategy:
+# estas tabelas são carregadas uma vez (schemas/scylla/load_full_dataset.py)
+# e só lidas depois. STCS otimiza escrita e deixa o mesmo dado espalhado em
+# várias SSTables, custando mais leituras por consulta; LCS é a recomendação
+# para carga write-once/read-many. Não muda semântica nenhuma — é layout em
+# disco, igual para todas as estratégias.
+_COMPACTION = "{'class': 'LeveledCompactionStrategy'}"
+
+_TABLES = ["candidates", "item_contexts", "candidates_by_context", "prematerialized"]
+
 _STATEMENTS = [
     f"""
     CREATE KEYSPACE IF NOT EXISTS {KEYSPACE}
@@ -32,14 +42,14 @@ _STATEMENTS = [
         item_id int,
         score float,
         PRIMARY KEY (user_id, rank)
-    )
+    ) WITH compaction = {_COMPACTION}
     """,
     f"""
     CREATE TABLE IF NOT EXISTS {KEYSPACE}.item_contexts (
         item_id int,
         context_id smallint,
         PRIMARY KEY (item_id, context_id)
-    )
+    ) WITH compaction = {_COMPACTION}
     """,
     # Desnormalizada, partição por (contexto, usuário) — leitura direta e já
     # filtrada por um único contexto (E-2). Não truncada, então intersectar
@@ -52,7 +62,7 @@ _STATEMENTS = [
         item_id int,
         score float,
         PRIMARY KEY ((context_id, user_id), rank)
-    )
+    ) WITH compaction = {_COMPACTION}
     """,
     # Chave composta (usuário, contexto) — leitura direta para E-3.
     f"""
@@ -63,7 +73,7 @@ _STATEMENTS = [
         item_id int,
         score float,
         PRIMARY KEY ((user_id, context_id), rank)
-    )
+    ) WITH compaction = {_COMPACTION}
     """,
 ]
 
@@ -73,8 +83,16 @@ def main() -> None:
     session = cluster.connect()
     for statement in _STATEMENTS:
         session.execute(statement)
+    # ALTER separado do CREATE: `CREATE TABLE IF NOT EXISTS` é no-op numa
+    # tabela que já existe, então sem isto uma base criada antes desta
+    # mudança continuaria em STCS para sempre. ALTER é idempotente — rodar
+    # de novo numa tabela já em LCS não faz nada.
+    for table in _TABLES:
+        session.execute(
+            f"ALTER TABLE {KEYSPACE}.{table} WITH compaction = {_COMPACTION}"
+        )
     cluster.shutdown()
-    print("Esquema Scylla aplicado.")
+    print(f"Esquema Scylla aplicado (compaction: LCS em {len(_TABLES)} tabelas).")
 
 
 if __name__ == "__main__":

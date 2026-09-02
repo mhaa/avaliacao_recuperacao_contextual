@@ -128,11 +128,15 @@ class ValkeyAdapter(StorageAdapter):
         return await asyncio.to_thread(self._intersect_sync, user_id, context, limit)
 
     def _intersect_sync(self, user_id: int, context: list[int], limit: int) -> list[Candidate]:
-        tmp_key = f"tmp:intersect:{user_id}:{'-'.join(map(str, context))}"
+        # SINTER (não SINTERSTORE + SMEMBERS + DELETE): a interseção continua
+        # sendo feita DENTRO do banco — que é o que define E-4 — mas em um
+        # round-trip só e sem chave temporária. A versão anterior escrevia
+        # `tmp:intersect:{user_id}:{contextos}`, uma chave COMPARTILHADA por
+        # requisições concorrentes do mesmo (usuário, contexto): duas em voo
+        # ao mesmo tempo podiam ter uma deletando o que a outra ainda ia ler.
+        # Além da corrida, era escrita no caminho de leitura.
         keys = [f"candidates_set:{user_id}"] + [f"inverted:{c}" for c in context]
-        self._client.sinterstore(tmp_key, keys)
-        item_ids = list(self._client.smembers(tmp_key))
-        self._client.delete(tmp_key)
+        item_ids = list(self._client.sinter(keys))
         if not item_ids:
             return []
         scores = self._client.hmget(f"candidates:{user_id}", item_ids)

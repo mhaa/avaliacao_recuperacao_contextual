@@ -15,7 +15,14 @@ CREATE TABLE IF NOT EXISTS candidates (
     PRIMARY KEY (user_id, item_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_candidates_user_rank ON candidates (user_id, rank);
+-- INCLUDE (item_id, score): as consultas de storage/postgres.py que usam
+-- este índice (`get_candidates`, `get_candidates_filtered`, `intersect`)
+-- leem exatamente essas duas colunas além da chave — com elas no índice o
+-- plano vira index-only scan, evitando até N=500 buscas na heap por
+-- requisição. Neutro quanto à estratégia da célula: E-1/E-2/E-4 leem as
+-- mesmas colunas, nenhuma ganha vantagem sobre a outra.
+CREATE INDEX IF NOT EXISTS idx_candidates_user_rank
+    ON candidates (user_id, rank) INCLUDE (item_id, score);
 
 -- Pertença item -> contexto (dado de catálogo, C=20 contextos materializados
 -- por generator/contexts.py — ver data_generation/README.md).

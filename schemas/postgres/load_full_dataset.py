@@ -67,6 +67,20 @@ def main() -> None:
                     label="prematerialized",
                     interval=500_000,
                 )
+            # VACUUM ANALYZE (não só ANALYZE) depois do COPY em massa, por
+            # dois motivos distintos:
+            # - ANALYZE: sem estatística, o planner escolhe plano no escuro
+            #   até o autovacuum decidir analisar sozinho — o que pode
+            #   acontecer NO MEIO da bateria, trocando o plano na metade das
+            #   repetições.
+            # - VACUUM: preenche o mapa de visibilidade, que é o que permite
+            #   ao index-only scan PULAR a heap. Sem ele os índices covering
+            #   (INCLUDE em 001_schema.sql/002_prematerialized.sql) ainda
+            #   fazem Heap Fetches em toda linha e o INCLUDE não paga nada —
+            #   confirmado com EXPLAIN (ANALYZE, BUFFERS) numa base recém-
+            #   carregada.
+            print("Rodando VACUUM ANALYZE...", flush=True)
+            cur.execute("VACUUM ANALYZE candidates, item_contexts, prematerialized")
 
     print(
         f"Carregado: {len(candidates)} candidatos, {len(item_contexts)} pertences "

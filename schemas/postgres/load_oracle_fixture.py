@@ -39,6 +39,10 @@ def main() -> None:
                     ["user_id", "context_id", "item_id", "rank", "score"]
                 ).iter_rows():
                     copy.write_row(row)
+            # Mesma razão de schemas/postgres/load_full_dataset.py: ANALYZE
+            # pela estatística do planner, VACUUM pelo mapa de visibilidade
+            # (sem ele o index-only scan ainda toca a heap em toda linha).
+            cur.execute("VACUUM ANALYZE candidates, item_contexts, prematerialized")
 
     print(
         f"Carregado: {len(candidates)} candidatos, {len(item_contexts)} pertences "

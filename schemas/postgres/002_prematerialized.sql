@@ -12,4 +12,8 @@ CREATE TABLE IF NOT EXISTS prematerialized (
     PRIMARY KEY (user_id, context_id, item_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_prematerialized_lookup ON prematerialized (user_id, context_id, rank);
+-- INCLUDE (item_id, score): mesma razão de idx_candidates_user_rank em
+-- 001_schema.sql — `get_prematerialized` lê só essas duas colunas além da
+-- chave, então o índice cobre a consulta inteira (index-only scan).
+CREATE INDEX IF NOT EXISTS idx_prematerialized_lookup
+    ON prematerialized (user_id, context_id, rank) INCLUDE (item_id, score);
