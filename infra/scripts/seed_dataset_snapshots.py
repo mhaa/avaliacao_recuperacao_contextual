@@ -41,10 +41,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import time
 
 from infra.scripts.cloud_smoke_test import (
     _confirm_billable,
+    _resolve_cmd,
     _run,
     fetch_terraform_access_token,
     gcloud_ssh,
@@ -53,6 +56,18 @@ from infra.scripts.cloud_smoke_test import (
     wait_for_container,
 )
 from infra.scripts.run_measurement_battery import build_remote_setup_command, snapshot_exists
+
+# gcloud espera (poll) a operação de snapshot terminar antes de devolver —
+# mas o timeout de LEITURA do cliente (confirmado ao vivo: 300s,
+# HTTPSConnectionPool ReadTimeout) é mais curto que o tempo real de um
+# snapshot de 200 GB. Isso já causou o bug real que esta constante e
+# wait_for_snapshot_ready existem para corrigir: o cliente desistia e saía
+# com erro enquanto o SERVIDOR continuava criando o snapshot com sucesso —
+# e o script, confiando só no código de saída do gcloud, seguia direto para
+# o destroy do disco de origem achando que tinha falhado. Nunca confiar no
+# exit code do cliente para essa operação — só no `status` real, via poll.
+_SNAPSHOT_POLL_INTERVAL_S = 15
+_SNAPSHOT_POLL_TIMEOUT_S = 1800  # 30 min — folgado sobre os ~300s já vistos falhar.
 
 TF_DIR = "infra/envs/seed"
 VALID_STORAGES = ("postgres", "scylla", "opensearch")
@@ -87,6 +102,72 @@ def delete_existing_snapshot(project_id: str, snapshot_name: str) -> None:
             f"--project={project_id}",
             "--quiet",
         ]
+    )
+
+
+def _snapshot_status(project_id: str, snapshot_name: str) -> str:
+    """Status real do snapshot no SERVIDOR — "" se ainda não existe (o
+    objeto pode levar um instante para aparecer depois do comando de
+    criação retornar/falhar do lado do cliente). Nunca levanta: consulta
+    de leitura usada em loop de polling, uma falha transitória de rede
+    aqui não deve derrubar o polling inteiro."""
+    cmd = [
+        "gcloud",
+        "compute",
+        "snapshots",
+        "describe",
+        snapshot_name,
+        f"--project={project_id}",
+        "--format=value(status)",
+    ]
+    print(f"+ {' '.join(cmd)}")
+    result = subprocess.run(
+        _resolve_cmd(cmd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def wait_for_snapshot_ready(project_id: str, snapshot_name: str) -> None:
+    """Espera o snapshot chegar a READY consultando o SERVIDOR — nunca
+    confia no código de saída do `gcloud compute disks snapshot` que o
+    disparou, porque esse comando pode dar timeout de leitura no cliente
+    (confirmado ao vivo, ~300s, disco de 200 GB) enquanto a operação segue
+    e termina com sucesso no servidor. É essa distinção — cliente que
+    desistiu de esperar vs. servidor que realmente falhou — que decide se é
+    seguro destruir o disco de origem em seguida.
+
+    Levanta RuntimeError com uma mensagem acionável se o snapshot terminar
+    em estado de erro ou não chegar a READY dentro do timeout. Quem chama
+    ainda vai rodar o destroy da VM no `finally` (parar de cobrar é
+    prioridade mesmo com o snapshot em dúvida) — mas precisa saber, sem
+    ambiguidade, que os dados carregados NÃO estão preservados e a carga
+    completa precisa ser refeita.
+    """
+    deadline = time.monotonic() + _SNAPSHOT_POLL_TIMEOUT_S
+    last_status = ""
+    while time.monotonic() < deadline:
+        last_status = _snapshot_status(project_id, snapshot_name)
+        if last_status == "READY":
+            return
+        if last_status in ("FAILED", "DELETING"):
+            raise RuntimeError(
+                f"snapshot '{snapshot_name}' terminou em estado '{last_status}' no servidor "
+                "— não é um timeout de cliente, é falha real. Os dados carregados NÃO estão "
+                "preservados; a carga completa (schema + load_full_dataset.py) precisa ser "
+                "refeita antes de tentar o snapshot de novo."
+            )
+        time.sleep(_SNAPSHOT_POLL_INTERVAL_S)
+    status_desc = last_status if last_status else "inexistente"
+    raise RuntimeError(
+        f"snapshot '{snapshot_name}' não chegou a READY em {_SNAPSHOT_POLL_TIMEOUT_S}s de "
+        f"polling (último status visto: '{status_desc}'). Verifique manualmente com "
+        f"'gcloud compute snapshots describe {snapshot_name} --project={project_id}' antes "
+        "de assumir qualquer coisa sobre os dados."
     )
 
 
@@ -195,21 +276,36 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"\nCarga completa concluída em {database_instance}. Tirando snapshot do disco...")
         delete_existing_snapshot(args.project_id, snapshot_name)
-        _run(
-            [
-                "gcloud",
-                "compute",
-                "disks",
-                "snapshot",
-                data_disk_name,
-                f"--zone={args.zone}",
-                f"--project={args.project_id}",
-                f"--snapshot-names={snapshot_name}",
-            ]
-        )
+        try:
+            _run(
+                [
+                    "gcloud",
+                    "compute",
+                    "disks",
+                    "snapshot",
+                    data_disk_name,
+                    f"--zone={args.zone}",
+                    f"--project={args.project_id}",
+                    f"--snapshot-names={snapshot_name}",
+                ]
+            )
+        except subprocess.CalledProcessError as exc:
+            # Não relança ainda: o comando acima FAZ POLL da operação até
+            # terminar, então um erro aqui pode ser só o timeout de leitura
+            # do CLIENTE (visto ao vivo: ReadTimeout em ~300s contra um
+            # disco de 200 GB) com o SERVIDOR seguindo e terminando com
+            # sucesso. wait_for_snapshot_ready abaixo consulta o status real
+            # e decide — nunca o exit code sozinho.
+            print(
+                f"\nAVISO: 'gcloud compute disks snapshot' retornou erro no cliente "
+                f"({exc}) — isso pode ser só o cliente desistindo de esperar, não o "
+                "servidor falhando. Consultando o status real do snapshot..."
+            )
+        wait_for_snapshot_ready(args.project_id, snapshot_name)
         print(
-            f"\nSnapshot '{snapshot_name}' criado — run_measurement_battery.py vai usá-lo "
-            f"automaticamente em qualquer célula com storage={args.storage}."
+            f"\nSnapshot '{snapshot_name}' confirmado READY no servidor — "
+            f"run_measurement_battery.py vai usá-lo automaticamente em qualquer célula com "
+            f"storage={args.storage}."
         )
 
     finally:
