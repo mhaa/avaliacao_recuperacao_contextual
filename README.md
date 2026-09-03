@@ -8,6 +8,10 @@ e são 14 no total (4 estratégias x 4 bancos - 2 combinações inviáveis)
 
 O detalhes do experimento em [CONTEXTO.md](CONTEXTO.md), a fonte verdade do projeto.
 
+Expectativa de latência **antes** de medir — benchmarks públicos das 4
+tecnologias, orçamento de CPU de uma `n2-standard-8` e régua para separar
+"resultado da tecnologia" de "erro de configuração": [benchmark.md](benchmark.md).
+
 ## Fases do projeto em ordem de produção
 
 Desenvolvido em 3 fases representando as 3 camadas da aplicação:
@@ -1008,6 +1012,13 @@ python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 
 ```
 
 ### Fase 5 — Execução dos testes de carga e captura de resultados
+
+> **Antes de interpretar qualquer resultado, leia [benchmark.md](benchmark.md).**
+> Traz a expectativa de latência estimada célula a célula, os benchmarks
+> publicados das 4 tecnologias em volume comparável e a régua de diagnóstico
+> que separa saturação de latência real — incluindo por que o primeiro número
+> a olhar num `summary.json` é `throughput_rps` contra o `rate` do manifest, e
+> não o percentil.
 
 **0. Massa de dados completa — antes de qualquer bateria real**
 
