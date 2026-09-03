@@ -26,16 +26,27 @@
 import http from 'k6/http';
 import { check } from 'k6';
 import { SharedArray } from 'k6/data';
-import { Trend } from 'k6/metrics';
 import exec from 'k6/execution';
 import { sampleUserId } from './zipf.js';
 
-// Métrica customizada: analysis/collect.py junta isto com http_req_duration
-// pelo tag `request_id` para montar latencies.parquet (IMPLEMENTACAO.md,
-// "Coleta de resultados": "uma linha por requisição: timestamp, latência,
-// status, contagem de itens retornados") — o k6 não correlaciona métricas
-// por si só, então o join precisa de um id explícito e único por requisição.
-const returnedCount = new Trend('returned_count', false);
+// NÃO tagueie por requisição (nem aqui nem em params.tags abaixo). Cada
+// valor único de tag vira uma série temporal nova no motor de métricas do
+// k6 — confirmado ao vivo: com `request_id` único por requisição em
+// params.tags, uma bateria real (1000 req/s por 7min contínuos) gerou
+// centenas de milhares de séries ("could cause high memory usage", aviso do
+// próprio k6) e o processo k6 afundou sob o peso das próprias métricas,
+// produzindo p99 de 10-25s por requisição já ENFILEIRADA NO CLIENTE — não
+// no serviço nem na rede (validado isolando cada camada: servidor e rede
+// respondiam em ~1-2ms sob a mesma carga via requisições manuais). Endosso
+// oficial do k6 para correlação por requisição é logging estruturado, não
+// tags — https://github.com/grafana/k6/issues/2584 (suporte a tags de alta
+// cardinalidade não-indexadas é só uma proposta em aberto, não existe na
+// versão pinada aqui). Por isso returned_count e latência não são mais uma
+// métrica k6 (Trend) — viram uma linha JSON por requisição em
+// console.log(), capturada via `k6 run --console-output=<arquivo>` (nunca
+// stdout puro: 1000 linhas/s por minutos poluiria e arriscaria interleaving
+// no terminal). analysis/collect.py lê esse arquivo diretamente, sem
+// precisar juntar duas métricas por tag.
 
 const TARGET_URL = __ENV.TARGET_URL || 'http://localhost:8000/v1/recommendations';
 const CELL = __ENV.CELL || 'e1-postgres';
@@ -155,14 +166,25 @@ export default function () {
   });
   const params = {
     headers: { 'Content-Type': 'application/json' },
-    tags: { cell: CELL, transport: TRANSPORT, tier: SELECTIVITY_TIER, request_id: requestId },
+    tags: { cell: CELL, transport: TRANSPORT, tier: SELECTIVITY_TIER },
   };
+  // Cronometrado manualmente (não http_req_duration do k6): http.post() é
+  // síncrono dentro da iteração, então Date.now() antes/depois mede o
+  // mesmo round-trip fim-a-fim que o k6 mediria — a única diferença é
+  // incluir também http_req_blocked/connecting (setup de conexão), o que é
+  // MAIS fiel à latência percebida pelo cliente, não menos.
+  const t0 = Date.now();
   const res = http.post(TARGET_URL, payload, params);
+  const latencyMs = Date.now() - t0;
   check(res, { 'status is 200': (r) => r.status === 200 });
-  if (res.status === 200) {
-    returnedCount.add(res.json('returned_count'), {
+  console.log(
+    JSON.stringify({
       request_id: requestId,
       scenario: exec.scenario.name,
-    });
-  }
+      timestamp: new Date().toISOString(),
+      latency_ms: latencyMs,
+      status: res.status,
+      returned_count: res.status === 200 ? res.json('returned_count') : null,
+    })
+  );
 }

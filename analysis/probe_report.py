@@ -11,7 +11,7 @@ quebrou a sintaxe do `bash -c "..."` que o envolve quando entregue via
 `gcloud compute ssh --command=...`.
 
 Uso:
-    python analysis/probe_report.py /app/results/_saturation/e1-postgres/short-0-1000/k6-raw.json
+    python analysis/probe_report.py /app/results/_saturation/e1-postgres/short-0-1000/requests.ndjson
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from analysis.collect import build_summary, parse_k6_ndjson
+from analysis.collect import build_summary, parse_requests_ndjson
 
 PROBE_SCENARIOS = frozenset({"probe"})
 
@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("ndjson_path", type=Path)
     args = parser.parse_args(argv)
 
-    df = parse_k6_ndjson(args.ndjson_path, scenarios=PROBE_SCENARIOS)
+    df = parse_requests_ndjson(args.ndjson_path, scenarios=PROBE_SCENARIOS)
     summary = build_summary(df)
     violated = violated_slo(summary)
 

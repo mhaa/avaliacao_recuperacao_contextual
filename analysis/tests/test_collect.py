@@ -1,6 +1,6 @@
-"""Testa parse_k6_ndjson/build_summary contra um NDJSON sintético no mesmo
-formato observado numa execução real de load/scenarios.js (ver README.md,
-Etapa 7) — não depende de k6 nem de rede."""
+"""Testa parse_requests_ndjson/build_summary contra um NDJSON sintético no
+mesmo formato que load/scenarios.js escreve via console.log() por
+requisição (ver README.md, Etapa 7) — não depende de k6 nem de rede."""
 
 from __future__ import annotations
 
@@ -8,12 +8,21 @@ import json
 
 import polars as pl
 
-from analysis.collect import build_summary, parse_k6_ndjson
+from analysis.collect import build_summary, parse_requests_ndjson
 
 
-def _point(metric: str, time: str, value: float, tags: dict) -> str:
+def _request(
+    scenario: str, timestamp: str, latency_ms: float, status: int, returned_count: int | None
+) -> str:
     return json.dumps(
-        {"metric": metric, "type": "Point", "data": {"time": time, "value": value, "tags": tags}}
+        {
+            "request_id": "0-0",
+            "scenario": scenario,
+            "timestamp": timestamp,
+            "latency_ms": latency_ms,
+            "status": status,
+            "returned_count": returned_count,
+        }
     )
 
 
@@ -21,43 +30,16 @@ def _write_ndjson(path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def test_parse_k6_ndjson_keeps_only_measurement_scenario_points(tmp_path):
-    path = tmp_path / "k6-raw.json"
+def test_parse_requests_ndjson_keeps_only_measurement_scenario_lines(tmp_path):
+    path = tmp_path / "requests.ndjson"
     lines = [
-        _point(
-            "http_req_duration",
-            "2026-01-01T00:00:00.000Z",
-            999.0,
-            {"scenario": "warmup", "status": "200", "request_id": "0-0"},
-        ),
-        _point(
-            "http_req_duration",
-            "2026-01-01T00:02:00.000Z",
-            12.5,
-            {"scenario": "measurement", "status": "200", "request_id": "1-0"},
-        ),
-        _point(
-            "returned_count",
-            "2026-01-01T00:02:00.000Z",
-            20,
-            {"scenario": "measurement", "request_id": "1-0"},
-        ),
-        _point(
-            "http_req_duration",
-            "2026-01-01T00:02:01.000Z",
-            15.0,
-            {"scenario": "measurement", "status": "500", "request_id": "1-1"},
-        ),
-        _point(
-            "returned_count",
-            "2026-01-01T00:02:01.000Z",
-            3,
-            {"scenario": "measurement", "request_id": "1-1"},
-        ),
+        _request("warmup", "2026-01-01T00:00:00.000Z", 999.0, 200, 20),
+        _request("measurement", "2026-01-01T00:02:00.000Z", 12.5, 200, 20),
+        _request("measurement", "2026-01-01T00:02:01.000Z", 15.0, 500, 3),
     ]
     _write_ndjson(path, lines)
 
-    df = parse_k6_ndjson(path)
+    df = parse_requests_ndjson(path)
 
     assert df.height == 2
     assert set(df["status"].to_list()) == {200, 500}
@@ -66,20 +48,15 @@ def test_parse_k6_ndjson_keeps_only_measurement_scenario_points(tmp_path):
     assert row["returned_count"] == 20
 
 
-def test_parse_k6_ndjson_ignores_non_point_events(tmp_path):
-    path = tmp_path / "k6-raw.json"
+def test_parse_requests_ndjson_ignores_blank_lines(tmp_path):
+    path = tmp_path / "requests.ndjson"
     lines = [
-        json.dumps({"type": "Metric", "metric": "http_req_duration", "data": {}}),
-        _point(
-            "http_req_duration",
-            "2026-01-01T00:02:00.000Z",
-            10.0,
-            {"scenario": "measurement", "status": "200", "request_id": "1-0"},
-        ),
+        "",
+        _request("measurement", "2026-01-01T00:02:00.000Z", 10.0, 200, 20),
     ]
     _write_ndjson(path, lines)
 
-    df = parse_k6_ndjson(path)
+    df = parse_requests_ndjson(path)
     assert df.height == 1
 
 

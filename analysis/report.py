@@ -59,9 +59,13 @@ EQUIVALENCE_MARGIN_MS = 10.0
 
 
 def discover_rep_dirs(results_root: Path, phase: str) -> list[Path]:
+    # requests.ndjson, não k6-raw.json: é o arquivo que analysis/collect.py
+    # de fato lê agora (console.log de load/scenarios.js, uma linha por
+    # requisição) — k6-raw.json (saída nativa --out json= do k6) continua
+    # sendo gravado, mas nada mais o lê.
     return sorted(
         p.parent
-        for p in results_root.glob(f"*/{phase}/*/rep*/k6-raw.json")
+        for p in results_root.glob(f"*/{phase}/*/rep*/requests.ndjson")
     )
 
 

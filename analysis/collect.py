@@ -1,9 +1,9 @@
-"""Consolida a saída bruta de load/run_battery.py (k6-raw.json + manifest.json,
-um por repetição) no formato de resultados de IMPLEMENTACAO.md, "Coleta de
-resultados": latencies.parquet e summary.json. resources.csv (analysis/
-resources.py) e storage.json (analysis/storage_size.py) são coletados à
-parte — dependem de infraestrutura viva (containers/serviço no ar), não só
-do arquivo bruto do k6.
+"""Consolida a saída bruta de load/run_battery.py (requests.ndjson +
+manifest.json, um por repetição) no formato de resultados de
+IMPLEMENTACAO.md, "Coleta de resultados": latencies.parquet e summary.json.
+resources.csv (analysis/resources.py) e storage.json (analysis/
+storage_size.py) são coletados à parte — dependem de infraestrutura viva
+(containers/serviço no ar), não só do arquivo bruto do k6.
 
 Percentis são calculados aqui em Python (polars), não a partir do
 `handleSummary()` do k6: assim latencies.parquet e summary.json usam
@@ -37,19 +37,32 @@ MEASUREMENT_SCENARIOS = frozenset({"measurement"})
 PROBE_SCENARIOS = frozenset({"probe"})
 
 
-def parse_k6_ndjson(path: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS) -> pl.DataFrame:
+def parse_requests_ndjson(
+    path: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS
+) -> pl.DataFrame:
     """latencies.parquet: uma linha por requisição — timestamp, latência,
-    status, returned_count. Junta http_req_duration (built-in) e
-    returned_count (customizada, ver load/scenarios.js) pelo tag
-    `request_id` que as duas carregam.
+    status, returned_count. Lida direto de `path`, o arquivo que
+    load/scenarios.js escreve via console.log() por requisição (uma linha
+    JSON já com os 4 campos), capturado com `k6 run --console-output=path`.
+
+    Antes disso era um join de duas MÉTRICAS do k6 (http_req_duration +
+    a Trend customizada returned_count) pelo tag `request_id` — abandonado
+    porque tag com valor único por requisição faz o motor de métricas do k6
+    registrar uma série temporal nova a cada requisição, e uma bateria real
+    (1000 req/s por minutos contínuos) afundava o próprio processo k6 sob
+    essa cardinalidade (confirmado ao vivo: p99 de 10-25s medido pelo k6
+    enquanto o serviço e a rede respondiam em ~1-2ms sob a mesma carga
+    testada manualmente). O k6 não tem suporte estável a tag de alta
+    cardinalidade não-indexada (github.com/grafana/k6/issues/2584, ainda em
+    aberto) — logging estruturado em vez de tag é a recomendação oficial do
+    projeto para correlação por requisição.
 
     `scenarios` default é MEASUREMENT_SCENARIOS (uso normal — nunca conta
     `warmup`). infra/scripts/cloud_smoke_test.py passa
     `scenarios={"smoke"}` para o mesmo parser, sobre o cenário de smoke de
     load/scenarios.js — nunca o padrão, pra não haver risco de dado de
     smoke entrar em MEASUREMENT_SCENARIOS por engano."""
-    durations: list[dict] = []
-    returned_by_request: dict[str, int] = {}
+    rows: list[dict] = []
 
     with path.open() as f:
         for line in f:
@@ -57,36 +70,17 @@ def parse_k6_ndjson(path: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIO
             if not line:
                 continue
             event = json.loads(line)
-            if event.get("type") != "Point":
+            if event.get("scenario") not in scenarios:
                 continue
-            data = event["data"]
-            tags = data.get("tags") or {}
-            if tags.get("scenario") not in scenarios:
-                continue
+            rows.append(
+                {
+                    "timestamp": event["timestamp"],
+                    "latency_ms": float(event["latency_ms"]),
+                    "status": int(event["status"]),
+                    "returned_count": event["returned_count"],
+                }
+            )
 
-            if event["metric"] == "http_req_duration":
-                durations.append(
-                    {
-                        "timestamp": data["time"],
-                        "latency_ms": data["value"],
-                        "status": int(tags.get("status", 0)),
-                        "request_id": tags.get("request_id"),
-                    }
-                )
-            elif event["metric"] == "returned_count":
-                request_id = tags.get("request_id")
-                if request_id is not None:
-                    returned_by_request[request_id] = int(data["value"])
-
-    rows = [
-        {
-            "timestamp": d["timestamp"],
-            "latency_ms": d["latency_ms"],
-            "status": d["status"],
-            "returned_count": returned_by_request.get(d["request_id"]),
-        }
-        for d in durations
-    ]
     df = pl.DataFrame(
         rows,
         schema={
@@ -146,7 +140,7 @@ def build_summary(latencies_df: pl.DataFrame) -> dict:
 
 
 def collect(run_dir: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS) -> None:
-    latencies_df = parse_k6_ndjson(run_dir / "k6-raw.json", scenarios=scenarios)
+    latencies_df = parse_requests_ndjson(run_dir / "requests.ndjson", scenarios=scenarios)
     latencies_df.write_parquet(run_dir / "latencies.parquet")
 
     summary = build_summary(latencies_df)

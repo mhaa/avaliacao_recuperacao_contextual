@@ -99,12 +99,29 @@ def build_k6_cmd(
     selectivity_tier: str,
     smoke: bool,
 ) -> list[str]:
+    # requests.ndjson (não k6-raw.json): analysis/collect.py lê daqui — uma
+    # linha por requisição escrita por console.log() em load/scenarios.js,
+    # não mais um join de métricas do k6 por tag (ver o comentário no topo
+    # de load/scenarios.js sobre por que tag por requisição afundava o k6
+    # sob cardinalidade em bateria real). --out json=... continua sendo
+    # gravado (k6-raw.json) só como saída nativa de diagnóstico do k6 —
+    # nada mais o lê.
+    # Path(...): infra/scripts/run_measurement_battery.py:build_remote_probe_command
+    # passa json_out como string (mesma convenção usada em todo aquele
+    # arquivo), não Path — .with_name exige Path.
+    requests_out = Path(json_out).with_name("requests.ndjson")
     cmd = [
         "k6",
         "run",
         SCENARIOS_SCRIPT.as_posix(),
         "--out",
         f"json={json_out}",
+        f"--console-output={requests_out}",
+        # sem isso, --console-output grava cada console.log() envolto em
+        # `time="..." level=info msg="<json escapado>"` (formato logrus
+        # padrão do k6) em vez do JSON puro que analysis/collect.py espera
+        # uma linha por linha — confirmado ao vivo testando localmente.
+        "--log-format=raw",
         "-e",
         f"CELL={cell_id}",
         "-e",
@@ -138,12 +155,15 @@ def build_probe_k6_cmd(
     load/scenarios.js, sem RATE/K fixos de constant-arrival-rate normal
     (a duração/aquecimento vêm do algoritmo de busca, não de --repetitions/
     --phase)."""
+    requests_out = Path(json_out).with_name("requests.ndjson")
     return [
         "k6",
         "run",
         SCENARIOS_SCRIPT.as_posix(),
         "--out",
         f"json={json_out}",
+        f"--console-output={requests_out}",
+        "--log-format=raw",
         "-e",
         f"CELL={cell_id}",
         "-e",

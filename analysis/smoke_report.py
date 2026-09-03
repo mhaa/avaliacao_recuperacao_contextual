@@ -1,6 +1,6 @@
 """CLI fina que imprime um resumo de sanidade (p50/p95/p99, taxa de erro —
 NUNCA média, CLAUDE.md: "Never report mean latency") de um run de smoke
-test em nuvem, reusando parse_k6_ndjson()/build_summary() de
+test em nuvem, reusando parse_requests_ndjson()/build_summary() de
 analysis/collect.py.
 
 Existe como arquivo, não um `python -c "..."` embutido em
@@ -9,7 +9,7 @@ quebrava a sintaxe do `bash -c "..."` que o envolve quando executado
 remotamente via `gcloud compute ssh --command=...`.
 
 Uso:
-    python analysis/smoke_report.py /tmp/smoke-raw.json
+    python analysis/smoke_report.py /tmp/smoke-requests.ndjson
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from analysis.collect import build_summary, parse_k6_ndjson
+from analysis.collect import build_summary, parse_requests_ndjson
 
 SMOKE_SCENARIOS = frozenset({"smoke"})
 
@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("ndjson_path", type=Path)
     args = parser.parse_args(argv)
 
-    df = parse_k6_ndjson(args.ndjson_path, scenarios=SMOKE_SCENARIOS)
+    df = parse_requests_ndjson(args.ndjson_path, scenarios=SMOKE_SCENARIOS)
     summary = build_summary(df)
 
     print(f"smoke: {summary['request_count']} requisições")

@@ -331,7 +331,11 @@ def build_remote_probe_command(
     for rep in range(repetitions):
         rep_dir = f"/app/results/{remote_subdir}/rep{rep}"
         json_out = f"{rep_dir}/k6-raw.json"
-        ndjson_paths.append(json_out)
+        # requests.ndjson, não k6-raw.json: analysis/probe_report.py lê o
+        # NDJSON que load/scenarios.js escreve via console.log() por
+        # requisição (build_probe_k6_cmd deriva esse nome do mesmo
+        # json_out) — ver load/run_battery.py:build_probe_k6_cmd.
+        ndjson_paths.append(f"{rep_dir}/requests.ndjson")
         # k6 não cria o diretório de --out sozinho (diferente de
         # load/run_battery.py:run_k6, que faz out_dir.mkdir(parents=True)
         # em Python antes de chamar o k6) — confirmado ao vivo: "open
@@ -686,6 +690,14 @@ def upload_results_to_bucket(local_dir: Path, results_bucket: str, cell_id: str)
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Mesmo fix de cloud_smoke_test.py:main() — a codepage cp1252 do console
+    # do Windows não representa vários caracteres que aparecem na saída de
+    # k6 (o resumo padrão usa símbolos Unicode como checkmarks e barras de
+    # threshold). Aqui o risco é maior ainda: esta bateria roda por horas
+    # imprimindo saída de k6/docker/terraform repetidamente por célula.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cell")
     parser.add_argument("project_id")

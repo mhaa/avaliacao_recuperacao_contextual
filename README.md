@@ -456,7 +456,7 @@ não o contrário).
 
 `load/run_battery.py` embaralha a lista de células viáveis (seed logada) e
 roda `load/scenarios.js` N vezes por célula, salvando
-`results/<cell-id>/<phase>/<timestamp>/rep<N>/{manifest.json,k6-raw.json}` —
+`results/<cell-id>/<phase>/<timestamp>/rep<N>/{manifest.json,k6-raw.json,requests.ndjson}` —
 `cells/*.yaml` (exceto `_defaults.yaml`) já É a lista de 14 células viáveis,
 sem duplicar a checagem em nenhum outro lugar.
 
@@ -493,12 +493,25 @@ docker compose stop postgres service
 Consolida a saída bruta do k6 no formato de `results/` (IMPLEMENTACAO.md,
 "Coleta de resultados") e fornece a estatística exigida por CONTEXTO.md.
 
-`analysis/collect.py` lê `k6-raw.json` (NDJSON do `--out json=` do k6) e
-reconstrói `latencies.parquet` — uma linha por requisição, com timestamp,
-latência, status e `returned_count`. `returned_count` é uma métrica
-customizada (`Trend`) adicionada a `load/scenarios.js` nesta etapa,
-correlacionada com `http_req_duration` pelo tag `request_id` (o k6 não
-junta métricas sozinho). `summary.json` é calculado em Python a partir do
+`analysis/collect.py` lê `requests.ndjson` (não `k6-raw.json`) e reconstrói
+`latencies.parquet` — uma linha por requisição, com timestamp, latência,
+status e `returned_count`. `requests.ndjson` é escrito por
+`console.log()` dentro de `load/scenarios.js` (uma linha JSON já com os
+quatro campos, um por requisição), capturado via `k6 run
+--console-output=<arquivo> --log-format=raw`. Isso substituiu uma tentativa
+anterior — `returned_count` como métrica customizada (`Trend`) do k6,
+correlacionada com `http_req_duration` pelo tag `request_id` — que quebrou
+em produção: tag com valor único por requisição faz o motor de métricas do
+k6 registrar uma série temporal nova a cada requisição, e uma bateria real
+(1000 req/s por minutos contínuos) afundava o próprio processo k6 sob essa
+cardinalidade (p99 de 10-25s medido pelo k6 enquanto serviço e rede
+respondiam em ~1-2ms sob a mesma carga, testada manualmente isolando cada
+camada). O k6 não tem suporte estável a tag de alta cardinalidade
+não-indexada (github.com/grafana/k6/issues/2584, em aberto) — logging
+estruturado em vez de tag é a recomendação oficial do projeto para
+correlação por requisição. `k6-raw.json` (`--out json=`) continua sendo
+gravado como saída nativa de diagnóstico do k6, mas nada mais o lê.
+`summary.json` é calculado em Python a partir do
 mesmo `latencies.parquet` — não a partir do `handleSummary()` do k6 — para
 que percentis e o bootstrap de `analysis/stats.py` usem exatamente o mesmo
 método de quantil, sem duas implementações (uma em JS, outra em Python)
@@ -1168,7 +1181,8 @@ results/<cell>/<phase>/<timestamp>/
 ├── resources.csv            # só na confirmação — CPU/memória/rede das 3 VMs
 └── rep<N>/
     ├── manifest.json        # metadados legíveis: célula, taxa, seletividade, timestamp, commit
-    └── k6-raw.json           # dump bruto do k6 (uma linha JSON por métrica) — não é pra ler direto
+    ├── requests.ndjson      # uma linha JSON por requisição (console.log de load/scenarios.js) — o que analysis/collect.py lê
+    └── k6-raw.json           # dump bruto nativo do k6 (--out json=) — só diagnóstico, nada mais lê isso
 ```
 
 - **Leitura rápida de uma célula só**, sem processar nada: abra
@@ -1176,11 +1190,13 @@ results/<cell>/<phase>/<timestamp>/
   `generator_cpu_unmeasured` e a lista de sondagens, cada uma com
   `generator_cpu_percent` — `null` ali significa sem leitura, nunca 0%) e
   `rep<N>/manifest.json` diretamente — são JSON pequenos, dá pra ler no editor.
-- **`k6-raw.json` nunca deve ser lido à mão** — são milhares de linhas, uma
-  por métrica coletada pelo k6. É *insumo* de `analysis/collect.py`, que o
-  transforma em `latencies.parquet` (uma linha por requisição, com
-  percentis) — chamado automaticamente por `analysis/report.py` abaixo, não
-  precisa rodar `collect.py` na mão.
+- **`requests.ndjson` nunca deve ser lido à mão** — são centenas de milhares
+  de linhas numa bateria real, uma por requisição. É *insumo* de
+  `analysis/collect.py`, que o transforma em `latencies.parquet` (uma linha
+  por requisição, com percentis) — chamado automaticamente por
+  `analysis/report.py` abaixo, não precisa rodar `collect.py` na mão.
+  `k6-raw.json` é só a saída nativa de diagnóstico do próprio k6 — nada no
+  pipeline o lê.
 - **Resumo estatístico entre células** (o que realmente importa pro TCC —
   percentis, Kruskal-Wallis/Dunn, fronteira de Pareto): os comandos
   `analysis/report.py` já documentados acima, um para triagem e outro para

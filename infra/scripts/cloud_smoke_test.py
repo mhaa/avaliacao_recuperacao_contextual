@@ -420,9 +420,10 @@ def build_remote_smoke_script(
     steps.append("python load/export_contexts_by_tier.py")
     steps.append(
         f"SMOKE_MODE=true TARGET_URL=http://{service_ip}:8000/v1/recommendations "
-        f"CELL={cell_id} k6 run load/scenarios.js --out json=/tmp/smoke-raw.json"
+        f"CELL={cell_id} k6 run load/scenarios.js --out json=/tmp/smoke-raw.json "
+        "--console-output=/tmp/smoke-requests.ndjson --log-format=raw"
     )
-    steps.append("python analysis/smoke_report.py /tmp/smoke-raw.json")
+    steps.append("python analysis/smoke_report.py /tmp/smoke-requests.ndjson")
     inner = " && ".join(steps)
 
     docker_argv = ["docker", "run", "--rm", "--network", "host", "--entrypoint", "bash"]
@@ -443,6 +444,16 @@ def resource_snapshot(instance: str, zone: str, project_id: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A codepage padrão do console do Windows (cp1252) não representa vários
+    # caracteres que aparecem na saída de k6/docker/pytest vindos da VM Linux
+    # remota via SSH — confirmado ao vivo: print(result.stdout) do smoke test
+    # derrubou o script com UnicodeEncodeError DEPOIS do teste remoto já ter
+    # passado e da infraestrutura já ter sido destruída no finally, mascarando
+    # um resultado bom como falha. errors="replace" garante que nenhum print
+    # deste script derruba a execução por causa de um caractere isolado.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cell")
     parser.add_argument("project_id")

@@ -19,9 +19,16 @@ from analysis.report import (
 )
 
 
-def _point(metric: str, time: str, value: float, tags: dict) -> str:
+def _request_line(scenario: str, time: str, latency_ms: float, status: int, request_id: str) -> str:
     return json.dumps(
-        {"metric": metric, "type": "Point", "data": {"time": time, "value": value, "tags": tags}}
+        {
+            "request_id": request_id,
+            "scenario": scenario,
+            "timestamp": time,
+            "latency_ms": latency_ms,
+            "status": status,
+            "returned_count": 20,
+        }
     )
 
 
@@ -31,18 +38,8 @@ def _write_fake_run(rep_dir, latencies: list[float]) -> None:
     for i, latency in enumerate(latencies):
         request_id = f"{i}-0"
         time = f"2026-01-01T00:02:{i % 60:02d}.000Z"
-        lines.append(
-            _point(
-                "http_req_duration",
-                time,
-                latency,
-                {"scenario": "measurement", "status": "200", "request_id": request_id},
-            )
-        )
-        lines.append(
-            _point("returned_count", time, 20, {"scenario": "measurement", "request_id": request_id})
-        )
-    (rep_dir / "k6-raw.json").write_text("\n".join(lines) + "\n")
+        lines.append(_request_line("measurement", time, latency, 200, request_id))
+    (rep_dir / "requests.ndjson").write_text("\n".join(lines) + "\n")
 
 
 def _build_fake_results(tmp_path, phase="triagem"):
