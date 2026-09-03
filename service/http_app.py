@@ -56,11 +56,18 @@ async def _lifespan(app: FastAPI):
     asyncio.get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=_TO_THREAD_MAX_WORKERS)
     )
+    # Carga de montagem (hoje: o catálogo item->contexto de E-1/E-3) — aqui,
+    # e não em create_app, porque exige um event loop rodando e porque cada
+    # worker Hypercorn se monta sozinho (multiprocessing "spawn"): cada um
+    # carrega a própria cópia do catálogo, ~20-40 MB numa VM de 16 GB.
+    await app.state.strategy.prepare(app.state.storage)
     yield
 
 
 def create_app(strategy: Strategy, storage: StorageAdapter) -> FastAPI:
     app = FastAPI(lifespan=_lifespan)
+    app.state.strategy = strategy
+    app.state.storage = storage
 
     @app.post("/v1/recommendations", response_model=Response)
     async def recommendations(req: Request) -> Response:

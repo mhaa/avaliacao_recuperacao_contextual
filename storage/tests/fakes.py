@@ -13,6 +13,7 @@ from storage.base import (
     GET_CANDIDATES_FILTERED,
     GET_PREMATERIALIZED,
     INTERSECT,
+    LOAD_ITEM_CONTEXTS,
     StorageAdapter,
 )
 
@@ -20,7 +21,13 @@ from storage.base import (
 class FakeStorageAdapter(StorageAdapter):
     name = "fake"
     supported_primitives = frozenset(
-        {GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED, INTERSECT}
+        {
+            GET_CANDIDATES,
+            GET_CANDIDATES_FILTERED,
+            GET_PREMATERIALIZED,
+            INTERSECT,
+            LOAD_ITEM_CONTEXTS,
+        }
     )
 
     def __init__(
@@ -28,10 +35,15 @@ class FakeStorageAdapter(StorageAdapter):
         candidates_by_user: dict[int, list[Candidate]] | None = None,
         prematerialized: dict[tuple[int, str], list[Candidate]] | None = None,
         inverted_lists: dict[int, frozenset[int]] | None = None,
+        item_contexts: dict[int, frozenset[int]] | None = None,
     ):
         self._candidates_by_user = candidates_by_user or {}
         self._prematerialized = prematerialized or {}
         self._inverted_lists = inverted_lists or {}
+        # Pertença item->contexto: desde que `Candidate` deixou de carregar
+        # `context_ids`, é daqui que sai tanto o filtro server-side simulado
+        # (get_candidates_filtered) quanto o catálogo que E-1/E-3 carregam.
+        self._item_contexts = item_contexts or {}
         self.calls: list[tuple[str, tuple]] = []
 
     async def get_candidates(self, user_id: int) -> list[Candidate]:
@@ -44,7 +56,9 @@ class FakeStorageAdapter(StorageAdapter):
         if not context:
             return list(candidates)
         wanted = frozenset(context)
-        return [c for c in candidates if wanted <= c.context_ids]
+        return [
+            c for c in candidates if wanted <= self._item_contexts.get(c.item_id, frozenset())
+        ]
 
     async def get_prematerialized(self, user_id: int, context_key: str) -> list[Candidate]:
         self.calls.append((GET_PREMATERIALIZED, (user_id, context_key)))
@@ -59,3 +73,18 @@ class FakeStorageAdapter(StorageAdapter):
             wanted = items if wanted is None else (wanted & items)
         wanted = wanted or frozenset()
         return [c for c in candidates if c.item_id in wanted][:limit]
+
+    async def load_item_contexts(self) -> dict[int, frozenset[int]]:
+        self.calls.append((LOAD_ITEM_CONTEXTS, ()))
+        return dict(self._item_contexts)
+
+
+async def prepared(strategy, storage: FakeStorageAdapter):
+    """Faz a carga de montagem da estratégia e zera `storage.calls`, para que
+    as asserções sobre quais primitivas foram chamadas falem só do caminho de
+    REQUISIÇÃO — `load_item_contexts` acontece uma vez na montagem e não deve
+    poluir essa contagem.
+    """
+    await strategy.prepare(storage)
+    storage.calls.clear()
+    return strategy

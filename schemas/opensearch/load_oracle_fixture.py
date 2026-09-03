@@ -18,12 +18,31 @@ from harness import fixtures
 
 HOSTS = [os.environ.get("TEST_OPENSEARCH_HOST", "http://opensearch:9200")]
 INDEX = "candidates"
+CATALOG_INDEX = "item_contexts"
+
+
+def _catalog_actions(context_ids_by_item: dict[int, list[int]]):
+    """Documentos do índice de catálogo (um por item), com _id = item_id
+    para a recarga ser idempotente sem duplicar."""
+    for item_id, context_ids in context_ids_by_item.items():
+        yield {
+            "_index": CATALOG_INDEX,
+            "_id": str(item_id),
+            "_source": {"item_id": item_id, "context_ids": context_ids},
+        }
+
 
 
 def main() -> None:
-    client = OpenSearch(hosts=HOSTS, use_ssl=False, verify_certs=False)
+    # timeout=60, não o default de 10s: os delete_by_query abaixo varrem os
+    # índices inteiros e legitimamente passam de 10s quando já havia carga
+    # anterior — mesmo motivo já documentado em load_full_dataset.py.
+    client = OpenSearch(hosts=HOSTS, use_ssl=False, verify_certs=False, timeout=60)
     client.delete_by_query(
         index=INDEX, body={"query": {"match_all": {}}}, conflicts="proceed", refresh=True
+    )
+    client.delete_by_query(
+        index=CATALOG_INDEX, body={"query": {"match_all": {}}}, conflicts="proceed", refresh=True
     )
 
     user_ids = fixtures.needed_user_ids()
@@ -50,11 +69,15 @@ def main() -> None:
             }
 
     success, _errors = bulk(client, _actions(), chunk_size=2000)
+    catalog_success, _catalog_errors = bulk(
+        client, _catalog_actions(context_ids_by_item), chunk_size=2000
+    )
     client.indices.refresh(index=INDEX)
+    client.indices.refresh(index=CATALOG_INDEX)
 
     print(
-        f"Carregado: {success} documentos indexados, {len(user_ids)} usuários "
-        "referenciados pelo oráculo"
+        f"Carregado: {success} documentos indexados, {catalog_success} itens de "
+        f"catálogo, {len(user_ids)} usuários referenciados pelo oráculo"
     )
 
 

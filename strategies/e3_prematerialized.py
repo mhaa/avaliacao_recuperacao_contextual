@@ -16,20 +16,39 @@ Isso é esperado virar um resultado citável do TCC (E-3 é rápido para
 contexto único, mas não tem vantagem em contexto composto), não um bug.
 
 Por isso `required_primitives` inclui `get_candidates` além de
-`get_prematerialized`.
+`get_prematerialized` — e, desde a adoção do catálogo em memória, também
+`load_item_contexts`: esse caminho de fallback avalia o predicado na
+aplicação exatamente como E-1, contra `core/catalog.py` (ver CONTEXTO.md,
+"Catálogo item->contexto residente na aplicação"). Requisição de contexto
+único e requisição sem contexto não tocam o catálogo.
 """
 
 from __future__ import annotations
 
+from core.catalog import ItemCatalog
 from core.contract import Request, Response, build_response
 from core.ordering import rank_candidates
 from core.session import apply_exclusion
-from storage.base import GET_CANDIDATES, GET_PREMATERIALIZED, StorageAdapter
+from storage.base import (
+    GET_CANDIDATES,
+    GET_PREMATERIALIZED,
+    LOAD_ITEM_CONTEXTS,
+    StorageAdapter,
+)
 
 
 class E3Prematerialized:
     name = "e3_prematerialized"
-    required_primitives = frozenset({GET_PREMATERIALIZED, GET_CANDIDATES})
+    required_primitives = frozenset(
+        {GET_PREMATERIALIZED, GET_CANDIDATES, LOAD_ITEM_CONTEXTS}
+    )
+
+    def __init__(self, catalog: ItemCatalog | None = None):
+        self._catalog = catalog
+
+    async def prepare(self, storage: StorageAdapter) -> None:
+        if self._catalog is None:
+            self._catalog = ItemCatalog(await storage.load_item_contexts())
 
     async def retrieve(self, storage: StorageAdapter, req: Request) -> Response:
         if len(req.context) == 1:
@@ -37,9 +56,12 @@ class E3Prematerialized:
         elif not req.context:
             candidates = await storage.get_candidates(req.user_id)
         else:
+            if self._catalog is None:
+                raise RuntimeError(
+                    "E3Prematerialized.prepare() não foi chamada antes de retrieve()"
+                )
             candidates = await storage.get_candidates(req.user_id)
-            wanted = frozenset(req.context)
-            candidates = [c for c in candidates if wanted <= c.context_ids]
+            candidates = self._catalog.filter(candidates, req.context)
         candidates = apply_exclusion(candidates, req.exclude)
         ranked = rank_candidates(candidates)
         return build_response(ranked, req.k)

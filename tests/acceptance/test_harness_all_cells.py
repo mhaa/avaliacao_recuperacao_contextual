@@ -20,6 +20,7 @@ import pytest
 
 from core.config import load_cell_config
 from core.registry import build_storage, build_strategy
+from strategies.base import build_cell_runtime
 from harness.oracle import load_oracle_cases
 from harness.verify import format_report, verify_cell
 
@@ -48,6 +49,7 @@ async def test_cell_matches_oracle(cell_id):
     config = load_cell_config(cell_id)
     strategy = build_strategy(config)
     storage = build_storage(config)
+    await build_cell_runtime(strategy, storage)
     cases = load_oracle_cases()
     report = await verify_cell(strategy, storage, cases)
     assert report.all_passed, format_report(report, cell_id)

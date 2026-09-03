@@ -24,6 +24,11 @@ class E4Intersection:
     name = "e4_intersection"
     required_primitives = frozenset({INTERSECT})
 
+    async def prepare(self, storage: StorageAdapter) -> None:
+        """Nada a carregar: o predicado é resolvido dentro do banco, então
+        esta estratégia não precisa do catálogo item->contexto em memória."""
+        return None
+
     async def retrieve(self, storage: StorageAdapter, req: Request) -> Response:
         candidates = await storage.intersect(req.user_id, req.context, _N_CANDIDATES)
         candidates = apply_exclusion(candidates, req.exclude)

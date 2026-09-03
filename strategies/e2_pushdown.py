@@ -15,6 +15,11 @@ class E2Pushdown:
     name = "e2_pushdown"
     required_primitives = frozenset({GET_CANDIDATES_FILTERED})
 
+    async def prepare(self, storage: StorageAdapter) -> None:
+        """Nada a carregar: o predicado é resolvido dentro do banco, então
+        esta estratégia não precisa do catálogo item->contexto em memória."""
+        return None
+
     async def retrieve(self, storage: StorageAdapter, req: Request) -> Response:
         candidates = await storage.get_candidates_filtered(req.user_id, req.context)
         candidates = apply_exclusion(candidates, req.exclude)

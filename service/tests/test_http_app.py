@@ -19,11 +19,13 @@ def test_recommendations_endpoint_returns_exact_contract_shape():
         candidates_by_user={1: [_candidate(1, 3.0), _candidate(2, 1.0)]}
     )
     app = create_app(E1AppFilter(), storage)
-    client = TestClient(app)
-
-    resp = client.post(
-        "/v1/recommendations", json={"user_id": 1, "context": [], "exclude": [], "k": 20}
-    )
+    # `with`, não TestClient(app) solto: só o context manager dispara o
+    # lifespan, que é onde a carga de montagem da célula acontece
+    # (service/http_app.py:_lifespan).
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/recommendations", json={"user_id": 1, "context": [], "exclude": [], "k": 20}
+        )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -36,12 +38,11 @@ def test_recommendations_endpoint_returns_exact_contract_shape():
 def test_recommendations_endpoint_rejects_unknown_request_field():
     storage = FakeStorageAdapter(candidates_by_user={1: [_candidate(1, 1.0)]})
     app = create_app(E1AppFilter(), storage)
-    client = TestClient(app)
-
-    resp = client.post(
-        "/v1/recommendations",
-        json={"user_id": 1, "context": [], "exclude": [], "k": 20, "extra_field": True},
-    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/recommendations",
+            json={"user_id": 1, "context": [], "exclude": [], "k": 20, "extra_field": True},
+        )
 
     assert resp.status_code == 422
 
@@ -50,11 +51,10 @@ def test_k20_response_payload_within_byte_budget():
     candidates = [_candidate(i, 1.0 - i * 0.001) for i in range(20)]
     storage = FakeStorageAdapter(candidates_by_user={1: candidates})
     app = create_app(E1AppFilter(), storage)
-    client = TestClient(app)
-
-    resp = client.post(
-        "/v1/recommendations", json={"user_id": 1, "context": [], "exclude": [], "k": 20}
-    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/recommendations", json={"user_id": 1, "context": [], "exclude": [], "k": 20}
+        )
 
     payload_size = len(json.dumps(resp.json()).encode("utf-8"))
     assert payload_size <= RESPONSE_BYTE_BUDGET + 200  # HTTP/JSON tem overhead sobre o núcleo

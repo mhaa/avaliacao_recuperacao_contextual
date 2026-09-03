@@ -7,7 +7,16 @@ comportamento padrão da classe base levanta `PrimitiveNotSupported`, e
 `supported_primitives` não inclui essa primitiva.
 
 Índice "candidates": um documento por (user_id, item_id), com context_ids
-como campo numérico multi-valor. `get_candidates_filtered` usa uma bool
+como campo numérico multi-valor (desnormalizado na carga — é o que a query
+`term` de E-2 resolve nativamente).
+
+Índice "item_contexts": um documento por item (~87.585), lido em MASSA uma
+única vez na montagem da célula (`load_item_contexts`) para o catálogo em
+memória de `core/catalog.py`. Existe porque E-1 passou a filtrar contra
+esse catálogo em vez de receber `context_ids` no caminho quente, e
+reconstruir a pertença varrendo os ~100M documentos de `candidates` seria
+inviável. Ver CONTEXTO.md, "Catálogo item->contexto residente na
+aplicação". `get_candidates_filtered` usa uma bool
 query com uma cláusula `term` por context_id pedido (AND via múltiplas
 cláusulas `must`) — exatamente a semântica que o índice invertido do Lucene
 resolve nativamente, sem workaround (E-2 "nativo" por CONTEXTO.md).
@@ -25,15 +34,28 @@ from opensearchpy import OpenSearch
 
 from core.contract import Candidate
 
-from .base import GET_CANDIDATES, GET_CANDIDATES_FILTERED, INTERSECT, StorageAdapter
+from .base import (
+    GET_CANDIDATES,
+    GET_CANDIDATES_FILTERED,
+    INTERSECT,
+    LOAD_ITEM_CONTEXTS,
+    StorageAdapter,
+)
 
 INDEX = "candidates"
+CATALOG_INDEX = "item_contexts"
 _N_CANDIDATES = 500
+# Página da varredura do catálogo. 10.000 é o teto default de `size` do
+# OpenSearch (index.max_result_window) — com ~87.585 itens dá ~9 páginas,
+# uma única vez na subida do serviço.
+_CATALOG_PAGE_SIZE = 10_000
 
 
 class OpenSearchAdapter(StorageAdapter):
     name = "opensearch"
-    supported_primitives = frozenset({GET_CANDIDATES, GET_CANDIDATES_FILTERED, INTERSECT})
+    supported_primitives = frozenset(
+        {GET_CANDIDATES, GET_CANDIDATES_FILTERED, INTERSECT, LOAD_ITEM_CONTEXTS}
+    )
 
     def __init__(self, hosts: list[str]):
         self._client = OpenSearch(hosts=hosts, use_ssl=False, verify_certs=False)
@@ -65,14 +87,37 @@ class OpenSearchAdapter(StorageAdapter):
             "query": {"bool": {"filter": filters}},
             "size": size,
             "track_total_hits": False,
-            "_source": ["item_id", "score", "context_ids"],
+            "_source": ["item_id", "score"],
         }
         response = self._client.search(index=INDEX, body=body)
         return [
-            Candidate(
-                item_id=hit["_source"]["item_id"],
-                score=hit["_source"]["score"],
-                context_ids=frozenset(hit["_source"].get("context_ids", [])),
-            )
+            Candidate(item_id=hit["_source"]["item_id"], score=hit["_source"]["score"])
             for hit in response["hits"]["hits"]
         ]
+
+    async def load_item_contexts(self) -> dict[int, frozenset[int]]:
+        return await asyncio.to_thread(self._load_item_contexts_sync)
+
+    def _load_item_contexts_sync(self) -> dict[int, frozenset[int]]:
+        # search_after sobre item_id (não `from`/`size` paginado, que fica
+        # O(n²), nem scroll, que segura um contexto de busca aberto no
+        # servidor). Uma vez só, na montagem da célula.
+        catalog: dict[int, frozenset[int]] = {}
+        search_after: list | None = None
+        while True:
+            body: dict = {
+                "query": {"match_all": {}},
+                "size": _CATALOG_PAGE_SIZE,
+                "sort": [{"item_id": "asc"}],
+                "track_total_hits": False,
+                "_source": ["item_id", "context_ids"],
+            }
+            if search_after is not None:
+                body["search_after"] = search_after
+            hits = self._client.search(index=CATALOG_INDEX, body=body)["hits"]["hits"]
+            if not hits:
+                return catalog
+            for hit in hits:
+                source = hit["_source"]
+                catalog[source["item_id"]] = frozenset(source.get("context_ids", []))
+            search_after = hits[-1]["sort"]

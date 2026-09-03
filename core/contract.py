@@ -17,16 +17,19 @@ class Candidate(BaseModel):
     """Candidato tal como circula entre storage/ e strategies/ — nunca vai
     para a rede diretamente (ver `ResponseItem`, que é o que sai no wire).
 
-    `context_ids` é a pertença do item aos contextos do catálogo (dado de
-    catálogo, não por usuário) — necessária para E-1 avaliar o predicado no
-    processo do serviço sem depender do banco para isso.
+    Carrega SÓ `(item_id, score)`. A pertença do item aos contextos não vem
+    daqui: é dado de catálogo, estático e O(itens), carregado uma vez na
+    montagem da célula e consultado em memória (`core/catalog.py`). Antes
+    ela viajava neste modelo, e reconstruí-la por requisição custava 501
+    comandos no Valkey e 501 consultas CQL no ScyllaDB — fazendo a linha
+    E-1 da matriz medir o modelo de dados do adaptador em vez da tecnologia
+    (CONTEXTO.md, "Catálogo item->contexto residente na aplicação").
     """
 
     model_config = ConfigDict(extra="forbid")
 
     item_id: int
     score: float
-    context_ids: frozenset[int] = frozenset()
 
 
 class Request(BaseModel):

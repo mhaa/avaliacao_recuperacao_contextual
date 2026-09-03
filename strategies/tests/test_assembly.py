@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from storage.base import GET_CANDIDATES, PrimitiveNotSupported
+from storage.base import GET_CANDIDATES, LOAD_ITEM_CONTEXTS, PrimitiveNotSupported
 from storage.tests.fakes import FakeStorageAdapter
 from strategies.base import check_compatibility
 from strategies.e1_app_filter import E1AppFilter
@@ -10,7 +10,7 @@ from strategies.e1_app_filter import E1AppFilter
 
 class _MinimalFake(FakeStorageAdapter):
     name = "fake-minimal"
-    supported_primitives = frozenset({GET_CANDIDATES})
+    supported_primitives = frozenset({GET_CANDIDATES, LOAD_ITEM_CONTEXTS})
 
 
 class _NoPrimitivesFake(FakeStorageAdapter):
@@ -18,7 +18,7 @@ class _NoPrimitivesFake(FakeStorageAdapter):
     supported_primitives = frozenset()
 
 
-def test_e1_assembles_with_adapter_that_only_supports_get_candidates():
+def test_e1_assembles_with_adapter_supporting_only_what_it_requires():
     check_compatibility(E1AppFilter(), _MinimalFake())  # não deve levantar
 
 

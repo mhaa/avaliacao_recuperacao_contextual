@@ -13,12 +13,25 @@ from __future__ import annotations
 import os
 
 from opensearchpy import OpenSearch
-from opensearchpy.helpers import parallel_bulk
+from opensearchpy.helpers import bulk, parallel_bulk
 
 from harness import fixtures
 
 HOSTS = [os.environ.get("TEST_OPENSEARCH_HOST", "http://opensearch:9200")]
 INDEX = "candidates"
+CATALOG_INDEX = "item_contexts"
+
+
+def _catalog_actions(context_ids_by_item: dict[int, list[int]]):
+    """Documentos do índice de catálogo (um por item), com _id = item_id
+    para a recarga ser idempotente sem duplicar."""
+    for item_id, context_ids in context_ids_by_item.items():
+        yield {
+            "_index": CATALOG_INDEX,
+            "_id": str(item_id),
+            "_source": {"item_id": item_id, "context_ids": context_ids},
+        }
+
 
 # Lotes em paralelo via parallel_bulk (thread pool no cliente), não bulk()
 # sequencial — bulk() espera a resposta de um lote antes de mandar o
@@ -40,6 +53,9 @@ def main() -> None:
     client = OpenSearch(hosts=HOSTS, use_ssl=False, verify_certs=False, timeout=60)
     client.delete_by_query(
         index=INDEX, body={"query": {"match_all": {}}}, conflicts="proceed", refresh=True
+    )
+    client.delete_by_query(
+        index=CATALOG_INDEX, body={"query": {"match_all": {}}}, conflicts="proceed", refresh=True
     )
 
     # Desliga refresh automático (default 1s) durante a carga — cada
@@ -85,10 +101,20 @@ def main() -> None:
         if ok:
             success += 1
 
+    # Catálogo: bulk() sequencial basta — ~87.585 documentos minúsculos,
+    # irrelevante perto dos ~100M de candidatos acima.
+    catalog_success, _catalog_errors = bulk(
+        client, _catalog_actions(context_ids_by_item), chunk_size=_CHUNK_SIZE
+    )
+
     client.indices.put_settings(index=INDEX, body={"index": {"refresh_interval": "1s"}})
     client.indices.refresh(index=INDEX)
+    client.indices.refresh(index=CATALOG_INDEX)
 
-    print(f"Carregado: {success} documentos indexados (base completa)")
+    print(
+        f"Carregado: {success} documentos indexados, {catalog_success} itens de "
+        "catálogo (base completa)"
+    )
 
 
 if __name__ == "__main__":

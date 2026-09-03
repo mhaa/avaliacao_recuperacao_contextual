@@ -43,6 +43,11 @@ class RecommendationServicer(recommendation_pb2_grpc.RecommendationServicer):
 
 
 async def _serve_async(strategy: Strategy, storage: StorageAdapter, host: str, port: int) -> None:
+    # Carga de montagem (catálogo item->contexto de E-1/E-3) antes de o
+    # servidor aceitar a primeira requisição. Aqui, e não em service/main.py,
+    # porque é este o dono do event loop — o HTTP faz o equivalente no
+    # lifespan de cada worker Hypercorn (service/http_app.py).
+    await strategy.prepare(storage)
     server = grpc.aio.server()
     recommendation_pb2_grpc.add_RecommendationServicer_to_server(
         RecommendationServicer(strategy, storage), server

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from core.contract import Candidate, Request
-from storage.base import GET_CANDIDATES, GET_PREMATERIALIZED
-from storage.tests.fakes import FakeStorageAdapter
+from storage.base import GET_CANDIDATES, GET_PREMATERIALIZED, LOAD_ITEM_CONTEXTS
+from storage.tests.fakes import FakeStorageAdapter, prepared
 from strategies.e3_prematerialized import E3Prematerialized
 
 
-def _candidate(item_id, score, context_ids=()):
-    return Candidate(item_id=item_id, score=score, context_ids=frozenset(context_ids))
+def _candidate(item_id, score):
+    return Candidate(item_id=item_id, score=score)
 
 
-def test_required_primitives_includes_prematerialized_and_get_candidates():
+def test_required_primitives_includes_prematerialized_get_candidates_and_catalog():
+    """O caminho de fallback de contexto composto filtra na aplicação, contra
+    o catálogo em memória — daí `load_item_contexts` também ser exigida."""
     assert E3Prematerialized.required_primitives == frozenset(
-        {GET_PREMATERIALIZED, GET_CANDIDATES}
+        {GET_PREMATERIALIZED, GET_CANDIDATES, LOAD_ITEM_CONTEXTS}
     )
 
 
@@ -20,8 +22,9 @@ async def test_single_context_uses_prematerialized_primitive_only():
     storage = FakeStorageAdapter(
         prematerialized={(1, "5"): [_candidate(10, 9.0), _candidate(20, 8.0)]}
     )
+    strategy = await prepared(E3Prematerialized(), storage)
     req = Request(user_id=1, context=[5], exclude=[], k=20)
-    response = await E3Prematerialized().retrieve(storage, req)
+    response = await strategy.retrieve(storage, req)
     assert {call[0] for call in storage.calls} == {GET_PREMATERIALIZED}
     assert [item.item_id for item in response.items] == [10, 20]
 
@@ -33,22 +36,22 @@ async def test_composed_context_falls_back_to_get_candidates_and_filters_in_app(
     context_id (ver docstring de strategies/e3_prematerialized.py)."""
     storage = FakeStorageAdapter(
         candidates_by_user={
-            1: [
-                _candidate(10, 5.0, context_ids=[5]),
-                _candidate(20, 4.0, context_ids=[5, 8]),
-            ]
-        }
+            1: [_candidate(10, 5.0), _candidate(20, 4.0)]
+        },
+        item_contexts={10: frozenset({5}), 20: frozenset({5, 8})},
     )
+    strategy = await prepared(E3Prematerialized(), storage)
     req = Request(user_id=1, context=[5, 8], exclude=[], k=20)
-    response = await E3Prematerialized().retrieve(storage, req)
+    response = await strategy.retrieve(storage, req)
     assert {call[0] for call in storage.calls} == {GET_CANDIDATES}
     assert [item.item_id for item in response.items] == [20]
 
 
 async def test_empty_context_falls_back_to_get_candidates():
     storage = FakeStorageAdapter(candidates_by_user={1: [_candidate(10, 5.0)]})
+    strategy = await prepared(E3Prematerialized(), storage)
     req = Request(user_id=1, context=[], exclude=[], k=20)
-    response = await E3Prematerialized().retrieve(storage, req)
+    response = await strategy.retrieve(storage, req)
     assert {call[0] for call in storage.calls} == {GET_CANDIDATES}
     assert [item.item_id for item in response.items] == [10]
 
@@ -60,8 +63,9 @@ async def test_exclusion_never_reaches_prematerialized_primitive_call():
     storage = FakeStorageAdapter(
         prematerialized={(1, "5"): [_candidate(10, 9.0), _candidate(20, 8.0)]}
     )
+    strategy = await prepared(E3Prematerialized(), storage)
     req = Request(user_id=1, context=[5], exclude=[10], k=20)
-    response = await E3Prematerialized().retrieve(storage, req)
+    response = await strategy.retrieve(storage, req)
 
     ((primitive, call_args),) = storage.calls
     assert primitive == GET_PREMATERIALIZED

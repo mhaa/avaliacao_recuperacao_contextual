@@ -61,15 +61,17 @@ aplicação) sobre Postgres (BD-1).
 
 `storage/base.py` define as primitivas que
 cada banco pode ou não oferecer (`get_candidates`, `get_candidates_filtered`,
-`get_prematerialized`, `intersect`) — um adaptador que não suporta uma
-primitiva falha na **montagem** da célula, nunca em tempo de requisição.
+`get_prematerialized`, `intersect`, `load_item_contexts`) — um adaptador que
+não suporta uma primitiva falha na **montagem** da célula, nunca em tempo de
+requisição. `load_item_contexts` é a única primitiva de **carga**, não de
+requisição: roda uma vez em `Strategy.prepare`, jamais no caminho quente.
 
 `storage/postgres.py` implementa `get_candidates`/`get_candidates_filtered`
 via `psycopg` (assíncrono); 
 
 `storage/tests/fakes.py` traz um adaptador fake
-em memória com as 4 primitivas, usado pelos testes de estratégia sem precisar
-de banco algum. O esquema mínimo do Postgres está em
+em memória com todas as primitivas, usado pelos testes de estratégia sem
+precisar de banco algum. O esquema mínimo do Postgres está em
 [`schemas/postgres/`](schemas/postgres/).
 
 Como rodar:
@@ -185,7 +187,7 @@ parquets de novo.
 
 #### Etapa 5 — Valkey (BD-2)
 
-`storage/valkey.py` implementa as 4 primitivas com estruturas
+`storage/valkey.py` implementa as primitivas com estruturas
 nativas do Valkey — HASH para candidatos, SET para pertença item→contexto e
 para listas invertidas (globais, não truncadas), e pré-materialização como
 HASH por (usuário, contexto). **Decisão de implementação**: a imagem hoje
@@ -232,7 +234,9 @@ levanta `PrimitiveNotSupported` (comportamento herdado da classe base).
 **Modelagem CQL** (sem joins, sem filtro arbitrário fora da chave de
 partição/clustering): `candidates(user_id, rank)` para leitura direta de
 todos os candidatos; `item_contexts(item_id, context_id)` para a pertença
-item→contexto; e uma tabela desnormalizada,
+item→contexto (varrida por inteiro **uma vez na montagem**, ver a seção do
+catálogo abaixo — não mais uma consulta por item, por requisição); e uma
+tabela desnormalizada,
 `candidates_by_context((context_id, user_id), rank)`, particionada por
 (contexto, usuário) — leitura direta e já filtrada por um único contexto
 (E-2). Como essa leitura nunca é truncada, contexto composto (E-2 com dois
@@ -246,6 +250,12 @@ ScyllaAdapter)` recebe a **classe**, não uma instância, então a checagem
 não abre conexão nenhuma — roda na camada rápida, sem Scylla no ar, e ainda
 assim comprova a falha na montagem, citando `intersect` e `scylla` na
 mensagem.
+
+**Nota**: os itens 1 e 2 abaixo descrevem a busca em lote de `item_contexts`
+que existia no caminho de requisição de E-1. Ela **não existe mais** — a
+pertença item→contexto virou catálogo em memória (ver a seção do catálogo
+adiante). O registro fica pelo aprendizado sobre `IN` multi-partição no
+Scylla, que continua válido.
 
 **Três bugs reais encontrados e corrigidos ao validar esta etapa** (fica
 registrado porque são armadilhas prováveis de reaparecer em OpenSearch):
@@ -289,7 +299,10 @@ invertido. `storage/opensearch.py` não implementa `get_prematerialized`, e
 `supported_primitives` não inclui essa primitiva.
 
 **Modelagem**: um documento por (usuário, item) no índice `candidates`,
-com `context_ids` como campo numérico multi-valor. `get_candidates_filtered`
+com `context_ids` como campo numérico multi-valor (desnormalizado na carga —
+é o que a query `term` de E-2 resolve). Há ainda o índice `item_contexts`,
+um documento por item (~87.585), lido em massa na montagem da célula para o
+catálogo em memória — ver a seção do catálogo adiante. `get_candidates_filtered`
 usa uma bool query com uma cláusula `term` por `context_id` pedido —
 interseção AND resolvida nativamente pelo índice invertido do Lucene, sem
 workaround (E-2 "nativo" por `CONTEXTO.md`). Diferente de Valkey/Scylla,
@@ -367,6 +380,75 @@ célula, com mensagem clara, sem precisar de conexão. Nenhuma latência foi
 medida em nenhum momento deste trabalho — por design (ver `CONTEXTO.md`,
 "regra de ouro da implementação"): essa é a Fase 1 de medição real,
 Terraform e nuvem, ainda não iniciada.
+
+#### Fase 2.6 — Catálogo item→contexto em memória (correção de assimetria em E-1)
+
+Correção de uma ameaça à validade descoberta ao estimar a capacidade de uma
+`n2-standard-8`, antes da bateria de medição. **Nenhuma latência foi medida
+para chegar a ela** — a assimetria é visível na contagem de operações.
+
+**O problema.** E-1 ("filtro na aplicação") precisa da pertença item→contexto
+para avaliar o predicado. O contrato antigo fazia cada adaptador reconstruí-la
+por requisição, e o custo disso era ditado pelo modelo de dados escolhido no
+adaptador, não pela tecnologia sob teste. Para um usuário com 500 candidatos,
+uma requisição custava:
+
+| Adaptador | Round-trips | Operações no servidor | Onde o "join" acontecia |
+|---|---|---|---|
+| OpenSearch | 1 | 1 query + fetch de 500 `_source` | no tempo de indexação (desnormalizado) |
+| PostgreSQL | 1 | `LEFT JOIN` + `array_agg` sobre ~1.500 linhas | dentro do planner |
+| Valkey | 2 | **501 comandos** numa thread única | N+1, no cliente |
+| ScyllaDB | ~9 | **501 consultas CQL** (janela de 64 ⇒ ~8 ondas) | N+1, no cliente |
+
+Medida assim, a linha E-1 da matriz compararia **qualidade de adaptador**, não
+tecnologia. O argumento de que "Valkey e Scylla não têm `JOIN`, logo N+1 é
+inerente" não se sustenta: o OpenSearch também não tem, e não paga nada porque
+desnormalizou na carga. Nada impedia os outros dois de fazerem o mesmo — a
+normalização foi uma escolha do adaptador.
+
+**A correção.** A pertença item→contexto é dado de catálogo: estático,
+O(itens) (~87.585 itens, ~200 mil pares), sem ranking. Passou a ser carregada
+**uma vez, na subida do serviço**, e mantida em memória (`core/catalog.py`,
+~20-40 MB por worker). `Candidate` carrega só `(item_id, score)`; a pertença
+nunca viaja no caminho quente. Isso é literalmente o que a definição de E-1
+pede — "avalia o predicado no processo do serviço" — e é o que a docstring do
+próprio contrato já dizia ser a intenção, antes de código e documento
+divergirem.
+
+Não confundir com E-3: a pré-materialização de E-3 é O(usuários × contextos) e
+contém ranking; o catálogo é O(itens) e não contém nenhum.
+
+**O que mudou:**
+
+- `core/catalog.py` (novo) — `ItemCatalog`, com o predicado AND.
+- `core/contract.py` — `Candidate` perdeu `context_ids`.
+- `storage/base.py` — primitiva `load_item_contexts` (carga, não requisição).
+- `strategies/base.py` — gancho `prepare(storage)` no protocolo, mais
+  `build_cell_runtime` (checagem de compatibilidade + carga, em um lugar só).
+- Os 4 adaptadores — `get_candidates` virou leitura pura; cada um ganhou seu
+  despejo de catálogo (`GROUP BY` no Postgres, `SCAN`+`SMEMBERS` em lotes no
+  Valkey, varredura paginada no Scylla, `search_after` no OpenSearch).
+- OpenSearch ganhou o índice `item_contexts` (~87.585 documentos, poucos MB):
+  reconstruir a pertença varrendo os ~100M documentos de `candidates` seria
+  inviável, e o índice de catálogo custa quase nada.
+- E-3 recebeu a mesma correção no caminho de contexto composto, que caía no
+  filtro em aplicação de E-1.
+
+**Efeitos colaterais bons:** o Postgres perdeu o `array_agg` e um `ORDER BY`
+que era jogado fora (`core/ordering.py` reordena tudo de qualquer forma) —
+E-1 ficou mais barato nas quatro tecnologias, não só nas duas penalizadas.
+
+**Validação:** as 14 células viáveis continuam batendo com os 1000 casos do
+oráculo (`make verify-all`, uma tecnologia por vez), e a camada rápida passa
+com 207 testes. Testes novos de regressão garantem que o caminho de
+requisição de E-1 chama **só** `get_candidates`, que o catálogo é carregado
+uma única vez, e que `retrieve` sem `prepare` falha alto em vez de devolver
+resposta vazia.
+
+**Limitação registrada para o texto do TCC:** o catálogo em memória favorece
+E-1 frente a E-2/E-3/E-4, que continuam resolvendo o predicado no banco. Isso
+é uma característica real da estratégia, não um viés de implementação — mas
+precisa estar explícito na discussão dos resultados.
 
 ### Fase 3 — service/, load/, analysis/, infra/ (rumo à medição real)
 

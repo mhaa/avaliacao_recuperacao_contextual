@@ -29,19 +29,32 @@ from psycopg_pool import AsyncConnectionPool
 
 from core.contract import Candidate
 
-from .base import GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED, INTERSECT, StorageAdapter
+from .base import (
+    GET_CANDIDATES,
+    GET_CANDIDATES_FILTERED,
+    GET_PREMATERIALIZED,
+    INTERSECT,
+    LOAD_ITEM_CONTEXTS,
+    StorageAdapter,
+)
 
+# Sem JOIN com item_contexts e sem ORDER BY: a pertença ao contexto vem do
+# catálogo em memória (core/catalog.py, carregado uma vez por
+# _LOAD_ITEM_CONTEXTS_SQL) e a ordenação final é sempre refeita por
+# core/ordering.py:order_candidates — ordenar aqui era trabalho jogado fora,
+# que nenhum dos outros três adaptadores pagava. Sobra um index-only scan
+# sobre idx_candidates_user_rank (INCLUDE (item_id, score)).
 _GET_CANDIDATES_SQL = """
-    SELECT c.item_id, c.score,
-           COALESCE(
-               array_agg(ic.context_id) FILTER (WHERE ic.context_id IS NOT NULL),
-               '{}'
-           ) AS context_ids
-    FROM candidates c
-    LEFT JOIN item_contexts ic ON ic.item_id = c.item_id
-    WHERE c.user_id = %(user_id)s
-    GROUP BY c.item_id, c.score, c.rank
-    ORDER BY c.rank
+    SELECT item_id, score
+    FROM candidates
+    WHERE user_id = %(user_id)s
+"""
+
+# Varredura única, na montagem da célula — nunca no caminho de requisição.
+_LOAD_ITEM_CONTEXTS_SQL = """
+    SELECT item_id, array_agg(context_id) AS context_ids
+    FROM item_contexts
+    GROUP BY item_id
 """
 
 # Semântica AND: um item só entra se pertencer a TODOS os context_ids
@@ -69,7 +82,13 @@ _GET_PREMATERIALIZED_SQL = """
 class PostgresAdapter(StorageAdapter):
     name = "postgres"
     supported_primitives = frozenset(
-        {GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED, INTERSECT}
+        {
+            GET_CANDIDATES,
+            GET_CANDIDATES_FILTERED,
+            GET_PREMATERIALIZED,
+            INTERSECT,
+            LOAD_ITEM_CONTEXTS,
+        }
     )
 
     # max_connections=200 no Postgres (docker-compose.yml / infra/modules/
@@ -93,14 +112,15 @@ class PostgresAdapter(StorageAdapter):
             async with conn.cursor() as cur:
                 await cur.execute(_GET_CANDIDATES_SQL, {"user_id": user_id})
                 rows = await cur.fetchall()
-        return [
-            Candidate(
-                item_id=row["item_id"],
-                score=row["score"],
-                context_ids=frozenset(row["context_ids"]),
-            )
-            for row in rows
-        ]
+        return [Candidate(item_id=row["item_id"], score=row["score"]) for row in rows]
+
+    async def load_item_contexts(self) -> dict[int, frozenset[int]]:
+        await self._pool.open()
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(_LOAD_ITEM_CONTEXTS_SQL)
+                rows = await cur.fetchall()
+        return {row["item_id"]: frozenset(row["context_ids"]) for row in rows}
 
     async def get_candidates_filtered(self, user_id: int, context: list[int]) -> list[Candidate]:
         if not context:

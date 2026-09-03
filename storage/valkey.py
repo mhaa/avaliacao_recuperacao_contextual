@@ -9,10 +9,17 @@ primitivas nativas do Valkey:
 
 - `candidates:{user_id}` — HASH item_id -> score.
 - `item_contexts:{item_id}` — SET de context_ids (pertença do item, dado de
-  catálogo). Usado por `get_candidates` (para popular `context_ids`) e por
-  `get_candidates_filtered` via um script Lua que avalia o predicado
-  server-side (SISMEMBER por item, dentro do Valkey — nunca busca tudo para
-  o cliente filtrar).
+  catálogo). Lido em MASSA uma única vez, na montagem da célula
+  (`load_item_contexts`, via SCAN + SMEMBERS em lotes), para o catálogo em
+  memória de `core/catalog.py`; e usado por `get_candidates_filtered` via um
+  script Lua que avalia o predicado server-side (SISMEMBER por item, dentro
+  do Valkey — nunca busca tudo para o cliente filtrar).
+
+  `get_candidates` (E-1) NÃO toca mais essas chaves: emitia um pipeline de
+  500 SMEMBERS por requisição, 501 comandos numa thread única, o que fazia
+  a célula E-1/Valkey medir a normalização escolhida aqui em vez do custo
+  real de uma leitura em massa (ver CONTEXTO.md, "Catálogo item->contexto
+  residente na aplicação").
 - `candidates_set:{user_id}` — SET de item_id (mesma informação de
   `candidates:{user_id}`, só que como SET, para permitir SINTERSTORE).
 - `inverted:{context_id}` — SET de item_id (lista invertida global, não
@@ -43,8 +50,13 @@ from .base import (
     GET_CANDIDATES_FILTERED,
     GET_PREMATERIALIZED,
     INTERSECT,
+    LOAD_ITEM_CONTEXTS,
     StorageAdapter,
 )
+
+# Lote do SCAN + SMEMBERS da carga do catálogo. ~87.585 chaves em lotes de
+# 1.000 = ~88 round-trips, uma única vez na subida do serviço.
+_CATALOG_SCAN_BATCH = 1_000
 
 _FILTER_SCRIPT = """
 local result = {}
@@ -71,7 +83,13 @@ return result
 class ValkeyAdapter(StorageAdapter):
     name = "valkey"
     supported_primitives = frozenset(
-        {GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED, INTERSECT}
+        {
+            GET_CANDIDATES,
+            GET_CANDIDATES_FILTERED,
+            GET_PREMATERIALIZED,
+            INTERSECT,
+            LOAD_ITEM_CONTEXTS,
+        }
     )
 
     def __init__(self, url: str):
@@ -83,21 +101,37 @@ class ValkeyAdapter(StorageAdapter):
 
     def _get_candidates_sync(self, user_id: int) -> list[Candidate]:
         raw = self._client.hgetall(f"candidates:{user_id}")
-        if not raw:
-            return []
-        item_ids = list(raw.keys())
-        pipe = self._client.pipeline()
-        for item_id in item_ids:
-            pipe.smembers(f"item_contexts:{item_id}")
-        context_sets = pipe.execute()
         return [
-            Candidate(
-                item_id=int(item_id),
-                score=float(raw[item_id]),
-                context_ids=frozenset(int(c) for c in context_sets[i]),
-            )
-            for i, item_id in enumerate(item_ids)
+            Candidate(item_id=int(item_id), score=float(score))
+            for item_id, score in raw.items()
         ]
+
+    async def load_item_contexts(self) -> dict[int, frozenset[int]]:
+        return await asyncio.to_thread(self._load_item_contexts_sync)
+
+    def _load_item_contexts_sync(self) -> dict[int, frozenset[int]]:
+        catalog: dict[int, frozenset[int]] = {}
+        batch: list[str] = []
+
+        def drain() -> None:
+            if not batch:
+                return
+            pipe = self._client.pipeline(transaction=False)
+            for key in batch:
+                pipe.smembers(key)
+            for key, members in zip(batch, pipe.execute()):
+                catalog[int(key.split(":", 1)[1])] = frozenset(int(m) for m in members)
+            batch.clear()
+
+        # scan_iter, não KEYS: KEYS varre o keyspace inteiro num único
+        # comando bloqueante — inaceitável mesmo na subida, com ~100M chaves
+        # de candidatos no mesmo banco.
+        for key in self._client.scan_iter(match="item_contexts:*", count=_CATALOG_SCAN_BATCH):
+            batch.append(key)
+            if len(batch) >= _CATALOG_SCAN_BATCH:
+                drain()
+        drain()
+        return catalog
 
     async def get_candidates_filtered(self, user_id: int, context: list[int]) -> list[Candidate]:
         if not context:

@@ -9,9 +9,16 @@ partição/clustering, salvo `ALLOW FILTERING`, evitado aqui):
 
 - `candidates(user_id, rank)` — PK (user_id, rank), leitura direta de todos
   os candidatos do usuário.
-- `item_contexts(item_id, context_id)` — pertença item->contexto, usada por
-  `get_candidates` para popular `context_ids` (uma consulta de partição
-  única por item, disparadas concorrentemente — ver `_get_candidates_sync`).
+- `item_contexts(item_id, context_id)` — pertença item->contexto, varrida
+  por INTEIRO uma única vez na montagem da célula (`load_item_contexts`),
+  para o catálogo em memória de `core/catalog.py`.
+
+  `get_candidates` (E-1) NÃO a consulta mais por requisição: emitia 500
+  consultas de partição única com janela de 64 em voo, ou seja ~8 ondas
+  sequenciais de round-trip por requisição de API, o que fazia a célula
+  E-1/Scylla medir a normalização escolhida aqui em vez do custo real de
+  ler uma partição de candidatos (ver CONTEXTO.md, "Catálogo
+  item->contexto residente na aplicação").
 - `candidates_by_context((context_id, user_id), rank)` — tabela
   desnormalizada, partição por (contexto, usuário): leitura direta e JÁ
   FILTRADA por um único contexto (E-2). Cada leitura devolve o conjunto
@@ -35,25 +42,29 @@ import asyncio
 
 from cassandra import ConsistencyLevel
 from cassandra.cluster import Cluster
-from cassandra.concurrent import execute_concurrent_with_args
-from cassandra.query import dict_factory
+from cassandra.query import SimpleStatement, dict_factory
 
 from core.contract import Candidate
 
-from .base import GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED, StorageAdapter
+from .base import (
+    GET_CANDIDATES,
+    GET_CANDIDATES_FILTERED,
+    GET_PREMATERIALIZED,
+    LOAD_ITEM_CONTEXTS,
+    StorageAdapter,
+)
 
 KEYSPACE = "recsys"
 
-# Consultas de item_contexts em voo por chamada de get_candidates (E-1 lê
-# até N=500 itens). Ver _get_candidates_sync para o porquê de serem
-# consultas de partição única concorrentes em vez de um IN multi-partição.
-_ITEM_CONTEXTS_CONCURRENCY = 64
+# Páginas da varredura completa de item_contexts na carga do catálogo
+# (~200 mil linhas, uma única vez na subida do serviço).
+_CATALOG_FETCH_SIZE = 10_000
 
 
 class ScyllaAdapter(StorageAdapter):
     name = "scylla"
     supported_primitives = frozenset(
-        {GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED}
+        {GET_CANDIDATES, GET_CANDIDATES_FILTERED, GET_PREMATERIALIZED, LOAD_ITEM_CONTEXTS}
     )
 
     def __init__(self, hosts: list[str]):
@@ -70,9 +81,6 @@ class ScyllaAdapter(StorageAdapter):
         self._stmt_candidates = self._session.prepare(
             "SELECT item_id, score FROM candidates WHERE user_id = ?"
         )
-        self._stmt_item_contexts = self._session.prepare(
-            "SELECT item_id, context_id FROM item_contexts WHERE item_id = ?"
-        )
         self._stmt_by_context = self._session.prepare(
             "SELECT item_id, score FROM candidates_by_context "
             "WHERE context_id = ? AND user_id = ?"
@@ -87,7 +95,6 @@ class ScyllaAdapter(StorageAdapter):
         # medição está medindo.
         for statement in (
             self._stmt_candidates,
-            self._stmt_item_contexts,
             self._stmt_by_context,
             self._stmt_prematerialized,
         ):
@@ -97,39 +104,25 @@ class ScyllaAdapter(StorageAdapter):
         return await asyncio.to_thread(self._get_candidates_sync, user_id)
 
     def _get_candidates_sync(self, user_id: int) -> list[Candidate]:
-        rows = list(self._session.execute(self._stmt_candidates, (user_id,)))
-        if not rows:
-            return []
-        item_ids = [row["item_id"] for row in rows]
-        # Uma consulta de PARTIÇÃO ÚNICA por item, disparadas
-        # concorrentemente — não um `IN` sobre até 100 chaves de partição
-        # por vez (que era o que estava aqui). `IN` multi-partição é
-        # anti-pattern documentado em Cassandra/Scylla: o coordenador vira
-        # ponto único de fan-out e segura todos os resultados em memória,
-        # enquanto consultas de partição única são roteadas direto ao dono
-        # de cada token e falham/repetem de forma independente. Também
-        # elimina os 5 round-trips SEQUENCIAIS que uma leitura de N=500
-        # itens custava (500 / 100 por lote), cada um segurando a thread
-        # do executor até voltar.
-        contexts_by_item: dict[int, set[int]] = {}
-        results = execute_concurrent_with_args(
-            self._session,
-            self._stmt_item_contexts,
-            [(item_id,) for item_id in item_ids],
-            concurrency=_ITEM_CONTEXTS_CONCURRENCY,
-            raise_on_first_error=True,
+        rows = self._session.execute(self._stmt_candidates, (user_id,))
+        return [Candidate(item_id=row["item_id"], score=row["score"]) for row in rows]
+
+    async def load_item_contexts(self) -> dict[int, frozenset[int]]:
+        return await asyncio.to_thread(self._load_item_contexts_sync)
+
+    def _load_item_contexts_sync(self) -> dict[int, frozenset[int]]:
+        # Varredura de tabela inteira — aceitável SÓ porque acontece uma vez
+        # na montagem da célula. fetch_size explícito para o driver paginar
+        # em vez de tentar materializar ~200 mil linhas de uma vez.
+        statement = SimpleStatement(
+            f"SELECT item_id, context_id FROM {KEYSPACE}.item_contexts",
+            fetch_size=_CATALOG_FETCH_SIZE,
+            consistency_level=ConsistencyLevel.ONE,
         )
-        for _success, context_rows in results:
-            for row in context_rows:
-                contexts_by_item.setdefault(row["item_id"], set()).add(row["context_id"])
-        return [
-            Candidate(
-                item_id=row["item_id"],
-                score=row["score"],
-                context_ids=frozenset(contexts_by_item.get(row["item_id"], set())),
-            )
-            for row in rows
-        ]
+        accumulator: dict[int, set[int]] = {}
+        for row in self._session.execute(statement):
+            accumulator.setdefault(row["item_id"], set()).add(row["context_id"])
+        return {item_id: frozenset(contexts) for item_id, contexts in accumulator.items()}
 
     async def get_candidates_filtered(self, user_id: int, context: list[int]) -> list[Candidate]:
         if not context:
