@@ -1,6 +1,6 @@
 """Consolida a saída bruta de load/run_battery.py (requests.ndjson +
 manifest.json, um por repetição) no formato de resultados de
-IMPLEMENTACAO.md, "Coleta de resultados": latencies.parquet e summary.json.
+docs/ARCHITECTURE.md, "Coleta de resultados": latencies.parquet e summary.json.
 resources.csv (analysis/resources.py) e storage.json (analysis/
 storage_size.py) são coletados à parte — dependem de infraestrutura viva
 (containers/serviço no ar), não só do arquivo bruto do k6.
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import polars as pl
 
-# Escopo de medição: CONTEXTO.md, "2 min de aquecimento descartados + 5 min
+# Escopo de medição: docs/DESIGN.md, "2 min de aquecimento descartados + 5 min
 # de medição" (tag `measurement`) — nunca `warmup`.
 MEASUREMENT_SCENARIOS = frozenset({"measurement"})
 
@@ -103,8 +103,8 @@ def parse_requests_ndjson(
 
 
 def build_summary(latencies_df: pl.DataFrame) -> dict:
-    """p50/p95/p99/p99,9, vazão, taxa de erro (CONTEXTO.md, "Métricas") —
-    NUNCA latência média (CONTEXTO.md, "regra de ouro": a distribuição é
+    """p50/p95/p99/p99,9, vazão, taxa de erro (docs/DESIGN.md, "Métricas") —
+    NUNCA latência média (docs/DESIGN.md, "regra de ouro": a distribuição é
     assimétrica, a média esconde a cauda). `cache_hit_rate` fica None: o
     A-1/A-2 (camadas de cache da Fase 2, hipótese H3) ainda não existem —
     todas as células atuais rodam com `cache: none`."""

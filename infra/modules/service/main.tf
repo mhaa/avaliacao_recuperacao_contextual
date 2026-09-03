@@ -48,7 +48,7 @@ variable "database_internal_ip" {
 
 variable "machine_type" {
   type        = string
-  description = "Tipo de máquina — n2-standard-4 (IMPLEMENTACAO.md, topologia)."
+  description = "Tipo de máquina — n2-standard-4 (docs/ARCHITECTURE.md, topologia)."
   default     = "n2-standard-4"
 }
 
@@ -73,7 +73,7 @@ resource "google_project_iam_member" "service_artifact_reader" {
   member  = "serviceAccount:${google_service_account.service.email}"
 }
 
-# Instrumentação de gargalo (CONTEXTO.md / analysis/resources.py:
+# Instrumentação de gargalo (docs/DESIGN.md / analysis/resources.py:
 # GCPMonitoringCollector) — o coletor OpenTelemetry no startup-script
 # escreve métrica de memória sob esta SA.
 resource "google_project_iam_member" "service_metric_writer" {
@@ -89,7 +89,7 @@ locals {
   # variável nova só para repetir o que `service_image` já contém.
   service_registry_host = split("/", var.service_image)[0]
 
-  # Instrumentação de gargalo (CONTEXTO.md) — mesmo mecanismo de
+  # Instrumentação de gargalo (docs/DESIGN.md) — mesmo mecanismo de
   # infra/modules/database/main.tf (Ops Agent oficial não roda em COS;
   # OpenTelemetry Collector Contrib como contêiner). Duplicado idêntico
   # nos 3 módulos de propósito — não é configuração por célula.
@@ -160,7 +160,7 @@ resource "google_compute_instance" "service" {
 
   network_interface {
     subnetwork = var.subnetwork_self_link
-    # Sem access_config: sem IP público (IMPLEMENTACAO.md).
+    # Sem access_config: sem IP público (docs/ARCHITECTURE.md).
   }
 
   service_account {

@@ -1,5 +1,5 @@
 # Rede privada única para banco, serviço e gerador de carga. Sem IP público
-# em nenhuma VM (IMPLEMENTACAO.md, "Sem IP público nas VMs de banco e
+# em nenhuma VM (docs/ARCHITECTURE.md, "Sem IP público nas VMs de banco e
 # serviço. Acesso por IAP ou bastion." — aplicado também ao gerador aqui,
 # por consistência: ele também não precisa ser alcançável de fora). Cloud
 # NAT dá saída à internet (pull de imagem Docker, apt) sem IP público em
@@ -48,7 +48,7 @@ resource "google_compute_subnetwork" "private" {
   private_ip_google_access = true
 }
 
-# SSH só via faixa de IP do IAP (IMPLEMENTACAO.md) — nunca 0.0.0.0/0.
+# SSH só via faixa de IP do IAP (docs/ARCHITECTURE.md) — nunca 0.0.0.0/0.
 resource "google_compute_firewall" "allow_iap_ssh" {
   name          = "tcc-recsys-allow-iap-ssh"
   network       = google_compute_network.main.id

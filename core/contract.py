@@ -1,6 +1,6 @@
 """Modelos de requisição e resposta do serviço de recuperação.
 
-Contrato fixo por CONTEXTO.md ("Contrato da API"): a resposta carrega só
+Contrato fixo por docs/DESIGN.md ("Contrato da API"): a resposta carrega só
 item_id/score/rank, sem metadados descritivos, para manter o payload em
 ~800 bytes e evitar joins. `extra="forbid"` em todos os modelos garante que
 um campo extra falhe alto na validação em vez de ser silenciosamente aceito.
@@ -23,7 +23,7 @@ class Candidate(BaseModel):
     ela viajava neste modelo, e reconstruí-la por requisição custava 501
     comandos no Valkey e 501 consultas CQL no ScyllaDB — fazendo a linha
     E-1 da matriz medir o modelo de dados do adaptador em vez da tecnologia
-    (CONTEXTO.md, "Catálogo item->contexto residente na aplicação").
+    (docs/DESIGN.md, "Catálogo item->contexto residente na aplicação").
     """
 
     model_config = ConfigDict(extra="forbid")

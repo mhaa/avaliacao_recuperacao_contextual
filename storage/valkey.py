@@ -2,7 +2,7 @@
 
 Decisão de implementação: a imagem hoje pinada em docker-compose.yml
 (`valkey/valkey:8-alpine`) não traz um módulo de busca (RediSearch ou
-equivalente), que é a técnica que CONTEXTO.md original imaginava para E-2.
+equivalente), que é a técnica que docs/DESIGN.md original imaginava para E-2.
 Em vez de depender de uma imagem de módulo (não há uma tag oficial estável
 para isso no momento da implementação), E-2 e E-4 são implementados com
 primitivas nativas do Valkey:
@@ -18,7 +18,7 @@ primitivas nativas do Valkey:
   `get_candidates` (E-1) NÃO toca mais essas chaves: emitia um pipeline de
   500 SMEMBERS por requisição, 501 comandos numa thread única, o que fazia
   a célula E-1/Valkey medir a normalização escolhida aqui em vez do custo
-  real de uma leitura em massa (ver CONTEXTO.md, "Catálogo item->contexto
+  real de uma leitura em massa (ver docs/DESIGN.md, "Catálogo item->contexto
   residente na aplicação").
 - `catalog:item_contexts` — HASH item_id -> context_ids separados por
   vírgula, gravado pelos loaders. É a fonte do despejo de montagem
@@ -35,7 +35,7 @@ primitivas nativas do Valkey:
 - `prematerialized:{user_id}:{context_id}` — HASH item_id -> score (top-40).
 
 O predicado continua avaliado DENTRO do banco nos dois casos (a distinção
-real que CONTEXTO.md quer entre E-1 e as demais), ainda que a técnica não
+real que docs/DESIGN.md quer entre E-1 e as demais), ainda que a técnica não
 seja literalmente um módulo de busca — registrar essa divergência no texto
 do TCC.
 

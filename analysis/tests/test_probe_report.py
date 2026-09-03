@@ -1,4 +1,4 @@
-"""Testa analysis/probe_report.py:violated_slo — CONTEXTO.md, "Protocolo de
+"""Testa analysis/probe_report.py:violated_slo — docs/DESIGN.md, "Protocolo de
 medição": "SLO: p99 > 200 ms ou taxa de erro > 1%."."""
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # Aplicação por célula — um `terraform init -backend-config` + `apply` por
-# célula, com prefixo de estado isolado (IMPLEMENTACAO.md, "Isolamento por
+# célula, com prefixo de estado isolado (docs/ARCHITECTURE.md, "Isolamento por
 # célula": "prefixo de estado separado por célula... em vez de workspaces
 # — mais fácil de auditar, menor risco de `terraform workspace select`
 # errado destruir a célula errada").
@@ -39,7 +39,7 @@ variable "project_id" {
 
 variable "region" {
   type        = string
-  description = "Região única do experimento (CONTEXTO.md: \"Nuvem... região única\")."
+  description = "Região única do experimento (docs/DESIGN.md: \"Nuvem... região única\")."
   default     = "us-central1"
 }
 

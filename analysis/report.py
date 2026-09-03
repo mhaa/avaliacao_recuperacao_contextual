@@ -1,6 +1,6 @@
 """Orquestra a análise em lote sobre `results/` — consolida as repetições de
 várias células (via analysis/collect.py), roda a estatística exigida por
-CONTEXTO.md ("Estatística" / "Delineamento em duas etapas") e gera os
+docs/DESIGN.md ("Estatística" / "Delineamento em duas etapas") e gera os
 gráficos de analysis/plots.py. Antes deste script, `collect.py`/`stats.py`/
 `plots.py` só eram chamados um `run_dir` (ou uma síntese) de cada vez, sem
 nada consolidando as 14 células (triagem) ou a fronteira de Pareto
@@ -172,7 +172,7 @@ def build_report(
 
 def build_confirmation_extras(groups: dict[str, list[float]]) -> dict:
     """TOST par-a-par entre as células da fronteira — 'não rejeitou H0' não
-    é o mesmo que 'equivalente na prática' (CONTEXTO.md, "Delineamento em
+    é o mesmo que 'equivalente na prática' (docs/DESIGN.md, "Delineamento em
     duas etapas")."""
     labels = list(groups)
     tost_by_pair = {}

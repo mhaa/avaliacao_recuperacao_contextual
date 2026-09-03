@@ -20,7 +20,7 @@ def plot_pareto_frontier(
 ) -> None:
     """`cells`: [{"cell_id": str, "latency_p99_ms": float, "cost_usd_hour": float,
     "saturation_throughput_approx": float|None, "saturation_censored": bool}, ...]
-    (os dois últimos campos são opcionais — CONTEXTO.md, "Delineamento em
+    (os dois últimos campos são opcionais — docs/DESIGN.md, "Delineamento em
     duas etapas": a triagem "identifica a fronteira de Pareto latência ×
     custo", agora em 3 dimensões — analysis/pareto.py). Vazão de saturação
     entra como anotação de texto, não um terceiro eixo (mais legível para o
@@ -80,7 +80,7 @@ def plot_latency_vs_throughput(
     points_by_cell: dict[str, list[tuple[float, float]]], out_path: Path
 ) -> None:
     """`points_by_cell`: {"e1-postgres": [(throughput_rps, latency_p99_ms), ...], ...}
-    — rampa até violar o SLO (CONTEXTO.md: p99 > 200 ms)."""
+    — rampa até violar o SLO (docs/DESIGN.md: p99 > 200 ms)."""
     fig, ax = plt.subplots()
     for cell_id, points in points_by_cell.items():
         ax.plot([p[0] for p in points], [p[1] for p in points], marker="o", label=cell_id)
@@ -94,7 +94,7 @@ def plot_latency_vs_throughput(
 
 def plot_cache_hit_rate(hit_rate_by_cache_layer: dict[str, float], out_path: Path) -> None:
     """`hit_rate_by_cache_layer`: {"none": 0.0, "candidates": .., "response": ..}
-    — H3: candidatos por usuário vs. resposta completa (CONTEXTO.md)."""
+    — H3: candidatos por usuário vs. resposta completa (docs/DESIGN.md)."""
     fig, ax = plt.subplots()
     ax.bar(list(hit_rate_by_cache_layer), list(hit_rate_by_cache_layer.values()))
     ax.set_ylabel("Taxa de acerto de cache")

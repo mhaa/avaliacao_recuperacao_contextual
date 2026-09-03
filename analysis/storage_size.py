@@ -1,5 +1,5 @@
 """storage.json — volume ocupado em disco, medido após a carga
-(IMPLEMENTACAO.md, "Coleta de resultados"). Uma consulta por tecnologia de
+(docs/ARCHITECTURE.md, "Coleta de resultados"). Uma consulta por tecnologia de
 banco: diferente de resources.csv, um relacional, um KV, um wide-column e
 um índice invertido não compartilham primitiva nenhuma de "tamanho em
 disco", então isto não força uma interface comum onde não existe uma.

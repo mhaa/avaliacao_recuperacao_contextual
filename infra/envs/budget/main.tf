@@ -1,5 +1,5 @@
 # Alerta de orçamento — aplicação separada, rodada uma vez ANTES de
-# qualquer célula (IMPLEMENTACAO.md: "google_billing_budget não depende
+# qualquer célula (docs/ARCHITECTURE.md: "google_billing_budget não depende
 # estruturalmente de VM nenhuma... ordem procedural, não uma dependência
 # de grafo do Terraform"; e "Alerta de orçamento configurado ANTES da
 # primeira VM").

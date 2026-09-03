@@ -1,9 +1,9 @@
 #!/bin/bash
 # Snapshot do disco de dados depois de carregar a massa numa célula —
-# IMPLEMENTACAO.md, "Custo": "Carregar 100M registros leva horas; sem
+# docs/ARCHITECTURE.md, "Custo": "Carregar 100M registros leva horas; sem
 # snapshot, religar o ambiente repete o custo." Chamado pelo fluxo do
 # Makefile, nunca por `local-exec` do Terraform (carga de dados é lógica
-# de aplicação, proibida ali — IMPLEMENTACAO.md, "Práticas obrigatórias").
+# de aplicação, proibida ali — docs/ARCHITECTURE.md, "Práticas obrigatórias").
 #
 # Uso: infra/scripts/snapshot_after_load.sh <disk-name> <zone> <project-id>
 # (disk-name = output `data_disk_name` de infra/envs/experiment)

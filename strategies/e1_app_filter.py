@@ -8,7 +8,7 @@ deliberado: antes, cada adaptador reconstruía a pertença ao contexto a cada
 requisição, a um custo ditado pelo modelo de dados do adaptador (501
 comandos no Valkey, 501 consultas CQL no ScyllaDB, `LEFT JOIN` +
 `array_agg` no PostgreSQL, nada no OpenSearch), o que fazia esta linha da
-matriz comparar adaptadores em vez de tecnologias. Ver CONTEXTO.md,
+matriz comparar adaptadores em vez de tecnologias. Ver docs/DESIGN.md,
 "Catálogo item->contexto residente na aplicação".
 
 Do banco, portanto, E-1 exige só a leitura em massa dos candidatos

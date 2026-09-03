@@ -1,4 +1,4 @@
-"""As células arquiteturalmente inviáveis da matriz de CONTEXTO.md devem
+"""As células arquiteturalmente inviáveis da matriz de docs/DESIGN.md devem
 falhar na MONTAGEM da célula, com uma mensagem que nomeia a primitiva
 ausente — nunca em tempo de requisição, e nunca silenciosamente. Ver
 `storage/base.py:PrimitiveNotSupported` e
@@ -9,7 +9,7 @@ Passa a CLASSE do adaptador (não uma instância) para `check_compatibility`
 não abre nenhuma conexão: é isso que garante a falha ser rápida e não
 depender do banco estar no ar.
 
-As 2 células inviáveis da matriz 4x4 (CONTEXTO.md) estão aqui: E-4/Scylla
+As 2 células inviáveis da matriz 4x4 (docs/DESIGN.md) estão aqui: E-4/Scylla
 (sem primitiva de interseção) e E-3/OpenSearch (pré-materialização sem
 sentido arquitetural sobre um índice invertido).
 """

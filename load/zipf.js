@@ -1,11 +1,11 @@
 // Amostragem de user_id por distribuição de Zipf (expoente 1,0 — fixo pelo
-// desenho experimental, ver CONTEXTO.md "Protocolo de medição": "Distribuição
+// desenho experimental, ver docs/DESIGN.md "Protocolo de medição": "Distribuição
 // de acesso: Zipf com expoente 1,0 (não uniforme)"). Sem lib externa
 // disponível no runtime JS do k6: a CDF é pré-computada uma única vez,
 // normalizada, e amostrada por busca binária a cada requisição.
 //
 // USER_COUNT precisa ser passado por __ENV: localmente U=10.000, na nuvem
-// U=1.000.000 (CONTEXTO.md, "Parâmetros fixos") — nunca hardcoded aqui, já
+// U=1.000.000 (docs/DESIGN.md, "Parâmetros fixos") — nunca hardcoded aqui, já
 // que os dois ambientes usam este mesmo script.
 //
 // `SharedArray` garante que a tabela seja computada uma vez por execução do

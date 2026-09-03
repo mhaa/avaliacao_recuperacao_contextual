@@ -1,5 +1,5 @@
 """Primitivas que cada banco pode ou não oferecer — é aqui que a matriz de
-viabilidade (CONTEXTO.md) fica codificada.
+viabilidade (docs/DESIGN.md) fica codificada.
 
 Cada adaptador real declara `supported_primitives`; a montagem da célula
 (`strategies.base.check_compatibility`) compara isso contra o que a
@@ -19,7 +19,7 @@ GET_PREMATERIALIZED = "get_prematerialized"
 INTERSECT = "intersect"
 # Primitiva de CARGA, não de requisição: chamada uma única vez na montagem
 # da célula (`Strategy.prepare`), nunca no caminho quente. Ver
-# core/catalog.py e CONTEXTO.md, "Catálogo item->contexto residente na
+# core/catalog.py e docs/DESIGN.md, "Catálogo item->contexto residente na
 # aplicação".
 LOAD_ITEM_CONTEXTS = "load_item_contexts"
 

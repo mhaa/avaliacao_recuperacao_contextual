@@ -4,7 +4,7 @@
 `cells/<id>.yaml` sobrepõe só o que muda. Falha alto (Pydantic,
 `extra="forbid"`) em campo desconhecido — erro de digitação em nome de
 campo não pode silenciosamente virar configuração padrão (ver
-IMPLEMENTACAO.md, "Configuração de célula").
+docs/ARCHITECTURE.md, "Configuração de célula").
 
 Isto carrega e valida a configuração; a montagem real da célula (mapear
 `strategy`/`storage` para as classes de strategies/ e storage/) é

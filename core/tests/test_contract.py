@@ -43,6 +43,6 @@ def test_k20_response_size_within_budget():
     payload_size = len(response.model_dump_json().encode("utf-8"))
     assert payload_size <= RESPONSE_BYTE_BUDGET, (
         f"payload de {payload_size} bytes excede o orçamento de "
-        f"{RESPONSE_BYTE_BUDGET} bytes (CONTEXTO.md) — orçamento documentado, "
+        f"{RESPONSE_BYTE_BUDGET} bytes (docs/DESIGN.md) — orçamento documentado, "
         "não um contrato rígido, mas um estouro grande é sinal de alerta."
     )

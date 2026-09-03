@@ -1,5 +1,5 @@
 """Dominância de Pareto em 3 dimensões — latência p99, custo, vazão de
-saturação (CONTEXTO.md, "Delineamento em duas etapas"). A vazão vem da
+saturação (docs/DESIGN.md, "Delineamento em duas etapas"). A vazão vem da
 rampa curta (load/saturation.py), de ensaio único — sem estimativa de
 variância, por isso a tolerância de 20% na comparação (latência e custo já
 vêm de 5 repetições, com IC de bootstrap, sem necessidade de tolerância
@@ -15,7 +15,7 @@ como se fosse a vazão real medida.
 
 from __future__ import annotations
 
-TOLERANCE = 0.20  # CONTEXTO.md: rampa curta é ensaio único, sem variância
+TOLERANCE = 0.20  # docs/DESIGN.md: rampa curta é ensaio único, sem variância
 
 
 def throughput_dominates(a: dict, b: dict) -> bool:
@@ -78,7 +78,7 @@ def pareto_frontier(cells: list[dict]) -> list[dict]:
 def censorship_warning(cells: list[dict]) -> str | None:
     """Se mais de metade das células viáveis medidas ficaram censuradas na
     dimensão de vazão, retorna uma mensagem de aviso — não altera o
-    cálculo de dominância (CONTEXTO.md: "sinalizar", nunca substituir
+    cálculo de dominância (docs/DESIGN.md: "sinalizar", nunca substituir
     automaticamente); `None` caso contrário."""
     if not cells:
         return None

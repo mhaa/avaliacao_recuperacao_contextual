@@ -1,7 +1,7 @@
 -- Esquema mínimo para BD-1 (Postgres), suficiente para as primitivas já
 -- implementadas em storage/postgres.py: get_candidates e
 -- get_candidates_filtered. Tabelas de pré-materialização (E-3) e o que
--- mais E-4 precisar chegam na Etapa 4 (ver IMPLEMENTACAO.md).
+-- mais E-4 precisar chegam na Etapa 4 (ver docs/ARCHITECTURE.md).
 --
 -- Rodado automaticamente pela imagem oficial do Postgres via
 -- docker-entrypoint-initdb.d (ver docker-compose.yml) — só DDL aqui, nunca

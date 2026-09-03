@@ -1,6 +1,6 @@
 # VM do banco sob teste — Compute Engine rodando a MESMA imagem Docker
 # usada localmente em docker-compose.yml (nunca um banco gerenciado —
-# restrição explícita do projeto, ver CONTEXTO.md "Fora de escopo"). Um
+# restrição explícita do projeto, ver docs/DESIGN.md "Fora de escopo"). Um
 # disco de dados separado do boot disk, para o snapshot pós-carga
 # (infra/scripts/snapshot_after_load.sh) não incluir o SO.
 #
@@ -50,7 +50,7 @@ variable "subnetwork_self_link" {
 
 variable "machine_type" {
   type        = string
-  description = "Tipo de máquina — n2-standard-8 por padrão (IMPLEMENTACAO.md, topologia); dimensionamento.xlsx (Etapa 1) pode indicar outro valor por célula."
+  description = "Tipo de máquina — n2-standard-8 por padrão (docs/ARCHITECTURE.md, topologia); dimensionamento.xlsx (Etapa 1) pode indicar outro valor por célula."
   default     = "n2-standard-8"
 }
 
@@ -216,7 +216,7 @@ locals {
   }
 }
 
-# Instrumentação de gargalo (CONTEXTO.md) — Ops Agent oficial do Google não
+# Instrumentação de gargalo (docs/DESIGN.md) — Ops Agent oficial do Google não
 # roda em COS (sem apt/yum); usamos o OpenTelemetry Collector Contrib como
 # contêiner (hostmetrics + exporter googlecloud), lendo o sistema de
 # arquivos do host via /hostfs somente leitura. Duplicado idêntico nos 3
@@ -308,7 +308,7 @@ resource "google_project_iam_member" "database_secret_accessor" {
   member  = "serviceAccount:${google_service_account.database.email}"
 }
 
-# Instrumentação de gargalo (CONTEXTO.md / analysis/resources.py:
+# Instrumentação de gargalo (docs/DESIGN.md / analysis/resources.py:
 # GCPMonitoringCollector) — o coletor OpenTelemetry no startup-script
 # escreve métrica de memória sob esta SA.
 resource "google_project_iam_member" "database_metric_writer" {
@@ -335,7 +335,7 @@ resource "google_compute_instance" "database" {
 
   network_interface {
     subnetwork = var.subnetwork_self_link
-    # Sem access_config: sem IP público (IMPLEMENTACAO.md).
+    # Sem access_config: sem IP público (docs/ARCHITECTURE.md).
   }
 
   service_account {

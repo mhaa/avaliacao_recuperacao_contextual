@@ -2,7 +2,7 @@
 tests/acceptance/test_harness_all_cells.py, mas chamável direto contra uma
 célula específica sem pytest (necessário para o smoke test em nuvem:
 gate de corretude antes de gastar tempo/dinheiro com carga, ver
-IMPLEMENTACAO.md/CLAUDE.md, "Correctness before latency").
+docs/ARCHITECTURE.md/CLAUDE.md, "Correctness before latency").
 
 Uso:
     docker compose run --rm --entrypoint python tools -m harness.verify_cli --cell e1-postgres

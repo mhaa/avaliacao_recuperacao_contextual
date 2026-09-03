@@ -2,7 +2,7 @@
 
 Implementa as 4 primitivas. `get_candidates`/`get_candidates_filtered`
 chegaram na Etapa 2; `get_prematerialized`/`intersect` chegam agora (Etapa
-4) — todas as 4 são viáveis em Postgres por CONTEXTO.md.
+4) — todas as 4 são viáveis em Postgres por docs/DESIGN.md.
 
 `intersect` reaproveita a mesma consulta relacional de
 `get_candidates_filtered` (via `item_contexts`), só com `LIMIT`. Isso é

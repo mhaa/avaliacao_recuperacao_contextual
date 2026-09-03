@@ -1,7 +1,7 @@
 """Valida cells/*.yaml: as 14 células reais carregam sem erro, e um campo
 desconhecido (no topo ou dentro de `params`) levanta erro de validação em
 vez de cair silenciosamente no default — erro de digitação em nome de
-campo não pode virar configuração padrão sem avisar (ver IMPLEMENTACAO.md,
+campo não pode virar configuração padrão sem avisar (ver docs/ARCHITECTURE.md,
 "Configuração de célula"). Suíte rápida, sem banco.
 """
 

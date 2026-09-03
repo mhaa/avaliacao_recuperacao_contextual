@@ -1,6 +1,6 @@
 """Adaptador OpenSearch (BD-4).
 
-E-3 (pré-materialização) não tem sentido arquitetural aqui por CONTEXTO.md:
+E-3 (pré-materialização) não tem sentido arquitetural aqui por docs/DESIGN.md:
 pré-materializar respostas chave-valor não aproveita nada do que um índice
 invertido oferece. `get_prematerialized` não é implementado —
 comportamento padrão da classe base levanta `PrimitiveNotSupported`, e
@@ -15,11 +15,11 @@ como campo numérico multi-valor (desnormalizado na carga — é o que a query
 memória de `core/catalog.py`. Existe porque E-1 passou a filtrar contra
 esse catálogo em vez de receber `context_ids` no caminho quente, e
 reconstruir a pertença varrendo os ~100M documentos de `candidates` seria
-inviável. Ver CONTEXTO.md, "Catálogo item->contexto residente na
+inviável. Ver docs/DESIGN.md, "Catálogo item->contexto residente na
 aplicação". `get_candidates_filtered` usa uma bool
 query com uma cláusula `term` por context_id pedido (AND via múltiplas
 cláusulas `must`) — exatamente a semântica que o índice invertido do Lucene
-resolve nativamente, sem workaround (E-2 "nativo" por CONTEXTO.md).
+resolve nativamente, sem workaround (E-2 "nativo" por docs/DESIGN.md).
 `intersect` usa a mesma técnica de consulta por ora — a distinção real de
 E-2 vs. E-4 (predicado direto vs. interseção com lista invertida global) é
 uma otimização de Fase 2 (medição de latência), fora do escopo desta etapa

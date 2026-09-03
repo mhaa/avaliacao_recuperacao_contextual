@@ -1,6 +1,6 @@
 """Roda a suíte de verificação (harness/verify.py) contra todas as células
-viáveis já implementadas, sobre os 1000 casos do oráculo. Ver CONTEXTO.md,
-"regra de ouro da implementação", e IMPLEMENTACAO.md, "## Não fazer": nunca
+viáveis já implementadas, sobre os 1000 casos do oráculo. Ver docs/DESIGN.md,
+"regra de ouro da implementação", e docs/ARCHITECTURE.md, "## Não fazer": nunca
 medir latência de uma célula que não passou aqui.
 
 Exige, antes de rodar:
@@ -10,7 +10,7 @@ Exige, antes de rodar:
 
 A lista de células viáveis agora vem de `cells/*.yaml` + `core/registry.py`
 (Etapa 6) — não é mais hardcoded aqui. Não tem e4-scylla nem e3-opensearch
-(inviáveis por CONTEXTO.md) — ver
+(inviáveis por docs/DESIGN.md) — ver
 tests/acceptance/test_infeasible_cells_fail_at_startup.py.
 """
 

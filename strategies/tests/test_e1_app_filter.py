@@ -15,7 +15,7 @@ def _candidate(item_id, score):
 def test_required_primitives_are_get_candidates_and_the_catalog_load():
     """A pertença item->contexto virou dado de catálogo carregado uma vez na
     montagem (core/catalog.py), então E-1 exige a primitiva de carga além da
-    leitura em massa — ver CONTEXTO.md, "Catálogo item->contexto residente na
+    leitura em massa — ver docs/DESIGN.md, "Catálogo item->contexto residente na
     aplicação"."""
     assert E1AppFilter.required_primitives == frozenset({GET_CANDIDATES, LOAD_ITEM_CONTEXTS})
 

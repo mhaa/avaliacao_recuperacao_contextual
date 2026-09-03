@@ -1,9 +1,9 @@
-"""Busca de vazão de saturação (CONTEXTO.md, "Protocolo de medição" / "3ª
+"""Busca de vazão de saturação (docs/DESIGN.md, "Protocolo de medição" / "3ª
 dimensão da fronteira de Pareto") — patamares dobrando (rampa curta,
 triagem) ou incrementos de 10% (rampa de confirmação), busca binária de até
 3 iterações ao violar o SLO, teto de 50.000 req/s, censura quando o teto é
 alcançado sem violação, e checagem obrigatória do gerador de carga (CPU <
-60%, CONTEXTO.md) a cada patamar — se o gerador saturar antes da célula, a
+60%, docs/DESIGN.md) a cada patamar — se o gerador saturar antes da célula, a
 execução inteira é inválida (`loadgen_bottleneck=True`), nunca interpretada
 como vazão da célula. Uma sondagem SEM leitura de CPU
 (`generator_cpu_percent=None`) não aborta a busca, mas marca
@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
-GENERATOR_CPU_THRESHOLD = 60.0  # CONTEXTO.md: "válido só se CPU do gerador < 60%"
+GENERATOR_CPU_THRESHOLD = 60.0  # docs/DESIGN.md: "válido só se CPU do gerador < 60%"
 CEILING_RPS = 50_000  # teto da busca — decisão do usuário para este protocolo
 DEFAULT_START_RATE = 1_000  # nível intermediário, mesmo da carga fixa da triagem
 BINARY_SEARCH_ITERATIONS = 3
@@ -36,7 +36,7 @@ class ProbeResult:
     # Monitoring sem ponto na janela — ver run_measurement_battery.py:
     # _generator_cpu_percent), estado distinto de 0.0 = medido e ocioso.
     # Antes, falha de telemetria virava 0.0 e passava calada pelo portão dos
-    # 60% do CONTEXTO.md: results/e1-postgres/triagem/20260901T144228Z/
+    # 60% do docs/DESIGN.md: results/e1-postgres/triagem/20260901T144228Z/
     # saturation.json tem 0.0 nas 4 sondagens enquanto o gerador empurrava
     # 1000 req/s — implausível, o portão foi vacuoso naquela execução
     # inteira. Mesma disciplina de analysis/resources.py:classify_bottleneck
@@ -58,7 +58,7 @@ class SaturationSearchResult:
 
 
 def _generator_saturated(result: ProbeResult) -> bool:
-    """Portão de validade do CONTEXTO.md (CPU do gerador < 60%): só dispara
+    """Portão de validade do docs/DESIGN.md (CPU do gerador < 60%): só dispara
     com uma LEITURA acima do limiar. `None` não é gargalo confirmado e não
     aborta a busca — abortar por atraso de ingestão do Cloud Monitoring já
     foi bug confirmado ao vivo (ver o retry em run_measurement_battery.py:

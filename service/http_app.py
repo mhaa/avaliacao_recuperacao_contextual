@@ -1,7 +1,7 @@
 """Serviço HTTP — FastAPI, servido via Hypercorn (não uvicorn: uvicorn não
 implementa HTTP/2; um proxy reverso só para T-B introduziria um processo
 extra cujo uso de CPU contaminaria a medição de recursos do serviço — ver
-CONTEXTO.md, seção "Pilha", atualizada para citar Hypercorn no lugar de
+docs/DESIGN.md, seção "Pilha", atualizada para citar Hypercorn no lugar de
 uvicorn).
 
 T-A (HTTP/1.1) e T-B (HTTP/2 cleartext) são o MESMO processo: rodando sem
@@ -92,7 +92,7 @@ def create_app(strategy: Strategy, storage: StorageAdapter) -> FastAPI:
         `response_model`, serialização JSON e os dois hops de rede. Toda
         comparação entre células vira então "latência da célula menos este
         piso", e a pergunta "isso é o banco ou a minha aplicação?" passa a
-        ter resposta numérica (benchmark.md, seção 6).
+        ter resposta numérica (docs/BENCHMARKS.md, seção 6).
 
         Exercita exatamente o mesmo caminho de `/v1/recommendations` exceto
         a leitura e a filtragem: aceita o mesmo corpo (paga o mesmo parse de

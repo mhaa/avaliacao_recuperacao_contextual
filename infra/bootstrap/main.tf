@@ -1,5 +1,5 @@
 # infra/bootstrap — a única exceção documentada a "nunca estado local"
-# (IMPLEMENTACAO.md, "Backend remoto com bloqueio de estado"): o bucket de
+# (docs/ARCHITECTURE.md, "Backend remoto com bloqueio de estado"): o bucket de
 # estado remoto precisa existir ANTES de qualquer `terraform init
 # -backend-config` em infra/envs/* poder apontar para ele. Rodado uma vez,
 # manualmente, com autenticação real — nunca por CI.
@@ -31,7 +31,7 @@ variable "project_id" {
 
 variable "region" {
   type        = string
-  description = "Região única do experimento (CONTEXTO.md: \"Nuvem... região única\")."
+  description = "Região única do experimento (docs/DESIGN.md: \"Nuvem... região única\")."
   default     = "us-central1"
 }
 
@@ -41,7 +41,7 @@ provider "google" {
 }
 
 # Bucket de estado remoto do Terraform — SEM prevent_destroy
-# (IMPLEMENTACAO.md: "prevent_destroy no bucket de resultados. No resto, não.").
+# (docs/ARCHITECTURE.md: "prevent_destroy no bucket de resultados. No resto, não.").
 resource "google_storage_bucket" "terraform_state" {
   name                        = "${var.project_id}-tcc-tfstate"
   location                    = var.region
@@ -61,7 +61,7 @@ resource "google_storage_bucket" "terraform_state" {
 # Bucket de resultados — durável além do ciclo de vida das VMs por célula
 # (analysis/collect.py sobe os 5 arquivos de results/<cell>/<phase>/<timestamp>/
 # aqui quando rodar na nuvem). prevent_destroy explícito, única exceção do
-# projeto (IMPLEMENTACAO.md, "Custo").
+# projeto (docs/ARCHITECTURE.md, "Custo").
 resource "google_storage_bucket" "results" {
   name                        = "${var.project_id}-tcc-results"
   location                    = var.region

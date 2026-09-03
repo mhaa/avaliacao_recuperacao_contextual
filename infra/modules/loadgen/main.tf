@@ -1,5 +1,5 @@
 # VM do gerador de carga — obrigatoriamente separada da VM de serviço
-# (IMPLEMENTACAO.md: "o gerador em VM separada não é detalhe: a
+# (docs/ARCHITECTURE.md: "o gerador em VM separada não é detalhe: a
 # metodologia exige verificar que a CPU do gerador ficou abaixo de 60%").
 # Mesma imagem `tools` usada localmente (docker/Dockerfile.tools), que já
 # carrega o binário do k6 e load/scenarios.js (Etapa 7).
@@ -46,7 +46,7 @@ variable "dataset_bucket" {
 
 variable "machine_type" {
   type        = string
-  description = "Tipo de máquina — n2-standard-8 (IMPLEMENTACAO.md, topologia)."
+  description = "Tipo de máquina — n2-standard-8 (docs/ARCHITECTURE.md, topologia)."
   default     = "n2-standard-8"
 }
 
@@ -74,7 +74,7 @@ resource "google_storage_bucket_iam_member" "loadgen_dataset_reader" {
   member = "serviceAccount:${google_service_account.loadgen.email}"
 }
 
-# Instrumentação de gargalo (CONTEXTO.md / analysis/resources.py:
+# Instrumentação de gargalo (docs/DESIGN.md / analysis/resources.py:
 # GCPMonitoringCollector) — mesma métrica de CPU que
 # load/saturation.py:GENERATOR_CPU_THRESHOLD checa a cada patamar da busca
 # de saturação, não só ao final; escrita sob esta SA.
@@ -89,7 +89,7 @@ locals {
   # partir da própria referência da imagem, sem variável nova.
   tools_registry_host = split("/", var.tools_image)[0]
 
-  # Instrumentação de gargalo (CONTEXTO.md) — mesmo mecanismo de
+  # Instrumentação de gargalo (docs/DESIGN.md) — mesmo mecanismo de
   # infra/modules/database/main.tf (Ops Agent oficial não roda em COS;
   # OpenTelemetry Collector Contrib como contêiner). Duplicado idêntico
   # nos 3 módulos de propósito — não é configuração por célula.

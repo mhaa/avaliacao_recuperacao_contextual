@@ -6,7 +6,7 @@ de cada contexto) — por isso `intersect` já lida corretamente com múltiplos
 `context_ids` (interseção AND) sem o problema de truncamento de E-3.
 
 `limit` é passado generoso (N=500, o teto de candidatos por usuário do
-desenho experimental — ver CONTEXTO.md) para nunca cortar antes da
+desenho experimental — ver docs/DESIGN.md) para nunca cortar antes da
 exclusão de sessão ser aplicada.
 """
 

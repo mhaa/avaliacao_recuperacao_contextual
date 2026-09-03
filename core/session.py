@@ -3,7 +3,7 @@
 Aplicada na camada de aplicação, em TODAS as estratégias — inclusive E-3
 (pré-materializado) e E-4 (interseção), cujos artefatos de origem já vêm
 sem a exclusão aplicada. Nenhuma estratégia deve empurrar isso para o banco
-(ver `IMPLEMENTACAO.md`, "## Não fazer"): por isso esta função nem aceita um
+(ver `docs/ARCHITECTURE.md`, "## Não fazer"): por isso esta função nem aceita um
 adaptador de storage como argumento — estruturalmente não há como fazer a
 exclusão virar um parâmetro de consulta.
 """

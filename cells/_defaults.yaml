@@ -1,5 +1,5 @@
 # Comum a todas as células — cada cells/<id>.yaml sobrepõe só o que muda.
-# Valores fixos do desenho experimental (ver CONTEXTO.md, "Parâmetros fixos").
+# Valores fixos do desenho experimental (ver docs/DESIGN.md, "Parâmetros fixos").
 cache: none
 transport: http1
 params:

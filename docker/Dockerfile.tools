@@ -1,9 +1,9 @@
 # Imagem de ferramentas — Python + pytest + k6 para rodar a suíte de testes
 # e a geração de carga do serviço de recuperação (core/, storage/,
 # strategies/, harness/, load/ etc. conforme cada etapa de
-# IMPLEMENTACAO.md for implementada). Isolada do host, mesma lógica de
+# docs/ARCHITECTURE.md for implementada). Isolada do host, mesma lógica de
 # data_generation/Dockerfile: nada de Python ou k6 precisa estar instalado
-# fora do Docker (IMPLEMENTACAO.md, "Ambiente local — Docker").
+# fora do Docker (docs/ARCHITECTURE.md, "Ambiente local — Docker").
 
 FROM grafana/k6:0.54.0 AS k6
 FROM hashicorp/terraform:1.9.8 AS terraform
@@ -20,7 +20,7 @@ COPY --from=k6 /usr/bin/k6 /usr/local/bin/k6
 COPY --from=terraform /bin/terraform /usr/local/bin/terraform
 
 # git: load/run_battery.py registra o hash do commit em cada manifest.json
-# (IMPLEMENTACAO.md, "Coleta de resultados": "obrigatório... permite saber
+# (docs/ARCHITECTURE.md, "Coleta de resultados": "obrigatório... permite saber
 # quais medições vieram de qual versão").
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*

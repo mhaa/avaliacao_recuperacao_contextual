@@ -1,5 +1,5 @@
 """Bateria de execuções de load/scenarios.js — 5 repetições por célula, em
-ordem aleatorizada (CONTEXTO.md, "Protocolo de medição": "5 repetições por
+ordem aleatorizada (docs/DESIGN.md, "Protocolo de medição": "5 repetições por
 célula, em ordem aleatorizada"; ver o plano em
 implementacao-md-com-base-nos-staged-snowflake.md, Etapa 7). A seed usada
 para embaralhar fica logada no manifesto de cada execução, para
@@ -13,7 +13,7 @@ nunca ganharam arquivo (ver core/registry.py,
 tests/acceptance/test_infeasible_cells_fail_at_startup.py). Não há outra
 checagem de viabilidade a duplicar aqui.
 
-Uso local (SMOKE apenas — CONTEXTO.md proíbe medir latência localmente):
+Uso local (SMOKE apenas — docs/DESIGN.md proíbe medir latência localmente):
     docker compose run --rm --entrypoint python tools load/run_battery.py \\
         --cells e1-postgres --target-url http://service:8000/v1/recommendations \\
         --repetitions 1 --rate 10 --smoke
@@ -24,7 +24,7 @@ partir dos outputs `service_internal_ip` de infra/envs/experiment. Quem
 invoca isso de fato é infra/scripts/run_measurement_battery.py, um combo
 (rate, selectivity_tier) por vez, via SSH na VM `loadgen`.
 
-A vazão de saturação (CONTEXTO.md, "Protocolo de medição") não é uma
+A vazão de saturação (docs/DESIGN.md, "Protocolo de medição") não é uma
 "bateria" no sentido deste arquivo (repetições × células) — é uma busca
 adaptativa de um único patamar por vez, orquestrada por
 load/saturation.py, que usa build_probe_k6_cmd() abaixo em vez de

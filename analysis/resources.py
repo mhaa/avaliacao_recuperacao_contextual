@@ -1,10 +1,10 @@
 """resources.csv — CPU, memória e rede do banco, do serviço e do gerador
-(CONTEXTO.md, "Métricas" / atribuição de gargalo). Duas fontes atrás de uma
+(docs/DESIGN.md, "Métricas" / atribuição de gargalo). Duas fontes atrás de uma
 interface comum (`ResourceCollector`), mesmo padrão de storage/base.py (uma
 interface, vários backends): `docker stats` localmente (um host Docker só,
 nunca para números que entram no TCC) vs. API do GCP Cloud Monitoring na
 nuvem (VMs separadas, infra/modules/{database,service,loadgen} — três VMs,
-IMPLEMENTACAO.md).
+docs/ARCHITECTURE.md).
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def _parse_mem_usage(value: str) -> float:
 
 
 class DockerStatsCollector:
-    """Local apenas — CONTEXTO.md proíbe medir aqui; usado só para validar
+    """Local apenas — docs/DESIGN.md proíbe medir aqui; usado só para validar
     o formato de resources.csv, nunca para números que entram no TCC."""
 
     def __init__(self, container_by_component: dict[str, str]):

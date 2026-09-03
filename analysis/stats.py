@@ -1,15 +1,15 @@
 """Kruskal-Wallis + Dunn (Bonferroni) + IC de percentil por bootstrap + TOST
-— CONTEXTO.md, "Estatística": "Kruskal-Wallis; se rejeitar H0, Dunn com
+— docs/DESIGN.md, "Estatística": "Kruskal-Wallis; se rejeitar H0, Dunn com
 correção de Bonferroni (α = 5%). Intervalos de confiança dos percentis por
 bootstrap com 10.000 reamostras. Reportar também a magnitude do efeito."
 
 Não-paramétrico em toda parte: a distribuição de latência é assimetrica por
-natureza (CONTEXTO.md, "regra de ouro": nunca reportar latência média), então
+natureza (docs/DESIGN.md, "regra de ouro": nunca reportar latência média), então
 testes que assumem normalidade (ANOVA, Tukey, Cohen's d) não se aplicam —
 daqui Kruskal-Wallis/Dunn em vez de ANOVA/Tukey, e epsilon-quadrado (o
 companion não-paramétrico do tamanho de efeito) em vez de Cohen's d.
 
-`tost_equivalence` existe para a etapa de confirmação (CONTEXTO.md,
+`tost_equivalence` existe para a etapa de confirmação (docs/DESIGN.md,
 "Delineamento em duas etapas") alegar equivalência prática entre células da
 fronteira de Pareto — "não rejeitou H0" não é o mesmo que "são equivalentes".
 """
@@ -40,7 +40,7 @@ def kruskal_wallis(groups: list[list[float]], alpha: float = 0.05) -> KruskalRes
 def dunn_posthoc(groups: dict[str, list[float]]) -> dict[tuple[str, str], float]:
     """Matriz de p-valores pareados (Bonferroni), achatada em um dict —
     só faz sentido chamar depois de `kruskal_wallis(...).reject_h0` (
-    CONTEXTO.md: Dunn só entra "se rejeitar H0")."""
+    docs/DESIGN.md: Dunn só entra "se rejeitar H0")."""
     labels = list(groups)
     data = [np.asarray(groups[label], dtype=float) for label in labels]
     p_matrix = sp.posthoc_dunn(data, p_adjust="bonferroni").to_numpy()
@@ -65,7 +65,7 @@ def bootstrap_percentile_ci(
     confidence: float = 0.95,
     seed: int | None = None,
 ) -> BootstrapCI:
-    """IC do percentil por reamostragem — CONTEXTO.md: "Intervalos de
+    """IC do percentil por reamostragem — docs/DESIGN.md: "Intervalos de
     confiança dos percentis por bootstrap com 10.000 reamostras"."""
     sample = np.asarray(data, dtype=float)
 
@@ -88,7 +88,7 @@ def bootstrap_percentile_ci(
 def effect_size_epsilon_squared(h_statistic: float, n_total: int, n_groups: int) -> float:
     """epsilon-quadrado (Tomczak & Tomczak, 2014) — companion não-paramétrico
     do Kruskal-Wallis, análogo ao R² de uma ANOVA; Cohen's d não se aplica
-    porque assume normalidade (CONTEXTO.md: "Reportar também a magnitude do
+    porque assume normalidade (docs/DESIGN.md: "Reportar também a magnitude do
     efeito")."""
     return (h_statistic - n_groups + 1) / (n_total - n_groups)
 

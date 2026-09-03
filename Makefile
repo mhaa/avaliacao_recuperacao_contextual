@@ -1,4 +1,4 @@
-# Fachada de comandos (IMPLEMENTACAO.md, "Interface") — por baixo, sempre
+# Fachada de comandos (docs/ARCHITECTURE.md, "Interface") — por baixo, sempre
 # Docker/docker compose/python -m já documentados no README.md. Nenhuma
 # lógica nova: cada alvo só encaminha, nunca reimplementa.
 #
@@ -98,7 +98,7 @@ measure:
 	    $(CELL) $(PROJECT_ID) $(REGION) $(ZONE) $(TF_STATE_BUCKET) $(RESULTS_BUCKET) $(DATASET_BUCKET) \
 	    --phase $(PHASE) $(if $(START),--saturation-start $(START),)
 
-## Vazão de saturação (CONTEXTO.md, "Delineamento em duas etapas" — 3ª
+## Vazão de saturação (docs/DESIGN.md, "Delineamento em duas etapas" — 3ª
 ## dimensão da fronteira de Pareto) — alvos nomeados pedidos explicitamente,
 ## equivalentes a `measure PHASE=triagem`/`measure PHASE=confirmacao`.
 

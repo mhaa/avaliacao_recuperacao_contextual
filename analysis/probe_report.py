@@ -24,7 +24,7 @@ from analysis.collect import build_summary, parse_requests_ndjson
 
 PROBE_SCENARIOS = frozenset({"probe"})
 
-# CONTEXTO.md, "Protocolo de medição": "SLO: p99 > 200 ms ou taxa de erro > 1%."
+# docs/DESIGN.md, "Protocolo de medição": "SLO: p99 > 200 ms ou taxa de erro > 1%."
 SLO_P99_MS = 200.0
 SLO_ERROR_RATE = 0.01
 

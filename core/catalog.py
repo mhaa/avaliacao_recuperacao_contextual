@@ -6,7 +6,7 @@ ranking. Carregado UMA vez na montagem da célula
 (`storage.load_item_contexts`, primitiva de carga em massa) e consultado em
 memória a cada requisição — nunca relido do banco no caminho quente.
 
-Por que existe (ver CONTEXTO.md, "Catálogo item->contexto residente na
+Por que existe (ver docs/DESIGN.md, "Catálogo item->contexto residente na
 aplicação"): sem ele, cada adaptador reconstruía `context_ids` por
 requisição a um custo ditado pelo modelo de dados do adaptador e não pela
 tecnologia sob teste — 1 round-trip com `LEFT JOIN` + `array_agg` no

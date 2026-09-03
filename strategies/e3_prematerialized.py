@@ -2,7 +2,7 @@
 (usuário, contexto).
 
 Decisão de implementação (descoberta ao cobrir os casos "composed" do
-oráculo, não antecipada no pseudocódigo original de IMPLEMENTACAO.md):
+oráculo, não antecipada no pseudocódigo original de docs/ARCHITECTURE.md):
 `prematerialized.parquet` é uma linha por (usuário, CONTEXTO ÚNICO),
 truncada em top-M=40 por esse contexto isolado — ver
 data_generation/README.md. Intersectar dois top-40 (um por contexto) NÃO
@@ -18,7 +18,7 @@ contexto único, mas não tem vantagem em contexto composto), não um bug.
 Por isso `required_primitives` inclui `get_candidates` além de
 `get_prematerialized` — e, desde a adoção do catálogo em memória, também
 `load_item_contexts`: esse caminho de fallback avalia o predicado na
-aplicação exatamente como E-1, contra `core/catalog.py` (ver CONTEXTO.md,
+aplicação exatamente como E-1, contra `core/catalog.py` (ver docs/DESIGN.md,
 "Catálogo item->contexto residente na aplicação"). Requisição de contexto
 único e requisição sem contexto não tocam o catálogo.
 """

@@ -1,11 +1,11 @@
-// Gerador de carga (Etapa 7) contra service/http_app.py — ver CONTEXTO.md,
+// Gerador de carga (Etapa 7) contra service/http_app.py — ver docs/DESIGN.md,
 // "Protocolo de medição", e o plano em
 // implementacao-md-com-base-nos-staged-snowflake.md, Etapa 7.
 //
 // Executor `constant-arrival-rate`: modelo aberto de verdade (taxa de
 // chegada fixa, independente de quão rápido o serviço responde) — é o
 // motivo de ter escolhido k6 sobre Locust (Locust é de malha fechada,
-// produz omissão coordenada quando o serviço degrada; ver CONTEXTO.md,
+// produz omissão coordenada quando o serviço degrada; ver docs/DESIGN.md,
 // "Pilha").
 //
 // T-C (gRPC) fica de fora deste script por decisão já tomada na Etapa 6:
@@ -55,10 +55,10 @@ const RATE = parseInt(__ENV.RATE || '100', 10);
 const SELECTIVITY_TIER = __ENV.SELECTIVITY_TIER || 'medium';
 const TRANSPORT = __ENV.TRANSPORT || 'http1';
 const EXCLUSION_SIZE = parseInt(__ENV.EXCLUSION_SIZE || '20', 10);
-// I=87.585 é constante do catálogo (CONTEXTO.md, "Parâmetros fixos") — não
+// I=87.585 é constante do catálogo (docs/DESIGN.md, "Parâmetros fixos") — não
 // escala com U, então não precisa de override entre local e nuvem.
 const ITEM_COUNT = parseInt(__ENV.ITEM_COUNT || '87585', 10);
-// Sondagem de um único patamar (CONTEXTO.md, "Protocolo de medição" —
+// Sondagem de um único patamar (docs/DESIGN.md, "Protocolo de medição" —
 // vazão de saturação): usada tanto pela rampa curta exploratória da
 // triagem quanto pela rampa fina de confirmação — a diferença entre elas
 // (patamares, se tem aquecimento, duração) é decidida no orquestrador
@@ -92,7 +92,7 @@ function randomExcludeIds() {
 }
 
 // VUs suficientes para sustentar RATE dado o orçamento de latência do SLO
-// (p99 < 200 ms, CONTEXTO.md) com folga — ajustar durante as execuções
+// (p99 < 200 ms, docs/DESIGN.md) com folga — ajustar durante as execuções
 // reais na nuvem se o k6 acusar "dropped iterations".
 const preAllocatedVUs = Math.max(50, Math.ceil(RATE * 0.5));
 const maxVUs = Math.max(200, RATE * 2);

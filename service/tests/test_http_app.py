@@ -60,7 +60,7 @@ def test_k20_response_payload_within_byte_budget():
     assert payload_size <= RESPONSE_BYTE_BUDGET + 200  # HTTP/JSON tem overhead sobre o núcleo
 
 
-# --- /v1/baseline: o piso da bancada (benchmark.md, secao 6) ---------------
+# --- /v1/baseline: o piso da bancada (docs/BENCHMARKS.md, secao 6) ---------------
 
 
 def _baseline_client(storage=None):

@@ -5,7 +5,7 @@ data_generation/generator/contexts.py:select_tier_contexts /
 assign_context_ids), sem recalcular nada.
 
 load/scenarios.js usa este arquivo para escolher, por cenário, o único
-context_id que corresponde à seletividade alvo (~2%/20%/60%, CONTEXTO.md
+context_id que corresponde à seletividade alvo (~2%/20%/60%, docs/DESIGN.md
 "Protocolo de medição") — mesma noção de "contexto único por patamar" que
 data_generation/generator/oracle.py já usa para os casos do oráculo (ver
 `tier_context_ids` em oracle.py:run).

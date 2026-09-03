@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-# Parâmetros fixos do experimento (CONTEXTO.md).
+# Parâmetros fixos do experimento (docs/DESIGN.md).
 N_CANDIDATES = 500
 K_DEFAULT = 20
 C_CONTEXTS = 20

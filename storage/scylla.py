@@ -1,6 +1,6 @@
 """Adaptador ScyllaDB (BD-3).
 
-E-4 é inviável aqui por CONTEXTO.md: sem primitiva de interseção de
+E-4 é inviável aqui por docs/DESIGN.md: sem primitiva de interseção de
 conjuntos em CQL. `supported_primitives` não inclui `INTERSECT` — a classe
 base já levanta `PrimitiveNotSupported` por padrão se algo tentar chamar.
 
@@ -17,7 +17,7 @@ partição/clustering, salvo `ALLOW FILTERING`, evitado aqui):
   consultas de partição única com janela de 64 em voo, ou seja ~8 ondas
   sequenciais de round-trip por requisição de API, o que fazia a célula
   E-1/Scylla medir a normalização escolhida aqui em vez do custo real de
-  ler uma partição de candidatos (ver CONTEXTO.md, "Catálogo
+  ler uma partição de candidatos (ver docs/DESIGN.md, "Catálogo
   item->contexto residente na aplicação").
 - `candidates_by_context((context_id, user_id), rank)` — tabela
   desnormalizada, partição por (contexto, usuário): leitura direta e JÁ

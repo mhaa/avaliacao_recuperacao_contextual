@@ -2,7 +2,7 @@
 """Bateria de medição real em nuvem — README.md, "Fase 5". Contraparte de
 infra/scripts/cloud_smoke_test.py (Fase 4): em vez de um smoke curto, roda
 load/run_battery.py de verdade contra a célula, varrendo carga ×
-seletividade conforme CONTEXTO.md ("Protocolo de medição" /
+seletividade conforme docs/DESIGN.md ("Protocolo de medição" /
 "Delineamento em duas etapas"), e traz os `results/` de volta. Também roda
 a busca de vazão de saturação (load/saturation.py) — a 3ª dimensão da
 fronteira de Pareto: rampa curta exploratória na triagem (1 patamar por
@@ -36,7 +36,7 @@ entra no sys.path, `python infra/scripts/run_measurement_battery.py` não):
     # confirmação: --saturation-start vem do report.json da triagem
     # (aproximado ou lower_bound se a célula ficou censurada). resources.csv
     # é escrito nesta fase (amostragem periódica de 5s durante o sweep +
-    # rampa fina, CONTEXTO.md), nunca na triagem.
+    # rampa fina, docs/DESIGN.md), nunca na triagem.
     python -m infra.scripts.run_measurement_battery <cell> ... --phase confirmacao \\
         --saturation-start 11000
 
@@ -80,10 +80,10 @@ from infra.scripts.cloud_smoke_test import (
 from load.run_battery import build_probe_k6_cmd
 from load.saturation import GENERATOR_CPU_THRESHOLD, ProbeResult, run_saturation_search
 
-# CONTEXTO.md, "Protocolo de medição".
+# docs/DESIGN.md, "Protocolo de medição".
 RATES = [100, 1_000, 10_000]
 SELECTIVITY_TIERS = ["high", "medium", "low"]
-# CONTEXTO.md, "Delineamento em duas etapas": a triagem roda com seletividade
+# docs/DESIGN.md, "Delineamento em duas etapas": a triagem roda com seletividade
 # e carga fixas em nível intermediário, para achar a fronteira de Pareto;
 # só a confirmação varre tudo.
 TRIAGEM_RATE = 1_000
@@ -99,7 +99,7 @@ REPETITIONS = 5
 RESULTS_MOUNT = "/home/tcc/results"
 FIXTURES_MOUNT = "/home/tcc/load-fixtures"
 
-# Repetições por patamar na rampa de confirmação (CONTEXTO.md, item pedido
+# Repetições por patamar na rampa de confirmação (docs/DESIGN.md, item pedido
 # pelo usuário) — a rampa curta usa 1 (ensaio único, por isso a tolerância
 # de 20% em analysis/pareto.py).
 CONFIRMATION_REPETITIONS = 5
@@ -108,7 +108,7 @@ CONFIRMATION_MEASURE = "3m"
 SHORT_RAMP_WARMUP = "0s"
 SHORT_RAMP_MEASURE = "1m"
 
-# IMPLEMENTACAO.md, "Topologia": memória nominal dos tipos de máquina
+# docs/ARCHITECTURE.md, "Topologia": memória nominal dos tipos de máquina
 # padrão — só para converter a fração que o coletor OpenTelemetry reporta
 # em MB (analysis/resources.py:GCPMonitoringCollector), sem uma chamada
 # extra à API do Compute para descobrir o tipo de máquina em runtime. Se
@@ -120,7 +120,7 @@ DEFAULT_MEMORY_MB_BY_COMPONENT = {
 }
 
 # Janela de amostragem periódica de recursos durante a rampa de
-# confirmação (CONTEXTO.md: "amostrar a cada 5 segundos nas três VMs").
+# confirmação (docs/DESIGN.md: "amostrar a cada 5 segundos nas três VMs").
 RESOURCE_SAMPLE_INTERVAL_SECONDS = 5
 
 
@@ -384,7 +384,7 @@ def _generator_cpu_percent(
     project_id: str, loadgen_instance: str, start_time, end_time
 ) -> float | None:
     """CPU da VM loadgen na janela de uma sondagem, via Cloud Monitoring —
-    CONTEXTO.md: "válido só se CPU do gerador < 60%", checado a cada
+    docs/DESIGN.md: "válido só se CPU do gerador < 60%", checado a cada
     patamar da busca de saturação, não só ao final."""
     from analysis.resources import GCPMonitoringCollector
 
@@ -413,7 +413,7 @@ def _generator_cpu_percent(
             print(
                 f"AVISO: não foi possível consultar CPU do gerador nesta sondagem ({exc}) — "
                 "registrada como NÃO MEDIDA (null), não como 0%. Assumir 0% fazia a falha de "
-                "telemetria passar pelo portão dos 60% do CONTEXTO.md como se o gerador "
+                "telemetria passar pelo portão dos 60% do docs/DESIGN.md como se o gerador "
                 "estivesse ocioso (confirmado ao vivo em results/e1-postgres/triagem/"
                 "20260901T144228Z/saturation.json, com 0.0 nas 4 sondagens sob 1000 req/s). "
                 "A busca continua — só o portão desta sondagem fica sem avaliação, e "
@@ -450,7 +450,7 @@ def verify_otel_pipeline(
     """Confirma que o coletor OpenTelemetry das 3 VMs (infra/modules/
     {database,service,loadgen}/main.tf) está de fato exportando métricas
     para o Cloud Monitoring, antes de comprometer horas de VM numa triagem
-    inteira — README.md/CONTEXTO.md sinalizam essa peça como a menos
+    inteira — README.md/docs/DESIGN.md sinalizam essa peça como a menos
     testada do projeto (Ops Agent oficial do Google não roda em COS, sem
     gerenciador de pacotes). Pensado para rodar só na primeira célula da
     triagem (--verify-otel): o módulo Terraform é idêntico nas 14, então
@@ -533,7 +533,7 @@ def sample_resources_periodically(
 ) -> None:
     """Chama collect_fn() a cada interval_seconds até stop_event ser
     sinalizado, acumulando em samples_out — roda numa thread separada,
-    em paralelo ao sweep/rampa de confirmação (CONTEXTO.md: "amostrar a
+    em paralelo ao sweep/rampa de confirmação (docs/DESIGN.md: "amostrar a
     cada 5 segundos nas três VMs"). collect_fn isolado por injeção de
     dependência (make_resource_collect_fn) para este loop ser testável com
     um fake, sem precisar de Cloud Monitoring de verdade — uma falha
@@ -611,7 +611,7 @@ def _report_saturation(saturation, label: str = "") -> None:
     elif saturation.censored:
         print(
             f"{prefix}célula não saturou nem no teto de {saturation.lower_bound:.0f} req/s — "
-            "censurada nessa dimensão (CONTEXTO.md: tratada como empatada com outras censuradas "
+            "censurada nessa dimensão (docs/DESIGN.md: tratada como empatada com outras censuradas "
             "e superior a qualquer não-censurada, nunca como o teto de verdade)."
         )
     else:
@@ -623,7 +623,7 @@ def _report_saturation(saturation, label: str = "") -> None:
     if unmeasured:
         print(
             f"{prefix}ATENÇÃO: {unmeasured} de {len(saturation.probes)} sondagens ficaram sem "
-            f"leitura de CPU do gerador — o portão de validade do CONTEXTO.md (CPU < "
+            f"leitura de CPU do gerador — o portão de validade do docs/DESIGN.md (CPU < "
             f"{GENERATOR_CPU_THRESHOLD:.0f}%) NÃO pôde ser avaliado nelas. Não é o mesmo que "
             "gerador ocioso: este resultado não está validado nessa dimensão. Confira o coletor "
             "OTel do loadgen (--verify-otel) antes de usar esta vazão na dissertação."
@@ -895,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.rmtree(Path("results") / args.cell, ignore_errors=True)
         shutil.rmtree(Path("results") / "_saturation" / args.cell, ignore_errors=True)
 
-        # Amostragem periódica de recursos (CONTEXTO.md: "amostrar a cada 5
+        # Amostragem periódica de recursos (docs/DESIGN.md: "amostrar a cada 5
         # segundos nas três VMs") — só durante a confirmação; a rampa curta
         # da triagem é exploratória e nunca é arquivada, o mesmo vale para o
         # uso de recursos dela.
@@ -935,7 +935,7 @@ def main(argv: list[str] | None = None) -> int:
             print(result.stdout)
 
         if args.phase == "triagem":
-            print("\n--- rampa curta de saturação (exploratória, CONTEXTO.md) ---")
+            print("\n--- rampa curta de saturação (exploratória, docs/DESIGN.md) ---")
             probe_fn = make_probe_fn(
                 args.cell,
                 target_url,

@@ -1,6 +1,6 @@
 # Imagem do serviço de recuperação — um único binário, uma única imagem
 # para todas as 14 células (a célula é escolhida em runtime via CELL, ver
-# IMPLEMENTACAO.md, "princípio que governa todas as decisões"). Multi-stage,
+# docs/ARCHITECTURE.md, "princípio que governa todas as decisões"). Multi-stage,
 # final slim, usuário não-root, sem ferramentas de build.
 
 FROM python:3.11-slim AS builder

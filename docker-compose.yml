@@ -60,7 +60,7 @@ services:
       # sobreviver a um único `docker compose run --rm`).
       - ./infra:/app/infra
       # Somente leitura: load/run_battery.py lê o hash do commit atual para
-      # cada manifest.json (IMPLEMENTACAO.md, "Coleta de resultados") — a
+      # cada manifest.json (docs/ARCHITECTURE.md, "Coleta de resultados") — a
       # imagem não copia .git (invalidaria o cache de build a cada commit).
       - ./.git:/app/.git:ro
 

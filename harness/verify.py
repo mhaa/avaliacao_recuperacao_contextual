@@ -1,5 +1,5 @@
 """Compara a resposta de uma célula (estratégia + storage já montados)
-contra o oráculo. Ver CONTEXTO.md, "regra de ouro da implementação":
+contra o oráculo. Ver docs/DESIGN.md, "regra de ouro da implementação":
 nenhuma latência é medida antes de passar 100% aqui.
 
 Ordem importa (mesmo desempate do oráculo); uma resposta curta que bate com
