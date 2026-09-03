@@ -348,6 +348,27 @@ def wait_for_container(
     raise TimeoutError(f"container '{container_name}' não subiu em {timeout_s}s")
 
 
+def restart_container(instance: str, zone: str, project_id: str, container_name: str) -> None:
+    """Reinicia um container já em execução — usado depois que o schema/dado
+    real é carregado no banco, DEPOIS de `tcc-service` já estar de pé.
+
+    `service/http_app.py:_lifespan` chama `strategy.prepare(storage)` uma
+    única vez, no startup, bloqueando até terminar; para E-1/E-3 isso carrega
+    o catálogo item->contexto (`core/catalog.py`) e nunca mais recarrega. O
+    `startup-script` da VM de serviço (`infra/modules/service/main.tf`) sobe
+    `tcc-service` assim que a VM boota — antes de qualquer schema/fixture
+    existir no banco, que só é aplicado depois, via este script, pelo
+    loadgen. Sem este restart, o catálogo fica vazio para sempre e toda
+    resposta filtrada por contexto volta `items: []`, sem erro nenhum —
+    confirmado ao vivo: `harness/verify_cli.py` passou 1000/1000 (monta
+    storage/strategy novo, depois da carga), mas
+    `tests/acceptance/test_service_smoke.py` via HTTP contra o `tcc-service`
+    já em pé bateu 20/20 falhas `obtido=[]` na mesma execução (e1-opensearch).
+    """
+    print(f"Reiniciando '{container_name}' em {instance} para recarregar o catálogo com dado fresco...")
+    gcloud_ssh(instance, zone, project_id, f"docker restart {container_name}")
+
+
 def build_storage_env_flags(
     cell_id: str, storage: str, database_ip: str, service_ip: str, postgres_password: str | None
 ) -> list[str]:
@@ -391,7 +412,22 @@ def build_schema_and_fixture_steps(storage: str, mode: str = "oracle") -> list[s
     return steps
 
 
-def build_remote_smoke_script(
+def _docker_run_script(env_flags: list[str], tools_image: str, steps: list[str]) -> str:
+    """Monta o comando remoto como uma lista de argv (docker run ...) e usa
+    shlex.join para virar uma única string shell-segura — nunca
+    concatenação manual de strings com aspas embutidas (isso já causou um
+    bug real: um `python -c "..."` com aspas duplas internas quebrava a
+    sintaxe do `bash -c "..."` que o envolvia quando entregue via
+    `gcloud compute ssh --command=...`, ver analysis/smoke_report.py)."""
+    inner = " && ".join(steps)
+    docker_argv = ["docker", "run", "--rm", "--network", "host", "--entrypoint", "bash"]
+    for flag in env_flags:
+        docker_argv += ["-e", flag]
+    docker_argv += [tools_image, "-c", inner]
+    return shlex.join(docker_argv)
+
+
+def build_remote_schema_fixture_script(
     cell_id: str,
     storage: str,
     database_ip: str,
@@ -399,17 +435,30 @@ def build_remote_smoke_script(
     tools_image: str,
     postgres_password: str | None,
 ) -> str:
-    """Monta o comando remoto como uma lista de argv (docker run ...) e usa
-    shlex.join para virar uma única string shell-segura — nunca
-    concatenação manual de strings com aspas embutidas (isso já causou um
-    bug real: um `python -c "..."` com aspas duplas internas quebrava a
-    sintaxe do `bash -c "..."` que o envolvia quando entregue via
-    `gcloud compute ssh --command=...`, ver analysis/smoke_report.py)."""
+    """Só schema + fixture do oráculo. Roda ANTES de `restart_container`
+    reiniciar `tcc-service` (ver main()), para o catálogo item->contexto de
+    E-1/E-3 nascer já com dado real, não vazio — ver a docstring de
+    `restart_container` para o bug real que essa ordem corrige."""
     env_flags = build_storage_env_flags(cell_id, storage, database_ip, service_ip, postgres_password)
     steps = build_schema_and_fixture_steps(storage)
+    return _docker_run_script(env_flags, tools_image, steps)
+
+
+def build_remote_verification_script(
+    cell_id: str,
+    storage: str,
+    database_ip: str,
+    service_ip: str,
+    tools_image: str,
+    postgres_password: str | None,
+) -> str:
+    """Gates de corretude + smoke de carga. Roda DEPOIS de
+    `restart_container` (ver main()), contra um `tcc-service` cujo catálogo
+    já foi recarregado com o dado real recém-aplicado."""
+    env_flags = build_storage_env_flags(cell_id, storage, database_ip, service_ip, postgres_password)
     # Gate 1: strategy + storage adapter em processo, sem rede — prova a
     # lógica de recuperação, mas nunca passa pelo transporte HTTP.
-    steps.append(f"python -m harness.verify_cli --cell {cell_id}")
+    steps = [f"python -m harness.verify_cli --cell {cell_id}"]
     # Gate 2: mesmos casos do oráculo (uma amostra — ver
     # tests/acceptance/test_service_smoke.py), agora via POST HTTP de
     # verdade contra o serviço da célula. Sem isso, um bug só no parsing
@@ -424,13 +473,7 @@ def build_remote_smoke_script(
         "--console-output=/tmp/smoke-requests.ndjson --log-format=raw"
     )
     steps.append("python analysis/smoke_report.py /tmp/smoke-requests.ndjson")
-    inner = " && ".join(steps)
-
-    docker_argv = ["docker", "run", "--rm", "--network", "host", "--entrypoint", "bash"]
-    for flag in env_flags:
-        docker_argv += ["-e", flag]
-    docker_argv += [tools_image, "-c", inner]
-    return shlex.join(docker_argv)
+    return _docker_run_script(env_flags, tools_image, steps)
 
 
 def resource_snapshot(instance: str, zone: str, project_id: str) -> str:
@@ -558,12 +601,31 @@ def main(argv: list[str] | None = None) -> int:
             )
             postgres_password = secret_result.stdout.strip()
 
-        _phase("schema + fixture + verify + smoke (via loadgen)")
-        remote_cmd = build_remote_smoke_script(
+        _phase("schema + fixture (via loadgen)")
+        schema_cmd = build_remote_schema_fixture_script(
             args.cell, storage, database_ip, service_ip, tools_image, postgres_password
         )
         try:
-            result = gcloud_ssh(loadgen_instance, args.zone, args.project_id, remote_cmd)
+            result = gcloud_ssh(loadgen_instance, args.zone, args.project_id, schema_cmd)
+        except subprocess.CalledProcessError as e:
+            print(e.stdout)
+            print(e.stderr, file=sys.stderr)
+            raise RuntimeError("carga de schema/fixture remota falhou — ver saída acima") from e
+        print(result.stdout)
+
+        _phase("recarregar catálogo do serviço")
+        # Ver docstring de restart_container: sem isso, o catálogo item->
+        # contexto de E-1/E-3 fica com o dado (vazio) de antes desta carga.
+        restart_container(service_instance, args.zone, args.project_id, "tcc-service")
+        wait_for_container(service_instance, args.zone, args.project_id, "tcc-service")
+        wait_for_service_ready(loadgen_instance, args.zone, args.project_id, service_ip)
+
+        _phase("verify + smoke (via loadgen)")
+        verify_cmd = build_remote_verification_script(
+            args.cell, storage, database_ip, service_ip, tools_image, postgres_password
+        )
+        try:
+            result = gcloud_ssh(loadgen_instance, args.zone, args.project_id, verify_cmd)
         except subprocess.CalledProcessError as e:
             print(e.stdout)
             print(e.stderr, file=sys.stderr)

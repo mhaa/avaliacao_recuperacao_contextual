@@ -71,6 +71,7 @@ from infra.scripts.cloud_smoke_test import (
     fetch_terraform_access_token,
     gcloud_ssh,
     resource_snapshot,
+    restart_container,
     storage_for_cell,
     terraform,
     terraform_output_json,
@@ -263,7 +264,7 @@ def build_remote_battery_command(
 ) -> str:
     """Monta `docker run ... load/run_battery.py ...` como argv +
     shlex.join, mesmo padrão de segurança de
-    cloud_smoke_test.py:build_remote_smoke_script (nunca concatenar strings
+    cloud_smoke_test.py:_docker_run_script (nunca concatenar strings
     com aspas manualmente). Bind-monta `results_mount` porque o container é
     `--rm` — sem isso, `results/` some quando ele sai — e `fixtures_mount`
     (somente leitura) para reusar o `contexts_by_tier.json` que o setup já
@@ -872,6 +873,20 @@ def main(argv: list[str] | None = None) -> int:
             skip_dataset_load=snapshot_found,
         )
         gcloud_ssh(loadgen_instance, args.zone, args.project_id, setup_cmd)
+
+        if not snapshot_found:
+            # tcc-service sobe no boot da VM, antes do schema/carga acima
+            # existir (setup_cmd roda depois, via este SSH) — sem reiniciar,
+            # o catálogo item->contexto de E-1/E-3 (carregado uma única vez
+            # no lifespan de startup, service/http_app.py) fica com o dado
+            # (vazio) de antes desta carga, para sempre, sem erro nenhum. Só
+            # quando skip_dataset_load (snapshot_found), o dado já está no
+            # disco antes do banco sequer ficar pronto — nesse caso o
+            # crash-loop-retry natural do tcc-service já resolve, sem
+            # precisar de restart explícito. Ver restart_container.
+            print("\n--- recarregar catálogo do serviço ---")
+            restart_container(service_instance, args.zone, args.project_id, "tcc-service")
+            wait_for_container(service_instance, args.zone, args.project_id, "tcc-service")
 
         # Depois do schema/carga, não antes: numa VM sem snapshot o banco só
         # passa a responder consulta de verdade quando as tabelas existem.
