@@ -25,7 +25,7 @@ aplicação exatamente como E-1, contra `core/catalog.py` (ver CONTEXTO.md,
 
 from __future__ import annotations
 
-from core.catalog import ItemCatalog
+from core.catalog import ItemCatalog, load_catalog
 from core.contract import Request, Response, build_response
 from core.ordering import rank_candidates
 from core.session import apply_exclusion
@@ -48,7 +48,7 @@ class E3Prematerialized:
 
     async def prepare(self, storage: StorageAdapter) -> None:
         if self._catalog is None:
-            self._catalog = ItemCatalog(await storage.load_item_contexts())
+            self._catalog = await load_catalog(storage)
 
     async def retrieve(self, storage: StorageAdapter, req: Request) -> Response:
         if len(req.context) == 1:

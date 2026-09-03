@@ -17,6 +17,16 @@ import valkey
 from harness import fixtures
 
 URL = os.environ.get("TEST_VALKEY_URL", "redis://valkey:6379/0")
+
+# Hash de catálogo dedicado ao despejo de montagem (E-1/E-3):
+# item_id -> context_ids separados por vírgula. Redundante com as chaves
+# `item_contexts:{item_id}` (que E-2 continua usando via SISMEMBER no script
+# Lua), e a redundância é de propósito: enumerar as chaves por item exigiria
+# SCAN sobre o keyspace INTEIRO, que na base cheia tem ~4,4 milhões de chaves
+# para achar ~80 mil que interessam — trabalho proporcional ao total, não ao
+# catálogo. Com o hash, o despejo do catálogo é um HGETALL só. Custa ~1-2 MB.
+CATALOG_KEY = "catalog:item_contexts"
+
 # Flush a cada N comandos enfileirados no pipeline, não só no final — sem
 # isso, o cliente acumula TODOS os comandos da base completa (~100,5M
 # candidatos + ~4M linhas pré-materializadas em escala real) em memória
@@ -68,12 +78,17 @@ def main() -> None:
             print(f"candidates: {users_done} usuários gravados", flush=True)
     print(f"candidates: {users_done} usuários gravados (final)", flush=True)
 
+    catalog_mapping: dict[str, str] = {}
     for item_id, group in item_contexts.group_by("item_id"):
         (iid,) = item_id
         context_ids = group["context_id"].to_list()
         pipe.sadd(f"item_contexts:{iid}", *[str(c) for c in context_ids])
+        catalog_mapping[str(iid)] = ",".join(str(c) for c in context_ids)
         queue()
     print(f"item_contexts: {item_contexts.height} linhas gravadas", flush=True)
+
+    pipe.hset(CATALOG_KEY, mapping=catalog_mapping)
+    queue()
 
     for (user_id, context_id), group in prematerialized.group_by(["user_id", "context_id"]):
         mapping = {str(row["item_id"]): row["score"] for row in group.iter_rows(named=True)}

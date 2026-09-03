@@ -20,6 +20,13 @@ primitivas nativas do Valkey:
   a célula E-1/Valkey medir a normalização escolhida aqui em vez do custo
   real de uma leitura em massa (ver CONTEXTO.md, "Catálogo item->contexto
   residente na aplicação").
+- `catalog:item_contexts` — HASH item_id -> context_ids separados por
+  vírgula, gravado pelos loaders. É a fonte do despejo de montagem
+  (`load_item_contexts`), redundante de propósito com as chaves por item:
+  enumerá-las exigiria SCAN sobre o keyspace INTEIRO (~4,4 milhões de
+  chaves na base cheia para achar ~80 mil), com custo proporcional ao total
+  e não ao catálogo — 4 workers subindo juntos saturariam a thread única do
+  Valkey por dezenas de segundos. Com o hash, é um HGETALL só.
 - `candidates_set:{user_id}` — SET de item_id (mesma informação de
   `candidates:{user_id}`, só que como SET, para permitir SINTERSTORE).
 - `inverted:{context_id}` — SET de item_id (lista invertida global, não
@@ -54,9 +61,8 @@ from .base import (
     StorageAdapter,
 )
 
-# Lote do SCAN + SMEMBERS da carga do catálogo. ~87.585 chaves em lotes de
-# 1.000 = ~88 round-trips, uma única vez na subida do serviço.
-_CATALOG_SCAN_BATCH = 1_000
+# Ver docstring: o catálogo vem de um hash único, não de um SCAN do keyspace.
+_CATALOG_KEY = "catalog:item_contexts"
 
 _FILTER_SCRIPT = """
 local result = {}
@@ -110,28 +116,21 @@ class ValkeyAdapter(StorageAdapter):
         return await asyncio.to_thread(self._load_item_contexts_sync)
 
     def _load_item_contexts_sync(self) -> dict[int, frozenset[int]]:
-        catalog: dict[int, frozenset[int]] = {}
-        batch: list[str] = []
-
-        def drain() -> None:
-            if not batch:
-                return
-            pipe = self._client.pipeline(transaction=False)
-            for key in batch:
-                pipe.smembers(key)
-            for key, members in zip(batch, pipe.execute()):
-                catalog[int(key.split(":", 1)[1])] = frozenset(int(m) for m in members)
-            batch.clear()
-
-        # scan_iter, não KEYS: KEYS varre o keyspace inteiro num único
-        # comando bloqueante — inaceitável mesmo na subida, com ~100M chaves
-        # de candidatos no mesmo banco.
-        for key in self._client.scan_iter(match="item_contexts:*", count=_CATALOG_SCAN_BATCH):
-            batch.append(key)
-            if len(batch) >= _CATALOG_SCAN_BATCH:
-                drain()
-        drain()
-        return catalog
+        # EXISTS antes do HGETALL: um hash ausente e um catálogo legitimamente
+        # vazio devolvem a mesma coisa ({}), e um catálogo vazio faria E-1
+        # responder lista vazia para qualquer predicado — resposta errada, em
+        # silêncio. É exatamente o modo de falha de subir contra um dado
+        # carregado por um loader antigo. Falhar alto, na montagem.
+        if not self._client.exists(_CATALOG_KEY):
+            raise RuntimeError(
+                f"chave '{_CATALOG_KEY}' não existe no Valkey — o dado foi carregado "
+                "por uma versão anterior de schemas/valkey/load_*.py. Recarregue."
+            )
+        raw = self._client.hgetall(_CATALOG_KEY)
+        return {
+            int(item_id): frozenset(int(c) for c in contexts.split(",") if c)
+            for item_id, contexts in raw.items()
+        }
 
     async def get_candidates_filtered(self, user_id: int, context: list[int]) -> list[Candidate]:
         if not context:

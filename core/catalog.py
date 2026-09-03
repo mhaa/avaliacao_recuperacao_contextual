@@ -21,6 +21,9 @@ composto, onde E-3 cai para leitura completa + filtro em aplicação).
 
 from __future__ import annotations
 
+import os
+import time
+
 from core.contract import Candidate
 
 
@@ -49,3 +52,25 @@ class ItemCatalog:
         by_item = self._contexts_by_item
         empty: frozenset[int] = frozenset()
         return [c for c in candidates if wanted <= by_item.get(c.item_id, empty)]
+
+
+async def load_catalog(storage) -> ItemCatalog:
+    """Carrega o catálogo e registra quanto levou.
+
+    O tempo importa e não aparece em nenhuma métrica de latência: `prepare`
+    roda uma vez POR WORKER Hypercorn (4 numa `n2-standard-4`, processos
+    separados por "spawn"), então são 4 despejos concorrentes do catálogo no
+    instante em que o serviço sobe. Não afeta latência de requisição, mas
+    afeta o tempo até o serviço ficar pronto — é onde um health check de
+    timeout curto falharia. O pid distingue as linhas dos workers
+    concorrentes; a contagem de itens denuncia catálogo truncado.
+    """
+    started = time.perf_counter()
+    catalog = ItemCatalog(await storage.load_item_contexts())
+    elapsed = time.perf_counter() - started
+    print(
+        f"[prepare] catálogo item->contexto: {len(catalog)} itens "
+        f"de '{storage.name}' em {elapsed:.3f}s (pid={os.getpid()})",
+        flush=True,
+    )
+    return catalog

@@ -1,9 +1,11 @@
 # Expectativa de latência — análise anterior à medição
 
-**Status: estimativas de engenharia, não medições.** Nada aqui foi medido nesta
-bancada. O objetivo é ter uma régua *antes* da primeira bateria válida, para
-distinguir "resultado legítimo da tecnologia" de "erro de configuração" — sem
-essa régua, um p99 de 800 ms parece tão plausível quanto um de 8 ms.
+**Status: estimativas de engenharia, não medições** — com uma exceção, a seção
+9, que traz o único número medido de verdade até aqui (tempo de montagem do
+catálogo). Nenhuma latência de requisição foi medida. O objetivo é ter uma
+régua *antes* da primeira bateria válida, para distinguir "resultado legítimo
+da tecnologia" de "erro de configuração" — sem essa régua, um p99 de 800 ms
+parece tão plausível quanto um de 8 ms.
 
 Escrito em 2026-09-02, revisado em 2026-09-03 após a mudança do catálogo
 item→contexto (README, "Fase 2.6"), que alterou o custo de E-1 nas quatro
@@ -185,6 +187,48 @@ Discriminantes por sintoma:
    interpretar qualquer diferença entre células.
 3. Só então subir para 1.000 e 10.000 req/s, esperando que boa parte da matriz
    sature — o que é a terceira dimensão da fronteira de Pareto, não uma falha.
+
+## 9. Medido: tempo de montagem do catálogo (`prepare`)
+
+Único número real deste documento. Medido em 2026-09-03 no ambiente **local**
+(Docker, fixture do oráculo), com a instrumentação de `core/catalog.py:
+load_catalog`. Não é latência de requisição — `prepare` roda uma vez na
+montagem da célula, fora do caminho medido.
+
+| Storage | `prepare` | Itens | Técnica do despejo |
+|---|---|---|---|
+| Valkey | **0,265 s** | 79.602 | 1 `HGETALL` de `catalog:item_contexts` |
+| PostgreSQL | **0,34 – 0,52 s** | 79.602 | `GROUP BY` + `array_agg`, 1 query |
+| ScyllaDB | **0,50 s** | 79.602 | varredura paginada (`fetch_size=10.000`) |
+| OpenSearch | **1,98 s** | 79.602 | `search_after`, ~9 páginas de 10.000 |
+
+As quatro concordam em 79.602 itens — checagem cruzada de que nenhum despejo
+está truncando. E 79.602 **já é o tamanho real** do catálogo: ele deriva de
+`items.parquet` global, não do subconjunto de usuários do oráculo.
+
+**Esses números devem se sustentar na base cheia.** A propriedade que importa é
+que nenhuma das quatro escala com U — todas as estruturas de catálogo têm
+tamanho fixo:
+
+| Storage | Escala com | Na nuvem |
+|---|---|---|
+| Valkey | catálogo (~80 mil, fixo) | ~0,3 s |
+| PostgreSQL | tabela `item_contexts` (fixa) | ~0,5 s |
+| ScyllaDB | tabela `item_contexts` (fixa) | ~0,5 s |
+| OpenSearch | índice `item_contexts` (~80 mil docs, fixo) | ~2 s |
+
+Era exatamente essa propriedade que faltava ao Valkey: a primeira versão
+enumerava as chaves `item_contexts:*` com `scan_iter`, e `SCAN` percorre o
+keyspace **inteiro** filtrando no servidor — custo proporcional ao total de
+chaves (~4,4 milhões na base cheia, contra ~102 mil localmente), não ao
+catálogo. Medido em 0,849 s localmente, extrapolava para ~37 s por worker na
+nuvem, com 4 workers concorrentes contra a thread única do Valkey. O hash de
+catálogo dedicado eliminou a dependência.
+
+**Efeito na subida do serviço:** `prepare` roda uma vez por worker Hypercorn,
+4 em paralelo (`spawn`). Pior caso é o OpenSearch: entre ~2 s e ~8 s até o
+serviço aceitar tráfego. Folgado para qualquer health check razoável, mas é
+número conhecido em vez de suposição.
 
 ---
 
