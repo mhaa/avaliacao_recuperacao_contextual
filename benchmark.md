@@ -139,11 +139,31 @@ seja o banco. Consequências:
   banco. Já houve precedente: o serviço ficou preso em ~28% de CPU com
   latências de 10–24 s até o número de workers ser corrigido.
 
-**Verificação pendente:** não existe endpoint de baseline — só
-`/v1/recommendations`. Um endpoint que devolve k itens sintéticos sem tocar o
-banco, sob o mesmo k6, daria o custo puro de Hypercorn+Pydantic+rede. Toda
-comparação passaria a ser "latência da célula − piso", e a pergunta "isso é o
-banco ou minha aplicação?" teria resposta numérica. Vale como número no TCC.
+**Como medir:** `POST /v1/baseline` (service/http_app.py) devolve k itens
+sintéticos sem tocar o banco. Percorre exatamente o mesmo caminho de
+`/v1/recommendations` — mesmo parse de `context`/`exclude`, mesma construção
+de `ResponseItem`, mesma revalidação pelo `response_model`, mesma
+serialização, mesmos dois hops — exceto a leitura e a filtragem. Existe em
+toda célula, então o piso é medível **no mesmo deploy** que está sendo medido.
+
+O k6 não precisa de cenário novo: `TARGET_URL` já vem de `__ENV`
+(load/scenarios.js).
+
+```
+TARGET_URL=http://<ip-do-servico>:8000/v1/baseline \
+CELL=<celula> K=20 RATE=1000 k6 run load/scenarios.js
+```
+
+A subtração "latência da célula − piso" só é legítima se os dois payloads
+tiverem o mesmo tamanho, porque serialização e rede escalam com bytes. Isso é
+garantido por teste (`test_baseline_payload_matches_real_response_size`,
+tolerância de 5% contra uma resposta real de E-1 com ids e scores de largura
+realista), não por inspeção — é por isso que os valores sintéticos usam ids de
+5 dígitos e scores de 6 casas decimais, e não `1, 2, 3` com score `1.0`.
+
+Medir o piso **antes** de interpretar qualquer diferença entre células. Ele
+também é número publicável no TCC: quantifica quanto da latência observada é
+da bancada e não da tecnologia — a ameaça à validade descrita acima.
 
 ## 7. Régua de diagnóstico
 
