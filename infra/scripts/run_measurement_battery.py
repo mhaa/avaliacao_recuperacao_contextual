@@ -925,7 +925,14 @@ def main(argv: list[str] | None = None) -> int:
                 FIXTURES_MOUNT,
                 timestamp,
             )
-            gcloud_ssh(loadgen_instance, args.zone, args.project_id, remote_cmd)
+            # print(result.stdout): sem isso, o resultado desta combinação
+            # fica completamente mudo no log — confirmado ao vivo: um crash
+            # posterior (na sondagem de saturação) levou o destroy a rodar
+            # sem nunca ter sincronizado os resultados desta combinação, e
+            # não havia NENHUM indício no log de como as 5 repetições
+            # tinham se saído antes de perdê-las com a VM.
+            result = gcloud_ssh(loadgen_instance, args.zone, args.project_id, remote_cmd)
+            print(result.stdout)
 
         if args.phase == "triagem":
             print("\n--- rampa curta de saturação (exploratória, CONTEXTO.md) ---")

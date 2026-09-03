@@ -106,10 +106,18 @@ def build_k6_cmd(
     # sob cardinalidade em bateria real). --out json=... continua sendo
     # gravado (k6-raw.json) só como saída nativa de diagnóstico do k6 —
     # nada mais o lê.
-    # Path(...): infra/scripts/run_measurement_battery.py:build_remote_probe_command
-    # passa json_out como string (mesma convenção usada em todo aquele
-    # arquivo), não Path — .with_name exige Path.
-    requests_out = Path(json_out).with_name("requests.ndjson")
+    # Path(...).as_posix(): infra/scripts/run_measurement_battery.py roda
+    # NO HOST (README.md, Fase 5 — "roda no HOST, não dentro do container
+    # tools"), que aqui é Windows. Path(str) sem .as_posix() vira
+    # WindowsPath, e str(WindowsPath) usa barra invertida — um argumento
+    # `--console-output=\app\results\...` enviado por SSH pro loadgen
+    # (sempre Linux) não abre nada lá. Confirmado ao vivo: k6 rodou normal
+    # (a barra invertida virou parte de um nome de arquivo, não um path),
+    # mas analysis/probe_report.py explodiu com FileNotFoundError procurando
+    # o caminho de barra normal que ele mesmo espera. .as_posix() força
+    # barra normal em qualquer host — mesmo motivo de SCENARIOS_SCRIPT
+    # acima.
+    requests_out = Path(json_out).with_name("requests.ndjson").as_posix()
     cmd = [
         "k6",
         "run",
@@ -155,7 +163,7 @@ def build_probe_k6_cmd(
     load/scenarios.js, sem RATE/K fixos de constant-arrival-rate normal
     (a duração/aquecimento vêm do algoritmo de busca, não de --repetitions/
     --phase)."""
-    requests_out = Path(json_out).with_name("requests.ndjson")
+    requests_out = Path(json_out).with_name("requests.ndjson").as_posix()
     return [
         "k6",
         "run",
