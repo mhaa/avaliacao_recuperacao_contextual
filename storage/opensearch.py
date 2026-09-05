@@ -20,10 +20,15 @@ aplicação". `get_candidates_filtered` usa uma bool
 query com uma cláusula `term` por context_id pedido (AND via múltiplas
 cláusulas `must`) — exatamente a semântica que o índice invertido do Lucene
 resolve nativamente, sem workaround (E-2 "nativo" por docs/DESIGN.md).
-`intersect` usa a mesma técnica de consulta por ora — a distinção real de
-E-2 vs. E-4 (predicado direto vs. interseção com lista invertida global) é
-uma otimização de Fase 2 (medição de latência), fora do escopo desta etapa
-(corretude) — mesma decisão já tomada para Postgres/Scylla/Valkey.
+
+`intersect` usa a mesma técnica de consulta — e, ao contrário do mesmo
+reaproveitamento em Postgres (placeholder até a técnica `intarray`/roaring
+entrar em cena, ver storage/postgres.py), aqui isso é definitivo: um filtro
+`term`/`bool filter` já É a interseção de listas invertidas (postings lists)
+do Lucene. Não existe, neste motor, uma segunda primitiva nativa para
+"intersectar o candidato com a lista invertida do contexto" que seja
+distinta de "aplicar o predicado" — E-2 e E-4 são mecanisticamente idênticos
+em OpenSearch. Ver docs/DESIGN.md, nota de rodapé da matriz de viabilidade.
 """
 
 from __future__ import annotations

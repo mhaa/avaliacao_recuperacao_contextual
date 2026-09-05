@@ -97,15 +97,38 @@ requisição. A leitura em massa é a primitiva `load_item_contexts`, chamada um
 |  | BD-1 Postgres | BD-2 Valkey | BD-3 Scylla | BD-4 OpenSearch |
 |---|---|---|---|---|
 | E-1 | viável | viável | viável | viável |
-| E-2 | viável (SQL + GIN) | viável (script Lua) | viável (clustering key) | viável (nativo) |
+| E-2 | viável (SQL + GIN) | viável (script Lua) | viável (clustering key) | viável (nativo)¹ |
 | E-3 | viável | viável | viável (chave composta) | sem sentido arquitetural |
-| E-4 | viável (intarray/roaring) | viável (SINTERSTORE) | **inviável** (sem primitiva) | viável (interno ao Lucene) |
+| E-4 | viável (intarray/roaring) | viável (SINTERSTORE) | **inviável** (sem primitiva) | viável (interno ao Lucene)¹ |
 
 Células inviáveis são **resultado documentado**, não falha. O motivo técnico de
 cada uma está registrado na implementação (`storage/scylla.py`, `storage/opensearch.py`)
 e verificado por teste (`tests/acceptance/test_infeasible_cells_fail_at_startup.py`)
 — ver [ARCHITECTURE.md](ARCHITECTURE.md) e [DECISIONS.md](DECISIONS.md#etapa-5-scylla)
 (E-4/Scylla) e [DECISIONS.md](DECISIONS.md#etapa-5-opensearch) (E-3/OpenSearch).
+
+¹ **E-2 e E-4 são mecanisticamente idênticos em BD-4 (OpenSearch).** Não é
+uma lacuna de implementação a fechar depois — é consequência estrutural do
+motor ser um índice invertido: um filtro `term`/`bool filter` já É a
+interseção de listas invertidas (postings lists) do Lucene. "Delegar o
+predicado ao banco" (E-2) e "intersectar o candidato com a lista invertida do
+contexto" (E-4) resolvem na mesma primitiva de execução — os rótulos
+"nativo" e "interno ao Lucene" descrevem essa mesma operação por ângulos
+diferentes (ótica da estratégia vs. ótica do motor), não duas técnicas
+distintas. Isso contrasta com BD-1 e BD-2, onde as duas estratégias usam
+técnicas genuinamente diferentes (Postgres: predicado via `WHERE`/`JOIN` vs.
+interseção via `intarray` sobre uma lista invertida global materializada
+por contexto, `inverted_lists`; Valkey: predicado via script Lua vs.
+interseção via `SINTER` sobre `inverted:{context_id}`) — em nenhum dos dois
+bancos E-2 e E-4 compartilham plano de execução. Nesse nível ("conjunto
+materializado + primitiva nativa de intersecção, buscado por chave"),
+Postgres/`intarray` e Valkey/`SINTER` ficam abaixo do OpenSearch, onde a
+intersecção acontece DENTRO do índice (Lucene percorre postings lists via
+skip-list) — mas ainda assim é uma primitiva de intersecção de conjuntos
+nativa do banco, não predicado avaliado linha a linha. Ver
+`storage/postgres.py`, `storage/opensearch.py` e
+[DECISIONS.md](DECISIONS.md#etapa-4) /
+[DECISIONS.md](DECISIONS.md#etapa-5-opensearch).
 
 ## Fase 2 — Camada de transmissão
 

@@ -22,10 +22,13 @@ def main() -> None:
     candidates = fixtures.load_candidates(user_ids)
     item_contexts = fixtures.load_item_contexts()
     prematerialized = fixtures.load_prematerialized(user_ids)
+    inverted_lists = fixtures.load_inverted_lists()
 
     with psycopg.connect(CONNINFO, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE candidates, item_contexts, prematerialized")
+            cur.execute(
+                "TRUNCATE candidates, item_contexts, prematerialized, inverted_lists"
+            )
             with cur.copy("COPY candidates (user_id, item_id, rank, score) FROM STDIN") as copy:
                 for row in candidates.select(["user_id", "item_id", "rank", "score"]).iter_rows():
                     copy.write_row(row)
@@ -39,14 +42,25 @@ def main() -> None:
                     ["user_id", "context_id", "item_id", "rank", "score"]
                 ).iter_rows():
                     copy.write_row(row)
+            # ~20 linhas (C=20 contextos) — INSERT parametrizado em vez de
+            # COPY: psycopg3 adapta list[int] para int[] diretamente via
+            # parâmetro, sem depender da serialização de array do protocolo
+            # texto do COPY.
+            cur.executemany(
+                "INSERT INTO inverted_lists (context_id, item_ids) VALUES (%s, %s)",
+                inverted_lists.select(["context_id", "item_ids"]).iter_rows(),
+            )
             # Mesma razão de schemas/postgres/load_full_dataset.py: ANALYZE
             # pela estatística do planner, VACUUM pelo mapa de visibilidade
             # (sem ele o index-only scan ainda toca a heap em toda linha).
-            cur.execute("VACUUM ANALYZE candidates, item_contexts, prematerialized")
+            cur.execute(
+                "VACUUM ANALYZE candidates, item_contexts, prematerialized, inverted_lists"
+            )
 
     print(
         f"Carregado: {len(candidates)} candidatos, {len(item_contexts)} pertences "
         f"item-contexto, {len(prematerialized)} linhas pré-materializadas, "
+        f"{len(inverted_lists)} listas invertidas de contexto, "
         f"{len(user_ids)} usuários referenciados pelo oráculo"
     )
 

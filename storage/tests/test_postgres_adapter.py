@@ -28,6 +28,11 @@ CONNINFO = os.environ.get("TEST_POSTGRES_DSN", "postgresql://tcc:tcc@postgres:54
 
 _TEST_USER_ID = 999_001
 _TEST_ITEM_IDS = [90_000_001, 90_000_002, 90_000_003]
+# Fora da faixa real de contextos (C=20, ids 1..20) — mesmo cuidado do
+# docstring do módulo, agora estendido a `inverted_lists`: sua PK é só
+# `context_id`, então um id real colidiria com uma lista invertida global
+# de verdade, carregada por load_oracle_fixture.py.
+_TEST_CONTEXT_IDS = [9001, 9002]
 
 
 def _seed():
@@ -35,6 +40,9 @@ def _seed():
         with conn.cursor() as cur:
             cur.execute("DELETE FROM candidates WHERE user_id = %s", (_TEST_USER_ID,))
             cur.execute("DELETE FROM item_contexts WHERE item_id = ANY(%s)", (_TEST_ITEM_IDS,))
+            cur.execute(
+                "DELETE FROM inverted_lists WHERE context_id = ANY(%s)", (_TEST_CONTEXT_IDS,)
+            )
             cur.executemany(
                 "INSERT INTO candidates (user_id, item_id, rank, score) VALUES (%s, %s, %s, %s)",
                 [
@@ -52,6 +60,17 @@ def _seed():
                     (_TEST_ITEM_IDS[2], 2),
                 ],
             )
+            # Lista invertida de teste: contexto 9001 = {item0, item2},
+            # contexto 9002 = {item1, item2} — item2 é o único presente nos
+            # dois, mesma forma dos dados de get_candidates_filtered acima,
+            # para exercitar a semântica AND de intersect.
+            cur.executemany(
+                "INSERT INTO inverted_lists (context_id, item_ids) VALUES (%s, %s)",
+                [
+                    (_TEST_CONTEXT_IDS[0], [_TEST_ITEM_IDS[0], _TEST_ITEM_IDS[2]]),
+                    (_TEST_CONTEXT_IDS[1], [_TEST_ITEM_IDS[1], _TEST_ITEM_IDS[2]]),
+                ],
+            )
 
 
 def _cleanup():
@@ -59,6 +78,9 @@ def _cleanup():
         with conn.cursor() as cur:
             cur.execute("DELETE FROM candidates WHERE user_id = %s", (_TEST_USER_ID,))
             cur.execute("DELETE FROM item_contexts WHERE item_id = ANY(%s)", (_TEST_ITEM_IDS,))
+            cur.execute(
+                "DELETE FROM inverted_lists WHERE context_id = ANY(%s)", (_TEST_CONTEXT_IDS,)
+            )
 
 
 @pytest.fixture
@@ -85,12 +107,12 @@ async def test_get_candidates_ordered_by_rank(adapter, seeded_user):
     assert [c.item_id for c in result] == _TEST_ITEM_IDS
 
 
-async def test_get_candidates_carries_context_membership(adapter, seeded_user):
+async def test_get_candidates_returns_all_items(adapter, seeded_user):
+    # Pertença item->contexto não viaja mais em Candidate (Fase 2.6,
+    # catálogo em memória — core/contract.py:Candidate só tem
+    # item_id/score); essa cobertura mora em strategies/tests/, não aqui.
     result = await adapter.get_candidates(seeded_user)
-    context_ids_by_item = {c.item_id: c.context_ids for c in result}
-    assert context_ids_by_item[_TEST_ITEM_IDS[0]] == frozenset({1})
-    assert context_ids_by_item[_TEST_ITEM_IDS[1]] == frozenset({2})
-    assert context_ids_by_item[_TEST_ITEM_IDS[2]] == frozenset({1, 2})
+    assert {c.item_id for c in result} == set(_TEST_ITEM_IDS)
 
 
 async def test_get_candidates_filtered_returns_only_matching_context(adapter, seeded_user):
@@ -111,3 +133,27 @@ async def test_get_candidates_filtered_empty_context_returns_everything(adapter,
 async def test_unknown_user_returns_empty_list_not_error(adapter):
     result = await adapter.get_candidates(999_999_999)
     assert result == []
+
+
+async def test_intersect_single_context(adapter, seeded_user):
+    result = await adapter.intersect(seeded_user, [_TEST_CONTEXT_IDS[0]], limit=500)
+    assert {c.item_id for c in result} == {_TEST_ITEM_IDS[0], _TEST_ITEM_IDS[2]}
+
+
+async def test_intersect_is_and_across_contexts(adapter, seeded_user):
+    result = await adapter.intersect(seeded_user, _TEST_CONTEXT_IDS, limit=500)
+    assert {c.item_id for c in result} == {_TEST_ITEM_IDS[2]}
+
+
+async def test_intersect_empty_context_returns_nothing(adapter, seeded_user):
+    # Diferente de get_candidates_filtered([]) (devolve tudo): E-4 não tem
+    # lista invertida global para intersectar sem contexto, mesmo contrato
+    # de storage/valkey.py e storage/opensearch.py.
+    result = await adapter.intersect(seeded_user, [], limit=500)
+    assert result == []
+
+
+async def test_intersect_respects_limit(adapter, seeded_user):
+    result = await adapter.intersect(seeded_user, [_TEST_CONTEXT_IDS[0]], limit=1)
+    assert len(result) == 1
+    assert {c.item_id for c in result} <= {_TEST_ITEM_IDS[0], _TEST_ITEM_IDS[2]}

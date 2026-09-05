@@ -35,6 +35,47 @@ aplicação (mesmo caminho de E-1). Isso é um resultado citável do trabalho
 (E-3 não tem vantagem em contexto composto), não um bug — ver a docstring do
 módulo para os detalhes.
 
+**E-4/Postgres — de placeholder a técnica real (revisão pós-Etapa 5).** A
+primeira versão de `intersect` reaproveitava a mesma SQL de
+`get_candidates_filtered` (E-2) só com `LIMIT` — suficiente para o harness de
+corretude, mas identificado em revisão como bloqueador antes da triagem: E-2
+e E-4 mediriam o mesmo plano de execução em Postgres, tornando a comparação
+entre as duas estratégias vazia por construção nessa tecnologia. Corrigido
+usando `intarray` (contrib oficial do Postgres) sobre uma nova tabela
+`inverted_lists(context_id, item_ids[])` — lista invertida global por
+contexto, carregada de `data_generation/data/inverted_lists.parquet` via
+`harness/fixtures.py:load_inverted_lists()` (existia desde a geração de
+dados, mas nenhum loader do Postgres a consumia). O operador `&` intersecta
+o array de candidatos do usuário com a lista invertida do(s) contexto(s)
+pedido(s) — mecanismo de array-merge sobre dado desnormalizado, distinto do
+JOIN+GROUP BY/HAVING de E-2 sobre `item_contexts` (normalizado).
+
+Considerado e descartado `pg_roaringbitmap` (apesar de o pipeline já gerar
+`inverted_bitmaps/*.bin` em formato Roaring via `pyroaring`, especificamente
+para esse tipo de consumo): não é módulo contrib do Postgres, exigiria
+compilar e publicar uma imagem Postgres customizada — tanto localmente
+(`docker-compose.yml`, hoje `postgres:16-alpine` oficial) quanto na nuvem
+(`infra/modules/database/main.tf`, mesma imagem oficial puxada via
+`docker pull` numa VM Container-Optimized OS, que não tem toolchain de
+build). Seria uma mudança de infraestrutura nova e permanente, fora do
+escopo de corrigir `intersect` — e reabriria a classe de risco de imagem de
+serviço dessincronizada já vivida neste projeto. `intarray` não exige nada
+disso: já vem compilado na imagem oficial, só precisa de
+`CREATE EXTENSION`.
+
+Vale registrar o "nível" de lista invertida aqui: `inverted_lists` é
+estruturalmente uma lista invertida (contexto→itens materializado), e `#`
+é a primitiva nativa de intersecção de conjuntos do Postgres sobre esse
+dado — mas, ao contrário do índice invertido do Lucene (OpenSearch), a
+intersecção não é feita PERCORRENDO um índice: os dois arrays são buscados
+por chave e intersectados fora de qualquer estrutura de índice secundária.
+É o mesmo nível do Valkey (`SINTER` sobre dois SETs buscados por chave) —
+abaixo do nível do OpenSearch (intersecção index-resident via skip-list),
+acima do nível de um JOIN linha-a-linha sobre dado normalizado (E-2). Sem
+índice GIN em `inverted_lists`: o acesso é sempre direto por `context_id`
+(chave primária); GIN só aceleraria "quais linhas contêm o item X", que não
+é o padrão de acesso de `intersect`.
+
 ## Etapa 5 — Valkey (BD-2) <a id="etapa-5-valkey"></a>
 
 **Decisão de implementação**: a imagem usada (`valkey/valkey:8-alpine`) não
@@ -113,10 +154,17 @@ estrutura global compartilhada entre usuários, então um `user_id` fora da
 faixa real já isola os testes de integração, sem o risco de colisão que
 apareceu nas etapas anteriores.
 
-`intersect` usa a mesma técnica de consulta de `get_candidates_filtered` por
-ora — a distinção real de E-2 vs. E-4 é uma otimização de latência da Fase 2,
-fora do escopo desta etapa (corretude), mesma decisão já tomada para
-Postgres/Scylla/Valkey.
+`intersect` usa a mesma técnica de consulta de `get_candidates_filtered` —
+e aqui isso **não** é um placeholder a ser substituído mais tarde (diferente
+da decisão tomada para Postgres, onde `intersect` reaproveita a SQL de E-2
+só até a técnica `intarray`/roaring entrar em cena). Em OpenSearch, um
+filtro `term`/`bool filter` já É a interseção de listas invertidas — não
+existe, neste motor, uma segunda primitiva nativa para intersectar o
+candidato com a lista invertida do contexto que seja distinta de aplicar o
+predicado. E-2 e E-4 são, portanto, **mecanisticamente idênticos** nesta
+tecnologia: resultado documentado da matriz de viabilidade (ver
+[DESIGN.md](DESIGN.md), nota de rodapé da matriz), não uma lacuna de
+implementação.
 
 ## Fase 2.6 — Catálogo item→contexto em memória (correção de assimetria em E-1) <a id="fase-2-6"></a>
 

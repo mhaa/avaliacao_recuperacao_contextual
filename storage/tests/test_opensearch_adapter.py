@@ -44,13 +44,13 @@ def seeded_user():
     )
 
 
-async def test_get_candidates_returns_all_with_context_ids(seeded_user):
+async def test_get_candidates_returns_all_items(seeded_user):
+    # Pertença item->contexto não viaja mais em Candidate (Fase 2.6,
+    # catálogo em memória — core/contract.py:Candidate só tem
+    # item_id/score); essa cobertura mora em strategies/tests/, não aqui.
     adapter = OpenSearchAdapter(HOSTS)
     result = await adapter.get_candidates(seeded_user)
-    by_id = {c.item_id: c for c in result}
-    assert set(by_id) == {90_000_001, 90_000_002, 90_000_003}
-    assert by_id[90_000_001].context_ids == frozenset({1})
-    assert by_id[90_000_003].context_ids == frozenset({1, 2})
+    assert {c.item_id for c in result} == {90_000_001, 90_000_002, 90_000_003}
 
 
 async def test_get_candidates_filtered_single_context(seeded_user):

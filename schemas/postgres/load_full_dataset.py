@@ -41,10 +41,13 @@ def main() -> None:
     candidates = fixtures.load_candidates()
     item_contexts = fixtures.load_item_contexts()
     prematerialized = fixtures.load_prematerialized()
+    inverted_lists = fixtures.load_inverted_lists()
 
     with psycopg.connect(CONNINFO, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE candidates, item_contexts, prematerialized")
+            cur.execute(
+                "TRUNCATE candidates, item_contexts, prematerialized, inverted_lists"
+            )
             with cur.copy("COPY candidates (user_id, item_id, rank, score) FROM STDIN") as copy:
                 _copy_rows(
                     copy,
@@ -67,6 +70,16 @@ def main() -> None:
                     label="prematerialized",
                     interval=500_000,
                 )
+            # ~20 linhas (C=20 contextos) — INSERT parametrizado em vez de
+            # COPY: psycopg3 adapta list[int] para int[] diretamente via
+            # parâmetro, sem depender da serialização de array do protocolo
+            # texto do COPY (mesma razão de load_oracle_fixture.py).
+            print("inverted_lists: gravando...", flush=True)
+            cur.executemany(
+                "INSERT INTO inverted_lists (context_id, item_ids) VALUES (%s, %s)",
+                inverted_lists.select(["context_id", "item_ids"]).iter_rows(),
+            )
+            print(f"inverted_lists: {len(inverted_lists)} linhas gravadas (final)", flush=True)
             # VACUUM ANALYZE (não só ANALYZE) depois do COPY em massa, por
             # dois motivos distintos:
             # - ANALYZE: sem estatística, o planner escolhe plano no escuro
@@ -80,11 +93,14 @@ def main() -> None:
             #   confirmado com EXPLAIN (ANALYZE, BUFFERS) numa base recém-
             #   carregada.
             print("Rodando VACUUM ANALYZE...", flush=True)
-            cur.execute("VACUUM ANALYZE candidates, item_contexts, prematerialized")
+            cur.execute(
+                "VACUUM ANALYZE candidates, item_contexts, prematerialized, inverted_lists"
+            )
 
     print(
         f"Carregado: {len(candidates)} candidatos, {len(item_contexts)} pertences "
-        f"item-contexto, {len(prematerialized)} linhas pré-materializadas (base completa)"
+        f"item-contexto, {len(prematerialized)} linhas pré-materializadas, "
+        f"{len(inverted_lists)} listas invertidas de contexto (base completa)"
     )
 
 

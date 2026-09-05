@@ -61,13 +61,13 @@ def seeded_user():
     client.srem(f"inverted:{c2}", i2, i3)
 
 
-async def test_get_candidates_returns_all_with_context_ids(seeded_user):
+async def test_get_candidates_returns_all_items(seeded_user):
+    # Pertença item->contexto não viaja mais em Candidate (Fase 2.6,
+    # catálogo em memória — core/contract.py:Candidate só tem
+    # item_id/score); essa cobertura mora em strategies/tests/, não aqui.
     adapter = ValkeyAdapter(URL)
     result = await adapter.get_candidates(seeded_user)
-    by_id = {c.item_id: c for c in result}
-    assert set(by_id) == {90000001, 90000002, 90000003}
-    assert by_id[90000001].context_ids == frozenset({900001})
-    assert by_id[90000003].context_ids == frozenset({900001, 900002})
+    assert {c.item_id for c in result} == {90000001, 90000002, 90000003}
 
 
 async def test_get_candidates_filtered_returns_only_matching_context(seeded_user):

@@ -91,13 +91,13 @@ def seeded_user():
     cluster.shutdown()
 
 
-async def test_get_candidates_returns_all_with_context_ids(seeded_user):
+async def test_get_candidates_returns_all_items(seeded_user):
+    # Pertença item->contexto não viaja mais em Candidate (Fase 2.6,
+    # catálogo em memória — core/contract.py:Candidate só tem
+    # item_id/score); essa cobertura mora em strategies/tests/, não aqui.
     adapter = ScyllaAdapter(HOSTS)
     result = await adapter.get_candidates(seeded_user)
-    by_id = {c.item_id: c for c in result}
-    assert set(by_id) == {_ITEM_A, _ITEM_B, _ITEM_C}
-    assert by_id[_ITEM_A].context_ids == frozenset({_CTX_1})
-    assert by_id[_ITEM_C].context_ids == frozenset({_CTX_1, _CTX_2})
+    assert {c.item_id for c in result} == {_ITEM_A, _ITEM_B, _ITEM_C}
 
 
 async def test_get_candidates_filtered_single_context(seeded_user):

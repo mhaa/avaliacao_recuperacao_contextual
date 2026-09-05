@@ -4,13 +4,25 @@ Implementa as 4 primitivas. `get_candidates`/`get_candidates_filtered`
 chegaram na Etapa 2; `get_prematerialized`/`intersect` chegam agora (Etapa
 4) — todas as 4 são viáveis em Postgres por docs/DESIGN.md.
 
-`intersect` reaproveita a mesma consulta relacional de
-`get_candidates_filtered` (via `item_contexts`), só com `LIMIT`. Isso é
-suficiente para corretude — o ponto desta etapa — mas não modela ainda a
-distinção arquitetural que a Fase 2 do TCC vai medir (predicado via WHERE
-vs. interseção de conjuntos via `intarray`/bitmap); ajustar a técnica SQL
-de `intersect` fica para quando a comparação de latência entrar em cena,
-sem mudar a interface pública.
+`intersect` usa o módulo `intarray` (contrib oficial do Postgres, habilitado
+em `schemas/postgres/003_inverted_lists.sql`) sobre uma lista invertida
+global por contexto (`inverted_lists`, uma linha por contexto com TODOS os
+seus itens, não truncada) — mecanismo genuinamente diferente do
+JOIN+GROUP BY/HAVING de `get_candidates_filtered` (E-2): array-merge sobre
+dado desnormalizado, não join linha-a-linha sobre `item_contexts`. Isso
+resolve o placeholder anterior (que reaproveitava a SQL de E-2 com um
+`LIMIT` colado, suficiente só para o harness de corretude, mas inaceitável
+para a triagem — E-2 e E-4 mediriam o mesmo plano de execução). Ver
+docs/DECISIONS.md, "Etapa 4", para a justificativa de não usar
+`pg_roaringbitmap` (exigiria imagem Postgres customizada nos dois
+ambientes, ver docker-compose.yml/infra/modules/database) nem índice GIN
+(o acesso a `inverted_lists` é sempre direto por `context_id`, chave
+primária).
+
+O operador `&` do `intarray` (interseção de dois `int[]`) exige os dois
+arrays ORDENADOS e sem duplicatas — por isso todo `array_agg` aqui usa
+`ORDER BY item_id` explícito; sem isso o resultado da interseção seria
+incorreto silenciosamente, não um erro.
 
 Usa um `AsyncConnectionPool` (não uma conexão por chamada): medido ao vivo
 na nuvem, abrir uma conexão nova por requisição estourava
@@ -69,7 +81,45 @@ _GET_CANDIDATES_FILTERED_SQL = """
     ORDER BY MIN(c.rank)
 """
 
-_INTERSECT_SQL = _GET_CANDIDATES_FILTERED_SQL + "\n    LIMIT %(limit)s"
+# Ver docstring do módulo: `&` (intarray) exige arrays ordenados e sem
+# duplicatas, por isso os dois `array_agg` abaixo usam `ORDER BY item_id`.
+# `context_intersection` reduz os N contextos pedidos ao seu AND (semântica
+# igual às demais estratégias: um item só entra se aparecer nas N listas
+# invertidas pedidas) antes de intersectar com os candidatos do usuário —
+# essa redução usa GROUP BY/HAVING sobre `inverted_lists` (dado
+# desnormalizado, uma linha por contexto), não sobre `item_contexts` (dado
+# normalizado que E-2 usa), então continua sendo um caminho de execução
+# distinto de E-2 mesmo nesse passo intermediário.
+_INTERSECT_SQL = """
+    WITH user_candidates AS (
+        SELECT COALESCE(array_agg(item_id ORDER BY item_id), ARRAY[]::int[]) AS ids
+        FROM candidates
+        WHERE user_id = %(user_id)s
+    ),
+    context_intersection AS (
+        SELECT COALESCE(array_agg(item_id ORDER BY item_id), ARRAY[]::int[]) AS ids
+        FROM (
+            SELECT item_id
+            FROM (
+                SELECT unnest(item_ids) AS item_id
+                FROM inverted_lists
+                WHERE context_id = ANY(%(context_ids)s)
+            ) per_context
+            GROUP BY item_id
+            HAVING count(*) = %(n_contexts)s
+        ) qualifying
+    ),
+    intersected AS (
+        SELECT (user_candidates.ids & context_intersection.ids) AS ids
+        FROM user_candidates, context_intersection
+    )
+    SELECT c.item_id, c.score
+    FROM candidates c
+    CROSS JOIN intersected
+    WHERE c.user_id = %(user_id)s
+      AND c.item_id = ANY(intersected.ids)
+    LIMIT %(limit)s
+"""
 
 _GET_PREMATERIALIZED_SQL = """
     SELECT item_id, score
@@ -151,6 +201,11 @@ class PostgresAdapter(StorageAdapter):
         return [Candidate(item_id=row["item_id"], score=row["score"]) for row in rows]
 
     async def intersect(self, user_id: int, context: list[int], limit: int) -> list[Candidate]:
+        # Sem lista invertida global para intersectar sem contexto — mesmo
+        # contrato de storage/valkey.py e storage/opensearch.py (diferente
+        # de get_candidates_filtered, onde contexto vazio devolve tudo).
+        if not context:
+            return []
         await self._pool.open()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:

@@ -20,7 +20,7 @@ import psycopg
 CONNINFO = os.environ.get("TEST_POSTGRES_DSN", "postgresql://tcc:tcc@postgres:5432/recsys")
 
 SCHEMA_DIR = Path(__file__).parent
-SQL_FILES = ["001_schema.sql", "002_prematerialized.sql"]
+SQL_FILES = ["001_schema.sql", "002_prematerialized.sql", "003_inverted_lists.sql"]
 
 
 def main() -> None:

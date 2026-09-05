@@ -34,6 +34,11 @@ results/*
 # pelo mesmo motivo que results/: são ~12 GB de saída bruta do k6.
 resultados-invalidos-pre-correcao/
 
+# Backup local do results/ e1/e2/e3-postgres antigo (formato pré-captura de
+# CPU/p99/error_rate), movido para fora da árvore antes do backfill — mesmo
+# motivo de results/: saída bruta do k6, nunca versionada.
+results_backup_old_postgres/
+
 # infra/ (Terraform, Etapa 9) — cache de provedores, estado (mesmo o local
 # de infra/bootstrap) e variáveis reais nunca são versionados.
 # .terraform.lock.hcl FICA versionado (docs/ARCHITECTURE.md) — não entra aqui.
