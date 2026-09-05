@@ -3,7 +3,9 @@
 infra/scripts/cloud_smoke_test.py (Fase 4): em vez de um smoke curto, roda
 load/run_battery.py de verdade contra a célula, varrendo carga ×
 seletividade conforme docs/DESIGN.md ("Protocolo de medição" /
-"Delineamento em duas etapas"), e traz os `results/` de volta. Também roda
+"Delineamento em duas etapas"), e sobe `results/` direto da VM loadgen para
+o bucket de resultados (load/upload_results.py, via ADC/metadata server —
+não passa mais pelo host do operador). Também roda
 a busca de vazão de saturação (load/saturation.py) — a 3ª dimensão da
 fronteira de Pareto: rampa curta exploratória na triagem (1 patamar por
 combinação, busca binária ao violar o SLO, teto de 50.000 req/s), rampa
@@ -13,9 +15,13 @@ células não dominadas.
 Roda no HOST (não dentro do container `tools`), pelo mesmo motivo de
 cloud_smoke_test.py: a imagem `tools` não tem o `gcloud` CLI, só
 terraform+k6+Python — e agora também precisa de `google-cloud-monitoring`
-no host, para `analysis.resources.GCPMonitoringCollector` checar a CPU do
-gerador a cada patamar da busca de saturação (README.md, "Instrumentação
-de gargalo"). Terraform roda via docker-compose.gcp.yml; a bateria de
+no host, para `analysis.resources.GCPMonitoringCollector` amostrar
+CPU/memória/rede das 3 VMs a cada 5s durante o sweep de confirmação
+(`resources.csv`, README.md, "Instrumentação de gargalo"). A CPU do gerador
+a cada patamar da busca de saturação NÃO usa esse caminho — vem de
+`/proc/stat` lido na própria VM loadgen, dentro do mesmo processo remoto que
+já decide o veredito da sondagem (analysis/probe_report.py), sem depender do
+Cloud Monitoring. Terraform roda via docker-compose.gcp.yml; a bateria de
 verdade e as sondagens de saturação rodam dentro de `docker run --rm
 --network host <tools_image> ...` executados remotamente via `gcloud
 compute ssh <loadgen> --tunnel-through-iap` — os IPs vêm de `terraform
@@ -58,6 +64,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -326,8 +333,13 @@ def build_remote_probe_command(
     rampa curta, 5 na de confirmação) e consolida com
     analysis/probe_report.py na MESMA invocação de container: evita expor
     polars ao host (só o resultado de uma linha `PROBE_RESULT ...` volta
-    via stdout do SSH, capturado por _parse_probe_result_line)."""
-    steps: list[str] = []
+    via stdout do SSH, capturado por _parse_probe_result). As duas leituras
+    de /proc/stat (antes do 1º k6, depois do último) cercam só a geração de
+    carga e são repassadas por variável de ambiente para
+    analysis/probe_report.py, que calcula e imprime a CPU do gerador na
+    MESMA linha PROBE_RESULT — sem consultar o Cloud Monitoring (ver
+    docstring de analysis/probe_report.py:_cpu_percent_from_stat)."""
+    steps: list[str] = ['BEFORE_STAT="$(cat /proc/stat | head -1)"']
     ndjson_paths: list[str] = []
     for rep in range(repetitions):
         rep_dir = f"/app/results/{remote_subdir}/rep{rep}"
@@ -346,7 +358,11 @@ def build_remote_probe_command(
         steps.append(shlex.join(["mkdir", "-p", rep_dir]))
         k6_argv = build_probe_k6_cmd(json_out, cell_id, target_url, rate, tier, warmup, measure)
         steps.append(shlex.join(str(a) for a in k6_argv))
-    steps.append("python analysis/probe_report.py " + shlex.join(ndjson_paths))
+    steps.append('AFTER_STAT="$(cat /proc/stat | head -1)"')
+    steps.append(
+        'GENERATOR_CPU_STAT_BEFORE="$BEFORE_STAT" GENERATOR_CPU_STAT_AFTER="$AFTER_STAT" '
+        "python analysis/probe_report.py " + shlex.join(ndjson_paths)
+    )
     inner = " && ".join(steps)
 
     docker_argv = [
@@ -368,59 +384,77 @@ def build_remote_probe_command(
     return shlex.join(docker_argv)
 
 
-def _parse_probe_result_line(stdout: str) -> bool:
-    """Lê a linha `PROBE_RESULT violated_slo=True p99=... error_rate=... ` que
-    analysis/probe_report.py imprime dentro do container remoto."""
+def build_remote_upload_command(
+    remote_dir: str,
+    results_mount: str,
+    results_bucket: str,
+    prefix: str,
+    tools_image: str,
+) -> str:
+    """Sobe `remote_dir` (caminho DENTRO do container, montado a partir de
+    `results_mount` na VM) para `gs://results_bucket/prefix/` — substitui o
+    par sync_results_from_loadgen (scp) + upload_results_to_bucket (do host)
+    que existiam antes. `--network host`: obrigatório, é o que faz
+    `load/upload_results.py`'s `storage.Client()` enxergar o metadata server
+    da VM pra ADC (mesmo padrão de harness/fixtures.py:
+    ensure_full_dataset_downloaded — ver docstring de load/upload_results.py
+    para o histórico completo do porquê desta mudança)."""
+    docker_argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        "-v",
+        f"{results_mount}:/app/results",
+        "--entrypoint",
+        "python",
+        tools_image,
+        "load/upload_results.py",
+        remote_dir,
+        results_bucket,
+        prefix,
+    ]
+    return shlex.join(docker_argv)
+
+
+def _parse_optional_float(token: str | None) -> float | None:
+    """analysis/probe_report.py imprime `p99=None`/`error_rate=None` (texto
+    literal do Python) quando build_summary não parseou nenhuma requisição
+    — ver analysis/collect.py:build_summary, ramo latencies_df.is_empty()."""
+    if token is None or token == "None":
+        return None
+    return float(token)
+
+
+@dataclass(frozen=True)
+class _ProbeVerdict:
+    violated_slo: bool
+    p99_ms: float | None
+    error_rate: float | None
+    generator_cpu_percent: float
+
+
+def _parse_probe_result(stdout: str) -> _ProbeVerdict:
+    """Lê a linha `PROBE_RESULT violated_slo=... p99=... error_rate=...
+    request_count=... generator_cpu_percent=...` que analysis/probe_report.py
+    imprime dentro do container remoto — um processo só decide o veredito
+    inteiro da sondagem, incluída a CPU do gerador (lida de /proc/stat pelo
+    wrapper bash de build_remote_probe_command, repassada por variável de
+    ambiente — nunca consulta o Cloud Monitoring para este portão, ver
+    docstring de analysis/probe_report.py:_cpu_percent_from_stat)."""
     for line in stdout.splitlines():
         if line.startswith("PROBE_RESULT"):
-            for token in line.split():
-                if token.startswith("violated_slo="):
-                    return token.split("=", 1)[1] == "True"
+            tokens = dict(tok.split("=", 1) for tok in line.split()[1:])
+            return _ProbeVerdict(
+                violated_slo=tokens["violated_slo"] == "True",
+                p99_ms=_parse_optional_float(tokens.get("p99")),
+                error_rate=_parse_optional_float(tokens.get("error_rate")),
+                generator_cpu_percent=float(tokens["generator_cpu_percent"]),
+            )
     raise RuntimeError(
         f"analysis/probe_report.py não imprimiu PROBE_RESULT na saída remota:\n{stdout}"
     )
-
-
-def _generator_cpu_percent(
-    project_id: str, loadgen_instance: str, start_time, end_time
-) -> float | None:
-    """CPU da VM loadgen na janela de uma sondagem, via Cloud Monitoring —
-    docs/DESIGN.md: "válido só se CPU do gerador < 60%", checado a cada
-    patamar da busca de saturação, não só ao final."""
-    from analysis.resources import GCPMonitoringCollector
-
-    collector = GCPMonitoringCollector(
-        project_id=project_id,
-        instance_by_component={"loadgen": loadgen_instance},
-        start_time=start_time,
-        end_time=end_time,
-    )
-    try:
-        return collector.collect()[0].cpu_percent
-    except ValueError:
-        # Mesmo atraso de ingestão do Cloud Monitoring já visto em
-        # verify_otel_pipeline, mas aqui sem a folga de minutos que aquela
-        # função dá — a janela é sempre a duração de UMA sondagem (~1min),
-        # recém-terminada. Sem retry, uma sondagem perfeitamente válida
-        # (violou SLO ou não) abortava a busca de saturação inteira só
-        # porque o Cloud Monitoring ainda não processou o ponto — confirmado
-        # ao vivo. Uma tentativa extra depois de uma espera curta; se ainda
-        # assim falhar, devolve None (não bloqueia a busca — só a checagem de
-        # gargalo do gerador fica sem dado para este patamar específico).
-        time.sleep(30)
-        try:
-            return collector.collect()[0].cpu_percent
-        except ValueError as exc:
-            print(
-                f"AVISO: não foi possível consultar CPU do gerador nesta sondagem ({exc}) — "
-                "registrada como NÃO MEDIDA (null), não como 0%. Assumir 0% fazia a falha de "
-                "telemetria passar pelo portão dos 60% do docs/DESIGN.md como se o gerador "
-                "estivesse ocioso (confirmado ao vivo em results/e1-postgres/triagem/"
-                "20260901T144228Z/saturation.json, com 0.0 nas 4 sondagens sob 1000 req/s). "
-                "A busca continua — só o portão desta sondagem fica sem avaliação, e "
-                "saturation.json marca isso em generator_cpu_unmeasured."
-            )
-            return None
 
 
 def snapshot_exists(project_id: str, snapshot_name: str) -> bool:
@@ -555,7 +589,6 @@ def make_probe_fn(
     warmup: str,
     measure: str,
     loadgen_instance: str,
-    loadgen_instance_id: str,
     zone: str,
     project_id: str,
     tools_image: str,
@@ -566,15 +599,15 @@ def make_probe_fn(
 ) -> Callable[[int], ProbeResult]:
     """Fecha sobre o contexto de rede/infra de uma célula e devolve um
     probe_fn(rate) -> ProbeResult para load.saturation.run_saturation_search
-    — cada chamada roda a sondagem remota via SSH, lê o veredito do SLO
-    (analysis/probe_report.py, dentro do container) e consulta a CPU do
-    gerador (Cloud Monitoring, no host) na mesma janela."""
+    — cada chamada roda a sondagem remota via SSH e lê o veredito inteiro
+    (SLO + p99/error_rate + CPU do gerador) de uma única linha PROBE_RESULT
+    impressa por analysis/probe_report.py dentro do container (CPU vem de
+    /proc/stat lido na própria VM, não do Cloud Monitoring)."""
     counter = itertools.count()
 
     def probe_fn(rate: int) -> ProbeResult:
         probe_id = f"{label}-{next(counter)}-{rate}"
         remote_subdir = f"_saturation/{cell_id}/{probe_id}"
-        start_time = datetime.now(timezone.utc)
 
         remote_cmd = build_remote_probe_command(
             cell_id,
@@ -590,12 +623,15 @@ def make_probe_fn(
             repetitions,
         )
         result = gcloud_ssh(loadgen_instance, zone, project_id, remote_cmd)
-        end_time = datetime.now(timezone.utc)
+        verdict = _parse_probe_result(result.stdout)
 
-        violated = _parse_probe_result_line(result.stdout)
-        generator_cpu = _generator_cpu_percent(project_id, loadgen_instance_id, start_time, end_time)
-
-        return ProbeResult(rate=rate, violated_slo=violated, generator_cpu_percent=generator_cpu)
+        return ProbeResult(
+            rate=rate,
+            violated_slo=verdict.violated_slo,
+            generator_cpu_percent=verdict.generator_cpu_percent,
+            p99_ms=verdict.p99_ms,
+            error_rate=verdict.error_rate,
+        )
 
     return probe_fn
 
@@ -647,47 +683,13 @@ def _write_saturation_json(
                 "rate": p.rate,
                 "violated_slo": p.violated_slo,
                 "generator_cpu_percent": p.generator_cpu_percent,
+                "p99_ms": p.p99_ms,
+                "error_rate": p.error_rate,
             }
             for p in saturation.probes
         ],
     }
     (out_dir / filename).write_text(json.dumps(payload, indent=2))
-
-
-def sync_results_from_loadgen(
-    loadgen_instance: str, zone: str, project_id: str, remote_dir: str, local_dir: str
-) -> None:
-    _run(
-        [
-            "gcloud",
-            "compute",
-            "scp",
-            "--recurse",
-            "--tunnel-through-iap",
-            f"--zone={zone}",
-            f"--project={project_id}",
-            f"{loadgen_instance}:{remote_dir}",
-            local_dir,
-        ]
-    )
-
-
-def upload_results_to_bucket(local_dir: Path, results_bucket: str, cell_id: str) -> None:
-    # str(local_dir) sozinho copiava o DIRETÓRIO em si como subpasta do
-    # destino (gcloud storage cp --recursive <dir> <dest>/ replica <dir>,
-    # não seu conteúdo) — confirmado no resultado real: gs://.../e1-postgres/
-    # e1-postgres/triagem/..., nome da célula duplicado. "/*" copia só o
-    # conteúdo de local_dir para dentro do destino.
-    _run(
-        [
-            "gcloud",
-            "storage",
-            "cp",
-            "--recursive",
-            f"{local_dir.as_posix()}/*",
-            f"gs://{results_bucket}/{cell_id}/",
-        ]
-    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -696,8 +698,17 @@ def main(argv: list[str] | None = None) -> int:
     # k6 (o resumo padrão usa símbolos Unicode como checkmarks e barras de
     # threshold). Aqui o risco é maior ainda: esta bateria roda por horas
     # imprimindo saída de k6/docker/terraform repetidamente por célula.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # line_buffering=True: sem isso, print() fica em buffer de bloco (~8KB)
+    # quando stdout é redirecionado para um arquivo (não um terminal) — quem
+    # acompanha o log via `tail -f` vê silêncio por dezenas de minutos
+    # mesmo com o wait_for_container/wait_for_service_ready/sweep avançando
+    # normalmente nas VMs remotas. Confirmado ao vivo: e3-postgres pareceu
+    # travado por >1h só por causa disso (SSH direto nas 3 VMs mostrou tudo
+    # saudável e o k6 já rodando) — mesma classe de problema que já custou
+    # ~3h30 de confusão em e1-scylla (ver docstring de tail_remote_file em
+    # cloud_smoke_test.py).
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cell")
@@ -730,6 +741,13 @@ def main(argv: list[str] | None = None) -> int:
         "--keep-infra",
         action="store_true",
         help="não roda terraform destroy no final (para investigar uma falha)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="pula a confirmação interativa 'sim' antes de apply/destroy (uso supervisionado, "
+        "ex.: uma sessão automatizando várias células em sequência com aprovação já dada fora "
+        "deste comando) — ainda imprime o aviso FATURÁVEL, só não bloqueia em input().",
     )
     args = parser.parse_args(argv)
 
@@ -785,7 +803,8 @@ def main(argv: list[str] | None = None) -> int:
             f"terraform apply da célula '{args.cell}' em {args.project_id}/{args.region} vai "
             f"criar VMs reais (banco + serviço + loadgen) e rodar {len(sweep)} combinação(ões) "
             f"de carga/seletividade x {args.repetitions} repetições, mais a busca de vazão de "
-            "saturação — pode levar horas e cobra o tempo todo."
+            "saturação — pode levar horas e cobra o tempo todo.",
+            auto_approve=args.yes,
         )
         applied = True
         terraform(
@@ -805,6 +824,7 @@ def main(argv: list[str] | None = None) -> int:
             f"-var=cell={args.cell}",
             f"-var=storage={storage}",
             f"-var=dataset_bucket={args.dataset_bucket}",
+            f"-var=results_bucket={args.results_bucket}",
         ]
         if snapshot_found:
             apply_vars.append(f"-var=data_disk_snapshot={snapshot_name}")
@@ -958,7 +978,6 @@ def main(argv: list[str] | None = None) -> int:
                 SHORT_RAMP_WARMUP,
                 SHORT_RAMP_MEASURE,
                 loadgen_instance,
-                loadgen_instance_id,
                 args.zone,
                 args.project_id,
                 tools_image,
@@ -980,7 +999,6 @@ def main(argv: list[str] | None = None) -> int:
                     CONFIRMATION_WARMUP,
                     CONFIRMATION_MEASURE,
                     loadgen_instance,
-                    loadgen_instance_id,
                     args.zone,
                     args.project_id,
                     tools_image,
@@ -1006,6 +1024,21 @@ def main(argv: list[str] | None = None) -> int:
                 resources_path = Path("results") / args.cell / args.phase / timestamp / "resources.csv"
                 write_resources_csv(resource_samples, resources_path)
                 print(f"\n{resources_path}: {len(resource_samples)} amostras de recursos escritas.")
+                # resources.csv nunca existiu na VM loadgen — GCPMonitoringCollector
+                # roda do HOST, direto contra a API do Cloud Monitoring (ver
+                # docstring do módulo). Por isso é o único arquivo que ainda sobe
+                # via `gcloud storage cp` (host -> bucket): nunca passou pelo hop
+                # scp (loadgen -> host) que era a causa real da falha em
+                # e3-postgres, então não precisa da mudança de load/upload_results.py.
+                _run(
+                    [
+                        "gcloud",
+                        "storage",
+                        "cp",
+                        str(resources_path),
+                        f"gs://{args.results_bucket}/{args.cell}/{args.phase}/{timestamp}/resources.csv",
+                    ]
+                )
                 try:
                     bottleneck = classify_bottleneck(
                         resource_samples, memory_ceiling_mb=DEFAULT_MEMORY_MB_BY_COMPONENT
@@ -1016,44 +1049,37 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("\nAVISO: nenhuma amostra de recursos coletada — resources.csv não foi escrito.")
 
+        # Upload direto da VM loadgen pro bucket (load/upload_results.py, via
+        # ADC/metadata server) — substitui o par scp (loadgen -> host) +
+        # `gcloud storage cp` (host -> bucket) de antes. Motivo: no Windows,
+        # `gcloud compute scp` roda sobre `pscp`/`plink` (PuTTY), cujo SFTP é
+        # menos robusto sobre uma transferência grande através do túnel IAP —
+        # confirmado ao vivo abortando a meio de um k6-raw.json de ~35MB em
+        # e3-postgres, deixando VMs órfãs cobrando (ver docstring de
+        # load/upload_results.py para o histórico completo).
         if args.phase == "confirmacao":
             # Diferente da rampa curta (exploratória, nunca arquivada), a de
-            # confirmação exige "saída com distribuição completa" — traz de
-            # volta as sondagens brutas para results/_saturation/, fora do
-            # namespace results/<cell>/<phase>/ que analysis/report.py varre
+            # confirmação exige "saída com distribuição completa" — as
+            # sondagens brutas vão para <bucket>/_saturation/<cell>/, fora do
+            # namespace <bucket>/<cell>/<phase>/ que analysis/report.py varre
             # (nunca entra por engano numa tabela de medição comum).
-            local_saturation_dir = Path("results") / "_saturation" / args.cell
-            # local_dir = PAI de local_saturation_dir, não ela mesma: `gcloud
-            # compute scp --recurse origem destino` recria a pasta de origem
-            # dentro do destino — passar o mesmo nome final duas vezes
-            # duplicava o caminho (mesmo bug de upload_results_to_bucket,
-            # confirmado no resultado real). Limpeza do diretório local já
-            # aconteceu mais acima, uma única vez, antes de qualquer coisa
-            # desta execução escrever nele (ver comentário perto de
-            # `timestamp = ...`) — não aqui, para não apagar o que a rampa
-            # de saturação acabou de escrever nesta mesma execução.
-            sync_results_from_loadgen(
-                loadgen_instance,
-                args.zone,
-                args.project_id,
-                f"{RESULTS_MOUNT}/_saturation/{args.cell}",
-                str(local_saturation_dir.parent),
+            saturation_upload_cmd = build_remote_upload_command(
+                f"/app/results/_saturation/{args.cell}",
+                RESULTS_MOUNT,
+                args.results_bucket,
+                f"_saturation/{args.cell}",
+                tools_image,
             )
-            upload_results_to_bucket(local_saturation_dir, args.results_bucket, f"_saturation/{args.cell}")
+            gcloud_ssh(loadgen_instance, args.zone, args.project_id, saturation_upload_cmd)
 
-        local_results_dir = Path("results") / args.cell
-        # local_dir = PAI, mesmo motivo do sync de _saturation acima.
-        # Limpeza já aconteceu mais acima (ver comentário perto de
-        # `timestamp = ...`), antes da rampa de saturação escrever
-        # saturation.json aqui dentro — não repetir aqui.
-        sync_results_from_loadgen(
-            loadgen_instance,
-            args.zone,
-            args.project_id,
-            f"{RESULTS_MOUNT}/{args.cell}",
-            str(local_results_dir.parent),
+        results_upload_cmd = build_remote_upload_command(
+            f"/app/results/{args.cell}",
+            RESULTS_MOUNT,
+            args.results_bucket,
+            args.cell,
+            tools_image,
         )
-        upload_results_to_bucket(local_results_dir, args.results_bucket, args.cell)
+        gcloud_ssh(loadgen_instance, args.zone, args.project_id, results_upload_cmd)
 
         print(f"\n[{loadgen_instance}] recursos:")
         print(resource_snapshot(loadgen_instance, args.zone, args.project_id))
@@ -1068,7 +1094,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             _confirm_billable(
-                f"terraform destroy da célula '{args.cell}' — é isso que PARA a cobrança."
+                f"terraform destroy da célula '{args.cell}' — é isso que PARA a cobrança.",
+                auto_approve=args.yes,
             )
             # Reminta o token: o token impersonado dura só ~1h (fetch_terraform_
             # access_token), e uma bateria real (5 repetições x 7min de k6 +
@@ -1089,6 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"-var=cell={args.cell}",
                 f"-var=storage={storage}",
                 f"-var=dataset_bucket={args.dataset_bucket}",
+                f"-var=results_bucket={args.results_bucket}",
             ]
             if snapshot_found:
                 destroy_vars.append(f"-var=data_disk_snapshot={snapshot_name}")

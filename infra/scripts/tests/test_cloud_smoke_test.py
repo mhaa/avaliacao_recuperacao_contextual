@@ -5,6 +5,7 @@ infra/scripts/tests/test_run_measurement_battery.py."""
 from __future__ import annotations
 
 from infra.scripts.cloud_smoke_test import (
+    _confirm_billable,
     build_remote_schema_fixture_script,
     build_remote_verification_script,
 )
@@ -37,3 +38,28 @@ def test_verification_script_has_no_schema_fixture_steps():
 def test_verification_script_smoke_report_reads_the_k6_console_output():
     cmd = build_remote_verification_script(*_ARGS)
     assert "analysis/smoke_report.py /tmp/smoke-requests.ndjson" in cmd
+
+
+def test_confirm_billable_auto_approve_skips_input(monkeypatch):
+    # auto_approve=True precisa pular o input() bloqueante (é o ponto todo
+    # da flag --yes) sem abortar — se input() for chamado aqui, o teste
+    # falha por conta própria (nenhum stdin disponível).
+    def _fail_if_called(prompt):
+        raise AssertionError("input() não deveria ser chamado com auto_approve=True")
+
+    monkeypatch.setattr("builtins.input", _fail_if_called)
+    _confirm_billable("mensagem de teste", auto_approve=True)
+
+
+def test_confirm_billable_default_still_prompts(monkeypatch):
+    # Comportamento default (sem a flag) tem que continuar bloqueando em
+    # input() — auto_approve não pode virar o novo default por engano.
+    calls = []
+
+    def _record(prompt):
+        calls.append(prompt)
+        return "sim"
+
+    monkeypatch.setattr("builtins.input", _record)
+    _confirm_billable("mensagem de teste")
+    assert len(calls) == 1

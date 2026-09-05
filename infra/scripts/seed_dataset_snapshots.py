@@ -180,6 +180,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("terraform_state_bucket")
     parser.add_argument("dataset_bucket")
     parser.add_argument(
+        "results_bucket",
+        help="output do bootstrap (results_bucket) — semear não sobe resultado nenhum, mas "
+        "module.loadgen exige o valor pra criar a IAM binding de escrita, mesmo motivo de "
+        "dataset_bucket.",
+    )
+    parser.add_argument(
         "--keep-infra",
         action="store_true",
         help="não roda terraform destroy no final (para investigar uma falha na carga)",
@@ -228,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"-var=storage={args.storage}",
                 f"-var=tools_image={tools_image}",
                 f"-var=dataset_bucket={args.dataset_bucket}",
+                f"-var=results_bucket={args.results_bucket}",
             ],
             tf_dir=TF_DIR,
         )
@@ -339,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"-var=storage={args.storage}",
                     f"-var=tools_image={tools_image}",
                     f"-var=dataset_bucket={args.dataset_bucket}",
+                    f"-var=results_bucket={args.results_bucket}",
                 ],
                 tf_dir=TF_DIR,
             )

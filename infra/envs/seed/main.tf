@@ -73,6 +73,11 @@ variable "dataset_bucket" {
   description = "Bucket com a massa de dados completa (output do bootstrap: dataset_bucket)."
 }
 
+variable "results_bucket" {
+  type        = string
+  description = "Bucket de resultados (output do bootstrap: results_bucket) — semear não sobe resultado nenhum, mas module.loadgen exige o valor pra criar a IAM binding de escrita, mesmo motivo de dataset_bucket acima."
+}
+
 provider "google" {
   project = var.project_id
   region  = var.region
@@ -105,6 +110,7 @@ module "loadgen" {
   subnetwork_self_link = module.network.subnetwork_self_link
   tools_image          = var.tools_image
   dataset_bucket       = var.dataset_bucket
+  results_bucket       = var.results_bucket
 }
 
 output "database_internal_ip" {

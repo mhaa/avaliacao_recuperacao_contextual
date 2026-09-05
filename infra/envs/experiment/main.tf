@@ -87,6 +87,11 @@ variable "dataset_bucket" {
   description = "Bucket com a massa de dados completa (output do bootstrap: dataset_bucket)."
 }
 
+variable "results_bucket" {
+  type        = string
+  description = "Bucket de resultados (output do bootstrap: results_bucket) — repassado à VM loadgen para upload direto (load/upload_results.py)."
+}
+
 variable "data_disk_snapshot" {
   type        = string
   description = "Nome do snapshot pra criar o disco de banco já carregado (infra/scripts/seed_dataset_snapshots.py) — vazio cria disco em branco."
@@ -132,6 +137,7 @@ module "loadgen" {
   subnetwork_self_link = module.network.subnetwork_self_link
   tools_image          = var.tools_image
   dataset_bucket       = var.dataset_bucket
+  results_bucket       = var.results_bucket
 }
 
 output "database_internal_ip" {

@@ -110,11 +110,14 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
         raise
 
 
-def _confirm_billable(message: str) -> None:
+def _confirm_billable(message: str, auto_approve: bool = False) -> None:
     print()
     print("=" * 70)
     print(f"FATURÁVEL: {message}")
     print("=" * 70)
+    if auto_approve:
+        print("--yes: confirmação pulada automaticamente.")
+        return
     answer = input("Digite 'sim' para continuar, qualquer outra coisa para abortar: ")
     if answer.strip().lower() != "sim":
         print("Abortado pelo usuário.")
@@ -510,6 +513,13 @@ def main(argv: list[str] | None = None) -> int:
         "module.loadgen precisa do valor pra criar a IAM binding.",
     )
     parser.add_argument(
+        "results_bucket",
+        help="output do bootstrap (results_bucket) — mesmo motivo de dataset_bucket acima: "
+        "o smoke test não sobe nenhum resultado (load/upload_results.py só roda a partir de "
+        "run_measurement_battery.py), mas module.loadgen precisa do valor pra criar a IAM "
+        "binding de escrita.",
+    )
+    parser.add_argument(
         "--keep-infra",
         action="store_true",
         help="não roda terraform destroy no final (para investigar uma falha)",
@@ -568,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"-var=cell={args.cell}",
                 f"-var=storage={storage}",
                 f"-var=dataset_bucket={args.dataset_bucket}",
+                f"-var=results_bucket={args.results_bucket}",
             ]
         )
 
@@ -669,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"-var=cell={args.cell}",
                     f"-var=storage={storage}",
                     f"-var=dataset_bucket={args.dataset_bucket}",
+                    f"-var=results_bucket={args.results_bucket}",
                 ]
             )
 

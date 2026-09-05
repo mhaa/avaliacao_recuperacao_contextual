@@ -13,6 +13,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# venv da raiz — `pip install -e .` para rodar analysis/report.py (e outros
+# scripts de host, ver pyproject.toml) fora do Docker.
+.venv/
+*.egg-info/
+
 # load/fixtures — derivado de data_generation/data/ por
 # load/export_contexts_by_tier.py, regenerável, nunca versionado.
 load/fixtures/*

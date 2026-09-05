@@ -27,8 +27,8 @@ KEYSPACE = "recsys"
 # timeout de escrita. No Scylla local de correção (`--smp 1`, dev-mode)
 # esse mesmo valor também funciona, só sem ganho adicional (1 shard só).
 # Ajustável sem alterar código para recalibrar contra CPU real da VM de
-# banco (ver infra/scripts/run_measurement_battery.py:_generator_cpu_percent
-# para o mesmo tipo de coleta, aplicável aqui via GCP Monitoring).
+# banco (ver analysis/resources.py:GCPMonitoringCollector para o mesmo tipo
+# de coleta, aplicável aqui via GCP Monitoring).
 _CONCURRENCY = int(os.environ.get("TEST_SCYLLA_LOAD_CONCURRENCY", "64"))
 
 # Linhas por lote dentro de uma mesma partição — mesmo motivo de

@@ -44,6 +44,11 @@ variable "dataset_bucket" {
   description = "Bucket com a massa de dados completa (output do bootstrap: dataset_bucket) — schemas/<db>/load_full_dataset.py baixa daqui via harness/fixtures.py:ensure_full_dataset_downloaded."
 }
 
+variable "results_bucket" {
+  type        = string
+  description = "Bucket de resultados (output do bootstrap: results_bucket) — load/upload_results.py escreve aqui direto desta VM, via ADC/metadata server."
+}
+
 variable "machine_type" {
   type        = string
   description = "Tipo de máquina — n2-standard-8 (docs/ARCHITECTURE.md, topologia)."
@@ -65,12 +70,27 @@ resource "google_project_iam_member" "loadgen_artifact_reader" {
 }
 
 # Leitura só — harness/fixtures.py:ensure_full_dataset_downloaded baixa,
-# nunca escreve. Resultados saem por um caminho totalmente separado
-# (infra/scripts/run_measurement_battery.py:upload_results_to_bucket, do
-# HOST com a sessão do operador, não desta SA).
+# nunca escreve neste bucket.
 resource "google_storage_bucket_iam_member" "loadgen_dataset_reader" {
   bucket = var.dataset_bucket
   role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.loadgen.email}"
+}
+
+# Escrita só (sem list/delete) — load/upload_results.py sobe os resultados
+# direto desta VM para o bucket, substituindo o hop antigo `gcloud compute
+# scp` (loadgen -> host, do HOST com a sessão do operador) + `gcloud storage
+# cp` (host -> bucket). No Windows, `gcloud compute scp` roda sobre
+# `pscp`/`plink` (PuTTY) — confirmado ao vivo abortando a meio de uma
+# transferência grande com "unable to understand SFTP response packet from
+# server" (e3-postgres), deixando VMs órfãs cobrando até o `terraform
+# destroy` (que já tinha falhado por um problema local não relacionado)
+# rodar de novo manualmente. `objectCreator` (não `objectAdmin`): esta SA só
+# precisa criar objetos novos em pastas com timestamp sempre novo, nunca
+# listar ou apagar nada.
+resource "google_storage_bucket_iam_member" "loadgen_results_writer" {
+  bucket = var.results_bucket
+  role   = "roles/storage.objectCreator"
   member = "serviceAccount:${google_service_account.loadgen.email}"
 }
 

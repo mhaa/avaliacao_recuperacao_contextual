@@ -13,11 +13,12 @@ from infra.scripts.run_measurement_battery import (
     SELECTIVITY_TIERS,
     TRIAGEM_RATE,
     TRIAGEM_TIER,
-    _parse_probe_result_line,
+    _parse_probe_result,
     _write_saturation_json,
     build_remote_battery_command,
     build_remote_probe_command,
     build_remote_setup_command,
+    build_remote_upload_command,
     build_sweep,
     sample_resources_periodically,
     shuffled_sweep,
@@ -81,6 +82,39 @@ def test_build_remote_battery_command_mounts_fixtures_dir_readonly():
     assert "-v /home/tcc/load-fixtures:/app/load/fixtures:ro" in cmd
 
 
+def test_build_remote_upload_command_uses_the_upload_script_with_no_gcloud_cli():
+    # load/upload_results.py, não `gcloud storage cp` — a VM não tem gcloud
+    # CLI (COS), só a imagem tools com google-cloud-storage instalado.
+    cmd = build_remote_upload_command(
+        "/app/results/e1-postgres", "/home/tcc/results", "my-results-bucket",
+        "e1-postgres", "gcr.io/x/tools:1",
+    )
+    assert "load/upload_results.py" in cmd
+    assert "gcloud" not in cmd
+
+
+def test_build_remote_upload_command_passes_local_dir_bucket_and_prefix_as_argv():
+    cmd = build_remote_upload_command(
+        "/app/results/_saturation/e1-postgres", "/home/tcc/results", "my-results-bucket",
+        "_saturation/e1-postgres", "gcr.io/x/tools:1",
+    )
+    assert cmd.endswith(
+        "load/upload_results.py /app/results/_saturation/e1-postgres my-results-bucket "
+        "_saturation/e1-postgres"
+    )
+
+
+def test_build_remote_upload_command_mounts_results_dir_and_uses_network_host():
+    # --network host: obrigatório pra storage.Client() enxergar o metadata
+    # server da VM (ADC) — ver docstring de load/upload_results.py.
+    cmd = build_remote_upload_command(
+        "/app/results/e1-postgres", "/home/tcc/results", "my-results-bucket",
+        "e1-postgres", "gcr.io/x/tools:1",
+    )
+    assert "-v /home/tcc/results:/app/results" in cmd
+    assert "--network host" in cmd
+
+
 def test_build_remote_setup_command_uses_the_full_loader_not_the_oracle_fixture():
     # load/zipf.js amostra de toda a população real — carregar só o
     # subconjunto do oráculo aqui corromperia silenciosamente a medição.
@@ -136,14 +170,61 @@ def test_build_remote_probe_command_repeats_k6_for_each_repetition():
         assert f"rep{rep}/k6-raw.json" in cmd
 
 
-def test_parse_probe_result_line_reads_violated_slo_true():
-    stdout = "algum log irrelevante\nPROBE_RESULT violated_slo=True p99=250.0 error_rate=0.0\n"
-    assert _parse_probe_result_line(stdout) is True
+def test_build_remote_probe_command_captures_proc_stat_before_and_after():
+    # A CPU do gerador vem de /proc/stat lido na própria VM (não do Cloud
+    # Monitoring) — as duas leituras precisam cercar a geração de carga e
+    # ser repassadas para analysis/probe_report.py por variável de ambiente.
+    cmd = build_remote_probe_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "medium", 4000, "0s", "1m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "_saturation/e1-postgres/short-0-4000", 1,
+    )
+    assert "cat /proc/stat" in cmd
+    assert "GENERATOR_CPU_STAT_BEFORE=" in cmd
+    assert "GENERATOR_CPU_STAT_AFTER=" in cmd
+    before_idx = cmd.index("BEFORE_STAT=")
+    probe_report_idx = cmd.index("analysis/probe_report.py")
+    after_idx = cmd.index("AFTER_STAT=", before_idx + 1)
+    assert before_idx < after_idx < probe_report_idx
 
 
-def test_parse_probe_result_line_reads_violated_slo_false():
-    stdout = "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0"
-    assert _parse_probe_result_line(stdout) is False
+def test_parse_probe_result_reads_violated_slo_true():
+    stdout = (
+        "algum log irrelevante\nPROBE_RESULT violated_slo=True p99=250.0 error_rate=0.0 "
+        "request_count=1000 generator_cpu_percent=12.5\n"
+    )
+    assert _parse_probe_result(stdout).violated_slo is True
+
+
+def test_parse_probe_result_reads_violated_slo_false():
+    stdout = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 "
+        "request_count=1000 generator_cpu_percent=12.5"
+    )
+    assert _parse_probe_result(stdout).violated_slo is False
+
+
+def test_parse_probe_result_reads_p99_error_rate_and_generator_cpu():
+    stdout = (
+        "PROBE_RESULT violated_slo=True p99=250.0 error_rate=0.02 "
+        "request_count=1000 generator_cpu_percent=45.2"
+    )
+    verdict = _parse_probe_result(stdout)
+    assert verdict.p99_ms == 250.0
+    assert verdict.error_rate == 0.02
+    assert verdict.generator_cpu_percent == 45.2
+
+
+def test_parse_probe_result_reads_p99_and_error_rate_as_none_when_literal_none():
+    # analysis/probe_report.py imprime `p99=None`/`error_rate=None` (texto
+    # literal do Python) quando nenhuma requisição foi parseada.
+    stdout = (
+        "PROBE_RESULT violated_slo=True p99=None error_rate=None "
+        "request_count=0 generator_cpu_percent=0.0"
+    )
+    verdict = _parse_probe_result(stdout)
+    assert verdict.p99_ms is None
+    assert verdict.error_rate is None
 
 
 def test_write_saturation_json_round_trips(tmp_path, monkeypatch):
@@ -179,6 +260,60 @@ def test_write_saturation_json_records_an_unmeasured_probe_as_null(tmp_path, mon
     payload = json.loads(out.read_text())
     assert payload["generator_cpu_unmeasured"] is True
     assert payload["probes"][0]["generator_cpu_percent"] is None
+
+
+def test_write_saturation_json_records_p99_and_error_rate_per_probe(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = SaturationSearchResult(
+        approx_throughput=1500.0,
+        censored=False,
+        lower_bound=None,
+        loadgen_bottleneck=False,
+        probes=[
+            ProbeResult(
+                rate=1000, violated_slo=False, generator_cpu_percent=12.5,
+                p99_ms=95.0, error_rate=0.0,
+            ),
+            ProbeResult(
+                rate=2000, violated_slo=True, generator_cpu_percent=30.0,
+                p99_ms=250.0, error_rate=0.02,
+            ),
+        ],
+    )
+    _write_saturation_json(result, "e1-postgres", "triagem", "20260101T000000Z")
+
+    out = tmp_path / "results" / "e1-postgres" / "triagem" / "20260101T000000Z" / "saturation.json"
+    payload = json.loads(out.read_text())
+    assert payload["probes"][0]["p99_ms"] == 95.0
+    assert payload["probes"][0]["error_rate"] == 0.0
+    assert payload["probes"][1]["p99_ms"] == 250.0
+    assert payload["probes"][1]["error_rate"] == 0.02
+
+
+def test_write_saturation_json_records_p99_and_error_rate_as_null_when_unmeasured(
+    tmp_path, monkeypatch
+):
+    # Mesma sondagem sem nenhuma requisição parseada (analysis/probe_report.py
+    # imprime p99=None/error_rate=None) — precisa chegar como `null`, não 0.0.
+    monkeypatch.chdir(tmp_path)
+    result = SaturationSearchResult(
+        approx_throughput=None,
+        censored=False,
+        lower_bound=None,
+        loadgen_bottleneck=False,
+        probes=[
+            ProbeResult(
+                rate=1000, violated_slo=True, generator_cpu_percent=0.0,
+                p99_ms=None, error_rate=None,
+            ),
+        ],
+    )
+    _write_saturation_json(result, "e1-postgres", "triagem", "20260101T000000Z")
+
+    out = tmp_path / "results" / "e1-postgres" / "triagem" / "20260101T000000Z" / "saturation.json"
+    payload = json.loads(out.read_text())
+    assert payload["probes"][0]["p99_ms"] is None
+    assert payload["probes"][0]["error_rate"] is None
 
 
 def test_sample_resources_periodically_stops_when_event_is_set():

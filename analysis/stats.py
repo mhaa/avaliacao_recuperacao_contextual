@@ -79,6 +79,13 @@ def bootstrap_percentile_ci(
         confidence_level=confidence,
         method="percentile",
         random_state=np.random.default_rng(seed),
+        # Sem `batch`, scipy vetoriza todas as `n_resamples` de uma vez —
+        # aloca uma matriz (n_resamples, len(sample)): com 10.000 reamostras
+        # sobre uma célula real (~1.5M linhas de medição), isso é ~120 GB e
+        # explode a memória (confirmado ao vivo: container morto com OOM,
+        # exit 137). `batch` limita quantas reamostras ficam na matriz por
+        # vez, sem mudar o resultado — só o pico de memória.
+        batch=50,
     )
     return BootstrapCI(
         low=float(result.confidence_interval.low), high=float(result.confidence_interval.high)

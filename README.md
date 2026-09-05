@@ -284,10 +284,10 @@ cp terraform.tfvars.example terraform.tfvars   # nunca commitar
 
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
-python infra/scripts/cloud_smoke_test.py e1-valkey <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
-python infra/scripts/cloud_smoke_test.py e1-scylla <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
-python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket>
+python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
+python infra/scripts/cloud_smoke_test.py e1-valkey <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
+python infra/scripts/cloud_smoke_test.py e1-scylla <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
+python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
 ```
 
 **Só avance para a Fase 5 depois que o smoke test passar limpo** para a
@@ -321,11 +321,11 @@ recarregar a base completa a cada `apply`/`destroy`):
 ```
 export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 python -m infra.scripts.seed_dataset_snapshots postgres <project-id> us-central1 us-central1-a \
-    <terraform_state_bucket> <dataset_bucket>
+    <terraform_state_bucket> <dataset_bucket> <results_bucket>
 python -m infra.scripts.seed_dataset_snapshots scylla <project-id> us-central1 us-central1-a \
-    <terraform_state_bucket> <dataset_bucket>
+    <terraform_state_bucket> <dataset_bucket> <results_bucket>
 python -m infra.scripts.seed_dataset_snapshots opensearch <project-id> us-central1 us-central1-a \
-    <terraform_state_bucket> <dataset_bucket>
+    <terraform_state_bucket> <dataset_bucket> <results_bucket>
 ```
 
 > **Mudou o schema? Refaça o snapshot** do storage afetado antes de medir —
@@ -354,7 +354,11 @@ make saturation-triagem CELL=e1-postgres PROJECT_ID=<project-id> TF_STATE_BUCKET
 
 `--keep-infra` pula o destroy para investigar uma falha manualmente. Se a
 rampa reportar `loadgen_bottleneck` (gerador saturou antes da célula), escale
-a VM do gerador e repita só a rampa. Consolide e ache a fronteira de Pareto:
+a VM do gerador e repita só a rampa. `--yes` pula a confirmação interativa
+"sim" de apply/destroy — o aviso `FATURÁVEL` continua sendo impresso, só não
+bloqueia em `input()`; use apenas em execução supervisionada (célula por
+célula, com aprovação já dada fora do comando), nunca como default. Consolide
+e ache a fronteira de Pareto:
 
 ```
 docker compose run --rm --entrypoint python tools analysis/report.py \

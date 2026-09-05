@@ -32,16 +32,21 @@ BINARY_SEARCH_ITERATIONS = 3
 class ProbeResult:
     rate: int
     violated_slo: bool
-    # `None` = não foi POSSÍVEL medir a CPU do gerador nesta sondagem (Cloud
-    # Monitoring sem ponto na janela — ver run_measurement_battery.py:
-    # _generator_cpu_percent), estado distinto de 0.0 = medido e ocioso.
-    # Antes, falha de telemetria virava 0.0 e passava calada pelo portão dos
-    # 60% do docs/DESIGN.md: results/e1-postgres/triagem/20260901T144228Z/
-    # saturation.json tem 0.0 nas 4 sondagens enquanto o gerador empurrava
-    # 1000 req/s — implausível, o portão foi vacuoso naquela execução
-    # inteira. Mesma disciplina de analysis/resources.py:classify_bottleneck
-    # (ausente != zero).
+    # `None` = não foi POSSÍVEL medir a CPU do gerador nesta sondagem, estado
+    # distinto de 0.0 = medido e ocioso. Desde que a CPU passou a vir de
+    # /proc/stat lido na própria VM loadgen (analysis/probe_report.py:
+    # _cpu_percent_from_stat, repassado por infra/scripts/
+    # run_measurement_battery.py:_parse_probe_result), `None` deveria ser
+    # raríssimo — mas o campo continua opcional como rede de segurança: antes,
+    # quando a CPU vinha do Cloud Monitoring, uma falha de telemetria virava
+    # 0.0 e passava calada pelo portão dos 60% do docs/DESIGN.md
+    # (results/e1-postgres/triagem/20260901T144228Z/saturation.json tem 0.0
+    # nas 4 sondagens enquanto o gerador empurrava 1000 req/s — implausível).
+    # Mesma disciplina de analysis/resources.py:classify_bottleneck (ausente
+    # != zero).
     generator_cpu_percent: float | None
+    p99_ms: float | None = None
+    error_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -60,9 +65,9 @@ class SaturationSearchResult:
 def _generator_saturated(result: ProbeResult) -> bool:
     """Portão de validade do docs/DESIGN.md (CPU do gerador < 60%): só dispara
     com uma LEITURA acima do limiar. `None` não é gargalo confirmado e não
-    aborta a busca — abortar por atraso de ingestão do Cloud Monitoring já
-    foi bug confirmado ao vivo (ver o retry em run_measurement_battery.py:
-    _generator_cpu_percent). Fica registrado em
+    aborta a busca (rede de segurança — ver o comentário de
+    ProbeResult.generator_cpu_percent; a CPU normalmente já chega medida,
+    lida de /proc/stat por analysis/probe_report.py). Fica registrado em
     SaturationSearchResult.generator_cpu_unmeasured: não medido é visível,
     não fatal."""
     return (

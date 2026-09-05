@@ -10,15 +10,20 @@ mesmo motivo de analysis/smoke_report.py: um `-c` com aspas internas já
 quebrou a sintaxe do `bash -c "..."` que o envolve quando entregue via
 `gcloud compute ssh --command=...`.
 
-Uso:
+Uso (1 ndjson na rampa curta da triagem, N na de confirmação — um por
+repetição, todos consolidados num veredito só):
     python analysis/probe_report.py /app/results/_saturation/e1-postgres/short-0-1000/requests.ndjson
+    python analysis/probe_report.py .../confirm-low-0-1000/rep0/requests.ndjson .../rep1/requests.ndjson ...
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+import polars as pl
 
 from analysis.collect import build_summary, parse_requests_ndjson
 
@@ -27,6 +32,39 @@ PROBE_SCENARIOS = frozenset({"probe"})
 # docs/DESIGN.md, "Protocolo de medição": "SLO: p99 > 200 ms ou taxa de erro > 1%."
 SLO_P99_MS = 200.0
 SLO_ERROR_RATE = 0.01
+
+
+def _parse_proc_stat_cpu_fields(line: str) -> tuple[int, ...]:
+    """Primeira linha de /proc/stat ('cpu  user nice system idle iowait irq
+    softirq steal ...'), em jiffies acumulados desde o boot."""
+    fields = line.split()
+    if fields[0] != "cpu":
+        raise RuntimeError(f"linha de /proc/stat inesperada: {line!r}")
+    return tuple(int(x) for x in fields[1:9])
+
+
+def _cpu_percent_from_stat(before: tuple[int, ...], after: tuple[int, ...]) -> float:
+    """Mesma aritmética de `top`/`mpstat` a partir de duas leituras de
+    /proc/stat: idle_time = idle+iowait, percentual = 1 - (delta idle /
+    delta total). Lido de dentro do container (`docker run --network
+    host`), mas Docker não virtualiza a contagem de jiffies por container
+    sem ferramentas extras (lxcfs) — o valor visto é o da VM inteira,
+    exatamente o escopo que docs/DESIGN.md pede ("CPU do gerador"). Preferido
+    a consultar o Cloud Monitoring (GCPMonitoringCollector,
+    analysis/resources.py) para este portão: elimina a dependência de um
+    pipeline de ingestão assíncrono para um dado que já está disponível
+    localmente, na própria VM, no mesmo processo que decide o veredito da
+    sondagem — confirmado ao vivo que a consulta ao Cloud Monitoring
+    frequentemente não tem nenhum ponto amostrado na janela curta de uma
+    sondagem (results/e3-postgres/triagem/20260904T022008Z/saturation.json:
+    5 de 5 sondagens sem leitura)."""
+    idle_before, idle_after = before[3] + before[4], after[3] + after[4]
+    total_before, total_after = sum(before), sum(after)
+    delta_total = total_after - total_before
+    if delta_total <= 0:
+        return 0.0
+    delta_idle = idle_after - idle_before
+    return 100.0 * (delta_total - delta_idle) / delta_total
 
 
 def violated_slo(summary: dict) -> bool:
@@ -42,16 +80,31 @@ def violated_slo(summary: dict) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("ndjson_path", type=Path)
+    # nargs="+": a rampa de confirmação roda k6 CONFIRMATION_REPETITIONS
+    # vezes (5) e passa um requests.ndjson por repetição — "consolida" no
+    # docstring do módulo (acima) significa combinar todas antes de calcular
+    # o p99/error_rate de UM veredito, não só ler a primeira e ignorar o
+    # resto (bug real: sem nargs, argparse rejeitava os paths extras com
+    # "unrecognized arguments" — nunca acionado ainda porque nenhuma célula
+    # chegou à confirmação; a rampa curta da triagem sempre passa 1 só, onde
+    # o bug era invisível).
+    parser.add_argument("ndjson_path", type=Path, nargs="+")
     args = parser.parse_args(argv)
 
-    df = parse_requests_ndjson(args.ndjson_path, scenarios=PROBE_SCENARIOS)
+    df = pl.concat(
+        [parse_requests_ndjson(path, scenarios=PROBE_SCENARIOS) for path in args.ndjson_path]
+    )
     summary = build_summary(df)
     violated = violated_slo(summary)
 
+    before = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_BEFORE"])
+    after = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_AFTER"])
+    generator_cpu_percent = _cpu_percent_from_stat(before, after)
+
     print(
         f"PROBE_RESULT violated_slo={violated} p99={summary['latency_ms_p99']} "
-        f"error_rate={summary['error_rate']} request_count={summary['request_count']}"
+        f"error_rate={summary['error_rate']} request_count={summary['request_count']} "
+        f"generator_cpu_percent={generator_cpu_percent}"
     )
     return 0
 
