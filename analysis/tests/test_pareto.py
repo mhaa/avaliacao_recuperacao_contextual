@@ -10,6 +10,7 @@ from analysis.pareto import (
     breakpoints,
     cells_without_cost,
     censorship_warning,
+    cheapest_cells,
     cost_at,
     cost_curve,
     crossovers,
@@ -143,11 +144,39 @@ def test_frontier_segments_partition_the_domain_and_are_maximal():
     for previous, current in zip(segments, segments[1:]):
         # contíguos, sem lacuna
         assert previous["demand_to_rps_inclusive"] == current["demand_from_rps_exclusive"]
-        # maximais: dois segmentos vizinhos nunca repetem a mesma decisão
-        assert (previous["pareto_frontier"], previous["cheapest_cell_id"]) != (
-            current["pareto_frontier"],
-            current["cheapest_cell_id"],
-        )
+        # maximais QUANTO À FRONTEIRA: vizinhos nunca repetem o mesmo conjunto
+        # não dominado. Oscilação do argmin não fatia mais o domínio.
+        assert previous["pareto_frontier"] != current["pareto_frontier"]
+
+
+def test_segments_do_not_split_when_only_the_cheapest_cell_flips():
+    """Regressão do defeito que gerou 32 faixas escondendo 3 mudanças de
+    fronteira: com curvas-escada que se entrelaçam, o argmin alterna dezenas
+    de vezes sem que a decisão arquitetural mude."""
+    # A é mais lenta e mais barata por unidade; B é mais rápida e mais cara.
+    # As curvas-escada se entrelaçam, então o argmin troca muitas vezes,
+    # enquanto o conjunto não dominado muda pouquíssimo.
+    a = _cell("a", latency=20, unit_cost=100, saturation=1000)
+    b = _cell("b", latency=10, unit_cost=101, saturation=1050)
+
+    segments = frontier_segments([a, b], 10_000)
+    cost_changes = crossovers([a, b], 10_000)["cost"]
+
+    assert len(segments) == 4
+    # O ponto do teste: a oscilação do argmin é de outra ordem de grandeza e
+    # não fatia mais o domínio. (Antes da correção, cada troca virava faixa.)
+    assert len(cost_changes) > 3 * len(segments)
+
+
+def test_cheapest_reports_every_tied_cell_instead_of_breaking_the_tie():
+    """Com memória fora do preço por GiB, as células Valkey ficam com custo
+    por unidade idêntico. Desempatar por ordem alfabética afirmava que uma
+    delas era a mais barata — afirmação falsa."""
+    a = _cell("a-valkey", latency=10, unit_cost=425.37, saturation=1000)
+    b = _cell("b-valkey", latency=20, unit_cost=425.37, saturation=1000)
+    c = _cell("c-postgres", latency=5, unit_cost=428.15, saturation=1000)
+
+    assert cheapest_cells([a, b, c], 100) == ["a-valkey", "b-valkey"]
 
 
 def test_crossovers_are_reported_where_the_cheapest_cell_changes():
@@ -156,7 +185,7 @@ def test_crossovers_are_reported_where_the_cheapest_cell_changes():
     # A de novo em (1500,2000].
     a = _cell("a", latency=10, unit_cost=100, saturation=1000)
     b = _cell("b", latency=10, unit_cost=110, saturation=1500)
-    changes = crossovers(frontier_segments([a, b], 2000), [a, b])
+    changes = crossovers([a, b], 2000)
 
     demands = [c["demand_rps"] for c in changes["cost"]]
     assert 1000.0 in demands
@@ -166,10 +195,26 @@ def test_crossovers_are_reported_where_the_cheapest_cell_changes():
 def test_crossover_reports_which_cell_added_a_unit():
     a = _cell("a", latency=10, unit_cost=100, saturation=1000)
     b = _cell("b", latency=10, unit_cost=110, saturation=1500)
-    changes = crossovers(frontier_segments([a, b], 2000), [a, b])
+    changes = crossovers([a, b], 2000)
 
     at_1000 = next(c for c in changes["cost"] if c["demand_rps"] == 1000.0)
     assert at_1000["units_incremented"] == ["a"]
+
+
+def test_cost_summary_flags_when_the_argmin_churn_is_all_within_tolerance():
+    """A leitura que o TCC precisa fazer: se quase toda troca de 'mais barata'
+    cabe na incerteza de S, o custo não discrimina e a decisão é da
+    fronteira."""
+    a = _cell("a", latency=10, unit_cost=100.0, saturation=1000)
+    b = _cell("b", latency=10, unit_cost=100.5, saturation=1050)
+
+    summary = crossovers([a, b], 10_000)["cost_summary"]
+
+    assert summary["total"] > 0
+    # A maioria das trocas cabe dentro da incerteza de S — as que não cabem
+    # são as de demanda baixa, onde n é pequeno e um degrau vale muito.
+    assert summary["within_tolerance"] > summary["total"] / 2
+    assert summary["cost_discriminates"] is False
 
 
 def test_memory_capacity_can_force_more_units_than_throughput_alone():

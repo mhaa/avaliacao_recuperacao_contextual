@@ -212,14 +212,30 @@ def pareto_frontier(cells: list[dict], demand, tolerance: float = TOLERANCE) -> 
     ]
 
 
-def cheapest(cells: list[dict], demand) -> dict | None:
-    """Célula de menor `C(D)` pela ESTIMATIVA PONTUAL — argmin sobre intervalos
-    seria mal definido. Desempate por `cell_id`, para ser determinístico."""
-    priced = [(cost_at(c, demand), c) for c in cells]
-    priced = [(cost, c) for cost, c in priced if cost is not None]
+def cheapest_cells(cells: list[dict], demand, rel_tol: float = 1e-9) -> list[str]:
+    """IDs de TODAS as células empatadas no menor `C(D)`, não apenas uma.
+
+    Devolver uma única célula obrigava a desempatar, e o desempate alfabético
+    produzia afirmação falsa: com memória fora do preço por GiB, as células
+    Valkey têm custo por unidade idêntico ao centavo, e o relatório saía
+    dizendo "e1-valkey é a mais barata até 375 req/s" quando o correto é
+    "as quatro células Valkey empatam". Empate é informação; escondê-lo atrás
+    de um `sorted()` é inventar um vencedor.
+
+    Usa a ESTIMATIVA PONTUAL de custo — argmin sobre os intervalos da
+    tolerância seria mal definido. `rel_tol` absorve apenas ruído de ponto
+    flutuante entre valores aritmeticamente iguais; não é margem de
+    equivalência prática."""
+    priced = [
+        (cost, cell["cell_id"])
+        for cost, cell in ((cost_at(c, demand), c) for c in cells)
+        if cost is not None
+    ]
     if not priced:
-        return None
-    return min(priced, key=lambda pair: (pair[0], pair[1]["cell_id"]))[1]
+        return []
+    minimum = min(cost for cost, _ in priced)
+    threshold = abs(minimum) * rel_tol
+    return sorted(cell_id for cost, cell_id in priced if cost - minimum <= threshold)
 
 
 def breakpoints(cells: list[dict], demand_max, tolerance: float = TOLERANCE) -> list[Fraction]:
@@ -256,49 +272,62 @@ def breakpoints(cells: list[dict], demand_max, tolerance: float = TOLERANCE) -> 
     return sorted(points)
 
 
-def frontier_segments(cells: list[dict], demand_max, tolerance: float = TOLERANCE) -> list[dict]:
-    """Partição exata de `(0, demand_max]` em faixas maximais nas quais a
-    fronteira e a configuração mais barata não mudam.
+def _raw_segments(cells: list[dict], demand_max: Fraction, tolerance: float) -> list[dict]:
+    """Um registro por intervalo entre breakpoints consecutivos, sem fusão.
 
-    Cada faixa é avaliada no seu extremo DIREITO: como o intervalo é fechado à
-    direita, o extremo é representante interior legítimo — não precisa de
-    epsilon nem de amostragem. `units_at_upper_bound` é, como o nome diz,
-    medido nesse extremo: dentro de uma faixa fundida, uma célula dominada pode
-    ter incrementado unidades sem alterar a decisão."""
-    demand_max = _as_fraction(demand_max)
-    if demand_max <= 0:
-        return []
-
+    Cada intervalo é avaliado no seu extremo DIREITO: como é fechado à direita,
+    o extremo é representante interior legítimo — não precisa de epsilon nem de
+    amostragem densa."""
     edges = [b for b in breakpoints(cells, demand_max, tolerance) if 0 < b < demand_max]
     raw: list[dict] = []
     start = Fraction(0)
     for end in [*edges, demand_max]:
         frontier = pareto_frontier(cells, end, tolerance)
-        cheapest_cell = cheapest(cells, end)
+        tied = cheapest_cells(cells, end)
         raw.append(
             {
                 "demand_from_rps_exclusive": float(start),
                 "demand_to_rps_inclusive": float(end),
                 "pareto_frontier": sorted(c["cell_id"] for c in frontier),
-                "cheapest_cell_id": cheapest_cell["cell_id"] if cheapest_cell else None,
-                "cheapest_cost_usd_month": cost_at(cheapest_cell, end) if cheapest_cell else None,
+                "cheapest_cell_ids": tied,
+                "cheapest_cost_usd_month": (
+                    min(c for c in (cost_at(c, end) for c in cells) if c is not None)
+                    if tied
+                    else None
+                ),
                 "units_at_upper_bound": {
                     c["cell_id"]: units_at(c, end) for c in cells if units_at(c, end) is not None
                 },
             }
         )
         start = end
+    return raw
+
+
+def frontier_segments(cells: list[dict], demand_max, tolerance: float = TOLERANCE) -> list[dict]:
+    """Partição de `(0, demand_max]` em faixas maximais nas quais **a fronteira**
+    não muda.
+
+    Funde SÓ pela fronteira, deliberadamente. Fundir também pela configuração
+    mais barata — como esta função fazia — produzia dezenas de faixas onde a
+    decisão arquitetural era a mesma e só o argmin oscilava entre curvas-escada
+    que se entrelaçam, com diferenças abaixo de 1%. Nos dados reais isso deu 32
+    faixas escondendo 3 mudanças de fronteira. A troca de "mais barata" continua
+    reportada, mas em `crossovers["cost"]`, onde vem com `relative_gap` e
+    `within_tolerance` para o leitor julgar se significa algo.
+
+    `cheapest_cell_ids` e `units_at_upper_bound` são medidos no extremo direito
+    da faixa e podem variar dentro dela — os nomes dizem isso."""
+    demand_max = _as_fraction(demand_max)
+    if demand_max <= 0:
+        return []
 
     merged: list[dict] = []
-    for segment in raw:
+    for segment in _raw_segments(cells, demand_max, tolerance):
         previous = merged[-1] if merged else None
-        same_decision = (
-            previous is not None
-            and previous["pareto_frontier"] == segment["pareto_frontier"]
-            and previous["cheapest_cell_id"] == segment["cheapest_cell_id"]
-        )
-        if same_decision:
+        if previous is not None and previous["pareto_frontier"] == segment["pareto_frontier"]:
             previous["demand_to_rps_inclusive"] = segment["demand_to_rps_inclusive"]
+            previous["cheapest_cell_ids"] = segment["cheapest_cell_ids"]
             previous["cheapest_cost_usd_month"] = segment["cheapest_cost_usd_month"]
             previous["units_at_upper_bound"] = segment["units_at_upper_bound"]
         else:
@@ -324,23 +353,28 @@ def _units_incremented_at(cells: list[dict], demand) -> list[str]:
     return sorted(incremented)
 
 
-def crossovers(segments: list[dict], cells: list[dict] | None = None) -> dict:
-    """Pontos em que a decisão muda, em duas famílias.
+def crossovers(cells: list[dict], demand_max, tolerance: float = TOLERANCE) -> dict:
+    """Pontos em que a decisão muda, em duas famílias — e um resumo que diz se
+    a família de custo significa alguma coisa.
 
-    `frontier`: o conjunto não dominado mudou — são os pontos de decisão
+    `frontier`: o conjunto não dominado mudou. São os pontos de decisão
     arquitetural substantivos.
 
-    `cost`: o argmin mudou. Vem com `relative_gap` e `within_tolerance`, porque
-    uma troca de "mais barato" com diferença de fração de por cento não é
-    achado nenhum: é ruído dentro da própria incerteza de `S`, e apresentá-la
-    como resultado seria over-claiming."""
-    cells = cells or []
+    `cost`: o conjunto de células mais baratas mudou. Vem com `relative_gap` e
+    `within_tolerance`, porque uma troca de "mais barato" com diferença de
+    fração de por cento não é achado: é ruído dentro da própria incerteza de
+    `S`. `cost_summary` conta quantas ficaram dentro da tolerância, para que
+    "o custo não discriminou" seja lido do relatório em vez de deduzido
+    contando linhas."""
+    demand_max = _as_fraction(demand_max)
+    raw = _raw_segments(cells, demand_max, tolerance) if demand_max > 0 else []
+
     frontier_changes: list[dict] = []
     cost_changes: list[dict] = []
 
-    for previous, current in zip(segments, segments[1:]):
+    for previous, current in zip(raw, raw[1:]):
         demand = current["demand_from_rps_exclusive"]
-        incremented = _units_incremented_at(cells, demand) if cells else []
+        incremented = _units_incremented_at(cells, demand)
 
         before = set(previous["pareto_frontier"])
         after = set(current["pareto_frontier"])
@@ -356,7 +390,7 @@ def crossovers(segments: list[dict], cells: list[dict] | None = None) -> dict:
                 }
             )
 
-        if previous["cheapest_cell_id"] != current["cheapest_cell_id"]:
+        if previous["cheapest_cell_ids"] != current["cheapest_cell_ids"]:
             from_cost = previous["cheapest_cost_usd_month"]
             to_cost = current["cheapest_cost_usd_month"]
             relative_gap = abs(to_cost - from_cost) / from_cost if from_cost else None
@@ -364,8 +398,8 @@ def crossovers(segments: list[dict], cells: list[dict] | None = None) -> dict:
                 {
                     "demand_rps": demand,
                     "units_incremented": incremented,
-                    "from_cell_id": previous["cheapest_cell_id"],
-                    "to_cell_id": current["cheapest_cell_id"],
+                    "from_cell_ids": previous["cheapest_cell_ids"],
+                    "to_cell_ids": current["cheapest_cell_ids"],
                     "from_cost_usd_month": from_cost,
                     "to_cost_usd_month": to_cost,
                     "relative_gap": relative_gap,
@@ -373,7 +407,19 @@ def crossovers(segments: list[dict], cells: list[dict] | None = None) -> dict:
                 }
             )
 
-    return {"frontier": frontier_changes, "cost": cost_changes}
+    within = sum(1 for c in cost_changes if c["within_tolerance"])
+    return {
+        "frontier": frontier_changes,
+        "cost": cost_changes,
+        "cost_summary": {
+            "total": len(cost_changes),
+            "within_tolerance": within,
+            # A leitura que o TCC precisa fazer, escrita aqui em vez de deixada
+            # ao leitor: se quase toda troca de "mais barata" cabe dentro da
+            # incerteza de S, o custo não discrimina e a decisão é da fronteira.
+            "cost_discriminates": len(cost_changes) > 0 and within < len(cost_changes) / 2,
+        },
+    }
 
 
 def cost_undefined_reason(cell: dict) -> str | None:

@@ -19,11 +19,18 @@ COPY --from=k6 /usr/bin/k6 /usr/local/bin/k6
 # nesta fase (nenhum `plan`/`apply` real sem projeto GCP de verdade).
 COPY --from=terraform /bin/terraform /usr/local/bin/terraform
 
-# git: load/run_battery.py registra o hash do commit em cada manifest.json
-# (docs/ARCHITECTURE.md, "Coleta de resultados": "obrigatório... permite saber
-# quais medições vieram de qual versão").
+# git ainda é útil para ferramentas locais, mas NÃO é o que abastece o
+# manifest.json: o código chega aqui por COPY, sem `.git`, então
+# `git rev-parse HEAD` sempre falhou dentro do contêiner e
+# load/run_battery.py gravava `"git_commit": ""` em silêncio (confirmado em
+# results/e4-postgres/triagem/20260906T155013Z). O hash agora é injetado no
+# build e lido de TCC_GIT_COMMIT — ver load/run_battery.py:_git_commit e
+# infra/scripts/build_and_push_images.sh, que passa --build-arg.
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
+
+ARG GIT_COMMIT=""
+ENV TCC_GIT_COMMIT=$GIT_COMMIT
 
 COPY pyproject.toml ./
 COPY core ./core

@@ -369,10 +369,24 @@ inteiro, silenciosamente.
 Duas famílias de cruzamento, ambas reportadas:
 - **`crossovers.frontier`** — o conjunto não dominado mudou. São os pontos de
   decisão arquitetural substantivos.
-- **`crossovers.cost`** — o argmin mudou. Vem com `relative_gap` e
-  `within_tolerance`, porque uma troca de "mais barato" com diferença de
-  fração de por cento é ruído dentro da própria incerteza de `S` — reportá-la
-  como achado seria over-claiming.
+- **`crossovers.cost`** — o conjunto de células mais baratas mudou. Vem com
+  `relative_gap` e `within_tolerance`, porque uma troca de "mais barato" com
+  diferença de fração de por cento é ruído dentro da própria incerteza de `S`
+  — reportá-la como achado seria over-claiming. `cost_summary` conta quantas
+  ficaram dentro da tolerância e expõe `cost_discriminates`, para que "o custo
+  não discriminou" seja lido do relatório em vez de deduzido contando linhas.
+
+**As faixas (`frontier_segments`) fundem SÓ pela fronteira.** Fundir também
+pela configuração mais barata produzia dezenas de faixas onde a decisão
+arquitetural era idêntica e apenas o argmin oscilava entre curvas-escada que
+se entrelaçam: nos dados reais, 32 faixas escondendo 3 mudanças de fronteira.
+Com a fusão só pela fronteira, sobram 4 faixas e as 3 mudanças ficam visíveis.
+
+**Empate de custo é reportado como empate.** `cheapest_cell_ids` é uma lista,
+não uma célula. Com memória fora do preço por GiB, as células Valkey têm custo
+por unidade idêntico ao centavo; desempatar por ordem alfabética fazia o
+relatório afirmar "e1-valkey é a mais barata até 375 req/s", o que é artefato
+de desempate, não resultado.
 
 ### Preços
 

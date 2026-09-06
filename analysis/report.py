@@ -360,7 +360,16 @@ def build_report(
         )
 
     segments = frontier_segments(cells, domain_max)
+    crossover_report = crossovers(cells, domain_max)
     frontier_union = sorted({cid for seg in segments for cid in seg["pareto_frontier"]})
+
+    summary = crossover_report["cost_summary"]
+    if summary["total"] and not summary["cost_discriminates"]:
+        cost_model_warnings.append(
+            f"{summary['within_tolerance']}/{summary['total']} das trocas de configuração mais "
+            "barata ficaram dentro da tolerância de S — o custo não discrimina as células; a "
+            "decisão vem da fronteira, não do argmin. Não reportar essas trocas como achado."
+        )
 
     demand_level_reports = []
     for demand in demand_levels:
@@ -432,7 +441,7 @@ def build_report(
         "cells_without_cost": without_cost,
         "demand_levels": demand_level_reports,
         "frontier_segments": segments,
-        "crossovers": crossovers(segments, cells),
+        "crossovers": crossover_report,
         # Renomeado de "pareto_frontier": a semântica mudou para "união sobre
         # o domínio de demanda", que é o conjunto que segue para a
         # confirmação. Reusar a chave antiga deixaria consumidores

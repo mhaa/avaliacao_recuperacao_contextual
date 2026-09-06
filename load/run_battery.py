@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import subprocess
 import sys
@@ -83,11 +84,38 @@ def target_url_for(
     raise ValueError("informe --target-url ou --targets")
 
 
-def _git_commit() -> str:
+def _git_commit() -> str | None:
+    """Hash do commit que gerou esta medição, ou None se indeterminável.
+
+    Prioridade para a variável de ambiente `TCC_GIT_COMMIT`, injetada no build
+    da imagem (docker/Dockerfile.tools). Isso não é preferência de estilo: no
+    contêiner `tools` o código chega por `COPY`, então **não existe `.git`** e
+    `git rev-parse HEAD` nunca teve como funcionar ali. Como a chamada usava
+    `check=False` e devolvia `stdout.strip()`, o erro virava string vazia e o
+    manifesto saía com `"git_commit": ""` — silenciosamente sem a informação
+    que existe justamente para saber qual versão produziu cada resultado.
+    Confirmado nos manifestos de results/e4-postgres/triagem/20260906T155013Z.
+
+    Devolve None, não "": vazio se confunde com "campo não preenchido", e o
+    aviso abaixo garante que a perda apareça no log da bateria, em vez de só
+    no arquivo, meses depois."""
+    from_env = os.environ.get("TCC_GIT_COMMIT", "").strip()
+    if from_env:
+        return from_env
+
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False
     )
-    return result.stdout.strip()
+    commit = result.stdout.strip()
+    if commit:
+        return commit
+
+    print(
+        "AVISO: não foi possível determinar o commit desta medição — nem TCC_GIT_COMMIT "
+        "(injetado no build da imagem) nem `git rev-parse HEAD` responderam. O manifesto "
+        "vai sem rastreabilidade de versão."
+    )
+    return None
 
 
 def build_k6_cmd(

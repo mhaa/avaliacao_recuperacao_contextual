@@ -223,7 +223,7 @@ def test_build_report_emits_demand_levels_segments_and_crossovers(tmp_path):
     for previous, current in zip(segments, segments[1:]):
         assert previous["demand_to_rps_inclusive"] == current["demand_from_rps_exclusive"]
 
-    assert set(report["crossovers"]) == {"frontier", "cost"}
+    assert set(report["crossovers"]) == {"frontier", "cost", "cost_summary"}
     union = {cid for seg in segments for cid in seg["pareto_frontier"]}
     assert set(report["pareto_frontier_union"]) == union
     assert "censorship_warning" in report
