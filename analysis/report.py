@@ -46,12 +46,96 @@ def storage_for_cell(cell_id: str) -> str:
 # verdade — placeholder até dimensionamento.xlsx, Etapa 1, dar custo real
 # por célula). Hoje todo storage usa os mesmos tipos de máquina
 # (infra/modules/database e /service têm o mesmo default para as 4), então
-# o custo sai igual nas 4 — limitação conhecida do placeholder, não um bug.
+# o custo de COMPUTAÇÃO sai igual nas 4 — limitação conhecida do
+# placeholder, não um bug. A componente de ARMAZENAMENTO abaixo é o que
+# discrimina as tecnologias de verdade (ver docs/DESIGN.md, "Custo de
+# armazenamento").
 MACHINE_HOURLY_USD = {"n2-standard-4": 0.194, "n2-standard-8": 0.388}
 CELL_COST_USD_HOUR = {
     storage: MACHINE_HOURLY_USD["n2-standard-8"] + MACHINE_HOURLY_USD["n2-standard-4"]
     for storage in ("postgres", "valkey", "scylla", "opensearch")
 }
+
+# Preço por GB — consultado direto na GCP em 2026-09-06 (não as estimativas
+# de dimensionamento.xlsx — ver docs/DESIGN.md, "Custo de armazenamento",
+# pela derivação completa e pela razão real memória:disco ≈16,5× que essa
+# consulta encontrou, contra a estimativa a priori de ≈50× da planilha).
+# Disco: pd-ssd, us-east4 (região do experimento) — $0,187/GB-mês (fonte:
+# gcloud-compute.com, tabela pública da GCP).
+DISK_USD_PER_GB_HOUR = 0.187 / 730
+# Memória: N2 customizada não tem página de preço isolado — derivada de
+# n2-standard-4 (4 vCPU, 16 GB, $0,1942/h) vs n2-highmem-4 (4 vCPU, 32 GB,
+# $0,2620/h), ambos us-central1 (fonte: economize.cloud — melhor tabela
+# pública encontrada; não achei preço de N2 customizada quebrado por região
+# para us-east4 especificamente).
+MEMORY_USD_PER_GB_HOUR = (0.2620 - 0.1942) / 16
+
+_BYTES_PER_GB = 1024**3
+
+# O que cada estratégia realmente usa, por tecnologia — mapeado às
+# tabelas/padrões de chave/índices dos adaptadores (storage/*.py), não ao
+# modelo idealizado de dimensionamento.xlsx (que assume um deploy mínimo
+# isolado por estratégia). Ver docs/DESIGN.md, "Custo de armazenamento",
+# pela tabela completa e a justificativa de cada linha. Combinação ausente
+# (ex.: ("e4", "scylla")) é célula inviável — nunca aparece em
+# results/<cell>/, então storage_cost_usd_hour nunca é chamada para ela.
+STRATEGY_STORAGE_KEYS: dict[tuple[str, str], list[str]] = {
+    ("e1", "postgres"): ["candidates"],
+    ("e2", "postgres"): ["candidates", "item_contexts"],
+    ("e3", "postgres"): ["prematerialized"],
+    ("e4", "postgres"): ["candidates", "inverted_lists"],
+    ("e1", "valkey"): ["candidates:*"],
+    ("e2", "valkey"): ["candidates:*", "item_contexts:*"],
+    ("e3", "valkey"): ["prematerialized:*"],
+    ("e4", "valkey"): ["candidates_set:*", "inverted:*"],
+    ("e1", "scylla"): ["candidates"],
+    ("e2", "scylla"): ["candidates_by_context"],
+    ("e3", "scylla"): ["prematerialized"],
+    ("e1", "opensearch"): ["candidates"],
+    ("e2", "opensearch"): ["candidates"],
+    ("e4", "opensearch"): ["candidates"],
+}
+
+
+_DEFAULT_STORAGE_ROOT = Path("results/storage")
+
+
+def _load_storage_sizes(storage: str, storage_root: Path) -> dict:
+    """Lê <storage_root>/<storage>.json — escrito por
+    infra/scripts/measure_storage_size.py, uma vez por tecnologia (nunca
+    por célula: armazenamento não varia com carga/taxa de requisição).
+    Ausência é erro, não 0 silencioso: misturar células com e sem custo de
+    armazenamento no mesmo relatório enviesaria a fronteira de Pareto sem
+    aviso nenhum. `storage_root` é parâmetro (não uma constante fixa) para
+    os testes poderem apontar pra uma árvore sintética em `tmp_path`, sem
+    tocar `results/` de verdade nem precisar de cache entre chamadas."""
+    path = storage_root / f"{storage}.json"
+    if not path.exists():
+        raise RuntimeError(
+            f"{path} não existe — rode infra/scripts/measure_storage_size.py {storage} "
+            "... antes de gerar o relatório (docs/DESIGN.md, 'Custo de armazenamento'). "
+            "Sem isso, custo_usd_hora ficaria incompleto (só computação) para as células dessa "
+            "tecnologia."
+        )
+    return json.loads(path.read_text())["sizes"]
+
+
+def storage_bytes_for_cell(cell_id: str, storage_root: Path = _DEFAULT_STORAGE_ROOT) -> int:
+    strategy, storage = cell_id.split("-", 1)
+    sizes = _load_storage_sizes(storage, storage_root)
+    keys = STRATEGY_STORAGE_KEYS[(strategy, storage)]
+    if storage == "valkey":
+        # valkey_key_pattern_bytes (analysis/storage_size.py) devolve uma
+        # estimativa por amostragem, não uma contagem exata — único dos 4
+        # storages com essa característica (ver docs/DESIGN.md).
+        return sum(sizes[key]["bytes_estimate"] for key in keys)
+    return sum(sizes[key] for key in keys)
+
+
+def storage_cost_usd_hour(cell_id: str, storage_root: Path = _DEFAULT_STORAGE_ROOT) -> float:
+    storage = cell_id.split("-", 1)[1]
+    price_per_gb_hour = MEMORY_USD_PER_GB_HOUR if storage == "valkey" else DISK_USD_PER_GB_HOUR
+    return (storage_bytes_for_cell(cell_id, storage_root) / _BYTES_PER_GB) * price_per_gb_hour
 
 # Margem de equivalência prática para o TOST na confirmação — placeholder,
 # confirmar com o usuário o valor real antes de usar num resultado do TCC.
@@ -120,7 +204,9 @@ def percentiles_of(latencies: list[float]) -> dict[str, float]:
 
 
 def build_report(
-    groups: dict[str, list[float]], saturation_by_cell: dict[str, dict] | None = None
+    groups: dict[str, list[float]],
+    saturation_by_cell: dict[str, dict] | None = None,
+    storage_root: Path = _DEFAULT_STORAGE_ROOT,
 ) -> dict:
     saturation_by_cell = saturation_by_cell or {}
     labels = list(groups)
@@ -134,11 +220,17 @@ def build_report(
     for cell_id, latencies in groups.items():
         p99 = percentiles_of(latencies)["p99"]
         saturation = saturation_by_cell.get(cell_id, {})
+        compute_cost = CELL_COST_USD_HOUR[storage_for_cell(cell_id)]
+        storage_bytes = storage_bytes_for_cell(cell_id, storage_root)
+        storage_cost = storage_cost_usd_hour(cell_id, storage_root)
         cells.append(
             {
                 "cell_id": cell_id,
                 "latency_p99_ms": p99,
-                "cost_usd_hour": CELL_COST_USD_HOUR[storage_for_cell(cell_id)],
+                "cost_usd_hour": compute_cost + storage_cost,
+                "compute_cost_usd_hour": compute_cost,
+                "storage_cost_usd_hour": storage_cost,
+                "storage_bytes": storage_bytes,
                 "saturation_throughput_approx": saturation.get("approx_throughput"),
                 "saturation_censored": saturation.get("censored", False),
                 "saturation_lower_bound": saturation.get("lower_bound"),

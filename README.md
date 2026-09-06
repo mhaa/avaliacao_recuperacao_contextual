@@ -330,7 +330,12 @@ python -m infra.scripts.seed_dataset_snapshots opensearch <project-id> us-centra
 
 > **Mudou o schema? Refaça o snapshot** do storage afetado antes de medir —
 > `run_measurement_battery.py` pula schema **e** carga quando o snapshot
-> existe. Valkey fica de fora (100% em memória, sem disco).
+> existe. Valkey fica de fora (100% em memória, sem disco). E antes de
+> refazer o snapshot, confirme que `tools:latest`/`service:latest` já foram
+> republicados com o fix — regenerar o snapshot com uma imagem
+> desatualizada reproduz o mesmo problema no disco restaurado. Ver
+> [docs/BENCHMARKS.md#10-a-armadilha-da-imagem-desatualizada](docs/BENCHMARKS.md#10-a-armadilha-da-imagem-desatualizada)
+> antes de confiar em qualquer bateria real após um fix de schema/estratégia.
 
 **Triagem** — todas as 14 células, carga/seletividade fixas + rampa curta de
 saturação. Rode a primeira com `--verify-otel` (confirma que a instrumentação

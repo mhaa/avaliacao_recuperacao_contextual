@@ -246,6 +246,95 @@ explicitamente: indica que a dimensão de vazão não discriminou as
 configurações neste delineamento, e a fronteira deveria ser reduzida a
 latência × custo (2D).
 
+### Custo de armazenamento — a componente que faltava na dimensão `custo`
+
+Até a triagem das 14 células ser concluída, `custo_usd_hora`
+(`analysis/report.py:CELL_COST_USD_HOUR`) era só custo de **computação**
+(soma dos tipos de VM), idêntico nas 4 tecnologias — que hoje usam os mesmos
+tipos de máquina. Isso deixou `custo` incapaz de discriminar qualquer célula:
+a fronteira de Pareto da triagem colapsou para 1 célula, decidida por ruído
+de milissegundo em latência, porque `custo` (empatado) e `vazão` (dentro da
+tolerância de 20%) não discriminavam nada.
+
+O que faltava é **armazenamento**: Valkey mantém tudo em memória (RAM
+provisionada), Postgres/ScyllaDB/OpenSearch usam disco — e os dois têm preço
+por GB muito diferente. `custo_usd_hora` de cada célula passa a ser:
+
+```
+custo_usd_hora = custo_computo_usd_hora + custo_armazenamento_usd_hora
+```
+
+**Preço por GB — consulta direta à GCP (não as estimativas de
+`dimensionamento.xlsx`).** A aba `Parametros` daquela planilha assumia
+memória ≈50× mais cara que disco ($0,006/GB-hora vs $0,10/GB-mês) — uma
+estimativa a priori, da Etapa 1, antes de qualquer preço ser conferido contra
+a calculadora do provedor (a própria planilha marca isso: "CONFERIR na
+calculadora do provedor antes de usar"). Preço real, consultado em
+2026-09-06:
+
+- **Disco** (`pd-ssd`, `us-east4` — região do experimento): **$0,187/GB-mês**
+  → `$0,187 ÷ 730 h = $0,0002562/GB-hora`.
+- **Memória** (N2 customizada): sem página de preço isolado; derivada de 2
+  tipos predefinidos que só diferem na RAM — `n2-standard-4` (4 vCPU, 16 GB)
+  = $0,1942/h e `n2-highmem-4` (4 vCPU, 32 GB) = $0,2620/h, ambos
+  `us-central1` (não achei tabela pública de N2 customizada quebrada por
+  região para `us-east4` especificamente; preço N2 tende a ser uniforme
+  entre as principais regiões dos EUA — aproximação registrada aqui, não
+  escondida). Delta: `($0,2620 − $0,1942) ÷ 16 GB = $0,0042375/GB-hora`.
+
+**Razão real memória:disco ≈ 16,5×, não ≈50×.** Ainda grande o bastante para
+justificar a dimensão, mas a magnitude da planilha original estava
+superestimada em ~3× — usar a razão real (16,5×) no texto do TCC, não a
+estimativa a priori. `dimensionamento.xlsx` continua válido como estimativa
+pré-provisionamento (Etapa 1); este cálculo é o que a própria planilha previa
+substituir "após carga piloto" — a carga piloto já aconteceu (as 14 células
+da triagem rodaram de verdade).
+
+**O que medir, por estratégia e tecnologia** — mapeado às tabelas/padrões de
+chave/índices que cada adaptador realmente usa (`storage/*.py`), não ao
+modelo idealizado da planilha original (que assume um deploy mínimo isolado
+por estratégia):
+
+| Estratégia | Postgres (tabela) | Valkey (padrão de chave) | ScyllaDB (tabela) | OpenSearch (índice) |
+|---|---|---|---|---|
+| E-1 | `candidates` | `candidates:*` | `candidates` | `candidates` |
+| E-2 | `candidates` + `item_contexts` | `candidates:*` + `item_contexts:*` | `candidates_by_context` | `candidates` (mecanisticamente = E-4) |
+| E-3 | `prematerialized` | `prematerialized:*` | `prematerialized` | inviável |
+| E-4 | `candidates` + `inverted_lists` | `candidates_set:*` + `inverted:*` | inviável | `candidates` (= E-2) |
+
+`item_contexts`/`catalog:item_contexts` é o catálogo compartilhado (~87.585
+itens, pequeno), carregado uma vez na montagem — entra na conta de E-2
+porque é o que o script Lua (Valkey) ou o `JOIN`/GIN (Postgres) consultam por
+requisição; não entraria num deploy que só serve E-1 sozinho, já que E-1 usa
+o catálogo em memória da aplicação (ver "Catálogo item→contexto residente na
+aplicação" acima).
+
+**Medição — real, não estimada por fator de sobrecarga.** Armazenamento não
+varia com carga/taxa de requisição (é função só do dataset carregado), então
+não exige reexecutar nenhuma bateria — só medir uma vez por tecnologia contra
+a base já carregada:
+
+- **Postgres**: `pg_total_relation_size(tabela)` por tabela — exato.
+- **ScyllaDB**: `system.size_estimates` (tabela virtual do driver CQL) —
+  `mean_partition_size × partitions_count` por tabela — exato o suficiente
+  sem precisar de SSH/`nodetool`.
+- **OpenSearch**: `_cat/indices?bytes=b` por índice — exato.
+- **Valkey**: `INFO memory` → `used_memory` dá o total real da instância
+  inteira, sem estimativa. Para quebrar por padrão de chave (necessário para
+  diferenciar E-1/E-2/E-3/E-4 dentro da mesma instância): `SCAN` com `MATCH`
+  por padrão + `MEMORY USAGE` amostrado sobre uma amostra de chaves daquele
+  padrão, multiplicado pela contagem real de chaves (contada pelo próprio
+  `SCAN`, não estimada). É a única das 4 tecnologias com uma componente de
+  amostragem estatística, não uma contagem exata — registrar o tamanho da
+  amostra usado junto ao resultado.
+
+Infraestrutura: reaproveita `infra/envs/seed` (a mesma raiz enxuta de
+`infra/scripts/seed_dataset_snapshots.py`) — Postgres/Scylla/OpenSearch
+restauram do snapshot de dataset já existente (rápido, sem recarregar);
+Valkey (sem disco persistente) paga uma carga completa, mesmo custo que já
+acontece hoje em toda célula real dessa tecnologia. 4 execuções no total
+(uma por tecnologia), não 14.
+
 ## Hipóteses
 
 - **H1** — E-3 tem a menor latência de cauda, ao custo de armazenamento proporcional

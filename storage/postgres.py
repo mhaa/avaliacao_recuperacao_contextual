@@ -12,8 +12,13 @@ JOIN+GROUP BY/HAVING de `get_candidates_filtered` (E-2): array-merge sobre
 dado desnormalizado, não join linha-a-linha sobre `item_contexts`. Isso
 resolve o placeholder anterior (que reaproveitava a SQL de E-2 com um
 `LIMIT` colado, suficiente só para o harness de corretude, mas inaceitável
-para a triagem — E-2 e E-4 mediriam o mesmo plano de execução). Ver
-docs/DECISIONS.md, "Etapa 4", para a justificativa de não usar
+para a triagem — E-2 e E-4 mediriam o mesmo plano de execução).
+
+Prioridade deliberada: `intarray` é nativo do Postgres (contrib oficial,
+mantido junto do core, já compilado na imagem oficial) — preferido a
+`pg_roaringbitmap`, uma extensão externa não oficial (repositório de
+terceiro, exige compilar e publicar uma imagem Postgres customizada). Ver
+docs/DECISIONS.md, "Etapa 4", para a justificativa completa de não usar
 `pg_roaringbitmap` (exigiria imagem Postgres customizada nos dois
 ambientes, ver docker-compose.yml/infra/modules/database) nem índice GIN
 (o acesso a `inverted_lists` é sempre direto por `context_id`, chave

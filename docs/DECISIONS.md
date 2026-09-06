@@ -50,10 +50,15 @@ o array de candidatos do usuário com a lista invertida do(s) contexto(s)
 pedido(s) — mecanismo de array-merge sobre dado desnormalizado, distinto do
 JOIN+GROUP BY/HAVING de E-2 sobre `item_contexts` (normalizado).
 
-Considerado e descartado `pg_roaringbitmap` (apesar de o pipeline já gerar
-`inverted_bitmaps/*.bin` em formato Roaring via `pyroaring`, especificamente
-para esse tipo de consumo): não é módulo contrib do Postgres, exigiria
-compilar e publicar uma imagem Postgres customizada — tanto localmente
+Prioridade deliberada por uma extensão **nativa** do Postgres: `intarray` é
+contrib oficial, mantido junto do core e já compilado na imagem oficial —
+não uma adição externa que precisa ser buscada, compilada e mantida à parte.
+Considerado e descartado `pg_roaringbitmap` por ser exatamente o oposto
+disso — uma extensão externa **não oficial** (repositório de terceiro, fora
+do projeto Postgres) — apesar de o pipeline já gerar `inverted_bitmaps/*.bin`
+em formato Roaring via `pyroaring`, especificamente para esse tipo de
+consumo: não é módulo contrib do Postgres, exigiria compilar e publicar uma
+imagem Postgres customizada — tanto localmente
 (`docker-compose.yml`, hoje `postgres:16-alpine` oficial) quanto na nuvem
 (`infra/modules/database/main.tf`, mesma imagem oficial puxada via
 `docker pull` numa VM Container-Optimized OS, que não tem toolchain de

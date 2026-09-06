@@ -6,9 +6,11 @@
 #
 # `cell` do módulo database/loadgen é só rótulo de recursos
 # ("seed-<storage>", nunca colide com as 14 células reais de
-# cells/*.yaml — o módulo database não valida esse campo). Sem
-# data_disk_snapshot aqui: semear sempre parte de disco em branco (é o que
-# está sendo criado); o default "" do módulo já cobre isso.
+# cells/*.yaml — o módulo database não valida esse campo). `data_disk_snapshot`
+# fica vazio (disco em branco) no uso normal de semear — é o que está sendo
+# criado; setado só quando infra/scripts/measure_storage_size.py reusa esta
+# raiz pra medir armazenamento real contra um snapshot já existente, sem
+# recarregar o dataset inteiro à toa.
 #
 # Uso (mesma disciplina de ../experiment — nunca commitar terraform.tfvars):
 #   cd infra/envs/seed
@@ -56,11 +58,17 @@ variable "zone" {
 
 variable "storage" {
   type        = string
-  description = "Tecnologia de banco sendo semeada — nunca valkey (sem disco persistente, ver README.md)."
+  description = "Tecnologia de banco sendo semeada OU medida (infra/scripts/measure_storage_size.py). Valkey nunca é semeada de verdade (sem disco persistente pra snapshotar, ver README.md), mas pode ser usada aqui só pra medir armazenamento real (docs/DESIGN.md, 'Custo de armazenamento') — nesse caso data_disk_snapshot fica sempre vazio, disco em branco não importa porque Valkey não tem disco."
   validation {
-    condition     = contains(["postgres", "scylla", "opensearch"], var.storage)
-    error_message = "storage precisa ser um de: postgres, scylla, opensearch (valkey não usa disco persistente)."
+    condition     = contains(["postgres", "valkey", "scylla", "opensearch"], var.storage)
+    error_message = "storage precisa ser um de: postgres, valkey, scylla, opensearch."
   }
+}
+
+variable "data_disk_snapshot" {
+  type        = string
+  description = "Nome do snapshot pra restaurar o disco já carregado (infra/scripts/seed_dataset_snapshots.py, ex.: tcc-dataset-seed-postgres) em vez de partir de disco em branco — usado por infra/scripts/measure_storage_size.py pra medir sem recarregar. Vazio (default) preserva o comportamento original deste root: sempre carga fresca (é o que cria o snapshot em primeiro lugar). Nunca usado para Valkey (sem disco persistente)."
+  default     = ""
 }
 
 variable "tools_image" {
@@ -100,6 +108,7 @@ module "database" {
   cell                 = local.seed_cell
   storage              = var.storage
   subnetwork_self_link = module.network.subnetwork_self_link
+  data_disk_snapshot   = var.data_disk_snapshot
 }
 
 module "loadgen" {

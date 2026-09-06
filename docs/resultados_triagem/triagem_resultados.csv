@@ -1,0 +1,15 @@
+﻿cell_id,estrategia,banco,run_timestamp,n_repeticoes,n_requisicoes_total,taxa_erro_media,vazao_atendida_media_rps,latencia_p50_ms,latencia_p95_ms,latencia_p99_ms,latencia_p999_ms,vazao_saturacao_aprox_rps,vazao_saturacao_censurada,vazao_saturacao_limite_inferior_rps,gerador_saturou_antes,cpu_gerador_nao_medida_em_alguma_sondagem
+e1-opensearch,E1,opensearch,20260904T195055Z,5,539447,0.0,358.0923410962138,5216.0,8640.0,9400.0,11401.878000000026,250.0,False,,False,False
+e1-postgres,E1,postgres,20260905T131529Z,5,1149091,0.0,763.1437532334054,2649.0,3728.0,7008.0,7137.0,750.0,False,,False,False
+e1-scylla,E1,scylla,20260904T170334Z,5,769558,0.0,511.5787184071224,3851.0,6512.0,7044.0,7904.443000000087,375.0,False,,False,False
+e1-valkey,E1,valkey,20260904T105647Z,5,645902,0.0,429.37891361449476,4610.0,6918.0,7511.0,8928.0,375.0,False,,False,False
+e2-opensearch,E2,opensearch,20260904T205451Z,5,1279076,0.0,853.1471814755668,2252.0,3096.0,3395.0,3750.0,625.0,False,,False,False
+e2-postgres,E2,postgres,20260905T140410Z,5,1500001,0.0,999.9773390525623,8.0,58.0,93.0,120.0,1125.0,False,,False,False
+e2-scylla,E2,scylla,20260904T175629Z,5,1500004,0.0,999.956674483191,7.0,68.0,95.0,117.0,1125.0,False,,False,False
+e2-valkey,E2,valkey,20260904T122311Z,5,1500002,0.0,999.9613401723964,13.0,79.0,108.0,139.0,1125.0,False,,False,False
+e3-postgres,E3,postgres,20260905T145535Z,5,1500002,0.0,1000.0206670711191,2.0,4.0,4.0,6.0,1750.0,False,,False,False
+e3-scylla,E3,scylla,20260904T185907Z,5,1500002,0.0,1000.0193336844509,3.0,12.0,102.0,126.0,1500.0,False,,False,False
+e3-valkey,E3,valkey,20260904T135625Z,5,1500006,0.0,1000.0233337844531,2.0,4.0,5.0,10.0,1625.0,False,,False,False
+e4-opensearch,E4,opensearch,20260904T220249Z,5,1207440,0.0,804.8830648730535,2394.0,3344.0,3717.0,4154.0,625.0,False,,False,False
+e4-postgres,E4,postgres,20260906T155013Z,5,1225157,0.0,815.7672731093309,2393.0,2871.0,2969.0,3077.0,750.0,False,,False,False
+e4-valkey,E4,valkey,20260904T153047Z,5,1500003,0.0,999.982001744327,14.0,91.0,124.0,159.0,1000.0,False,,False,False

@@ -252,6 +252,55 @@ número conhecido em vez de suposição.
 
 ---
 
+## 10. A armadilha da imagem desatualizada
+
+`service`/`tools` são publicados em Artifact Registry por
+`infra/scripts/build_and_push_images.sh`, **fora do Terraform** — nada força
+um rebuild quando o código muda. `infra/envs/experiment` e `infra/envs/seed`
+sempre referenciam a mesma tag `:latest`; se ela não for atualizada, uma
+célula real roda em silêncio contra código antigo, e o sintoma se parece com
+um achado de tecnologia legítimo.
+
+Dois casos reais, mesma causa raiz:
+
+- **2026-09-03** — `service:latest` era de antes do fix de múltiplos workers
+  do Hypercorn. `e1-postgres` mediu p50=1,4s/p99=8,9s a 1.000 req/s (~5-12×
+  pior que `docs/BENCHMARKS.md` previa) com 0% de erro — parecia limite do
+  banco. `docker top tcc-service` mostrou 1 processo, não 4.
+- **2026-09-06** — pior: o fix de E-4/Postgres (técnica real de
+  interseção via `intarray`, ver `docs/DECISIONS.md`, "Etapa 4") foi
+  commitado, mas `tools:latest`/`service:latest` continuaram apontando para
+  uma imagem de 2 dias antes por quase mais um dia inteiro. A célula rodou
+  o **placeholder antigo** (SQL de E-2 com `LIMIT`) em vez da técnica nova —
+  e como o placeholder ainda devolve resultado correto, o harness de
+  corretude não acusou nada. p99 medido: 81 ms. p99 real, depois de corrigir
+  e re-rodar: **2.969 ms** (~37×) — diferença grande o bastante para mudar
+  quais células entram na fronteira de Pareto.
+
+**Checagem antes de confiar em qualquer bateria real** (mais barata que
+qualquer sondagem de sintoma):
+
+```
+gcloud artifacts docker images list <repo>/service --include-tags \
+    --sort-by=~createTime --limit=5
+gcloud artifacts docker images list <repo>/tools --include-tags \
+    --sort-by=~createTime --limit=5
+```
+
+Confirmar que o `createTime` do dígest com a tag `latest` é **posterior** ao
+commit da última mudança que afeta o caminho de requisição/schema/dado —
+nunca assumir isso de memória (edição local e rebuild+push são passos
+distintos, podem ficar horas ou dias separados). O nome do diretório de
+timestamp de `results/<célula>/<fase>/<timestamp>/` é o registro confiável
+de quando a bateria rodou de verdade — compare os dois direto, não de
+memória. A mesma lacuna atinge `infra/scripts/seed_dataset_snapshots.py`:
+um snapshot de dataset gerado com `tools:latest` desatualizado fica
+faltando schema/dado novo (ex.: uma tabela criada num commit posterior),
+mesmo que o *nome* do snapshot pareça atual — sempre regenerar o snapshot
+**depois** de confirmar a imagem, nunca antes.
+
+---
+
 ## Fontes
 
 - Pinterest Engineering — [Establishing a Large Scale Learned Retrieval System](https://medium.com/pinterest-engineering/establishing-a-large-scale-learned-retrieval-system-at-pinterest-eb0eaf7b92c5)

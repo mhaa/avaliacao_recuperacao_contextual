@@ -42,6 +42,43 @@ def _write_fake_run(rep_dir, latencies: list[float]) -> None:
     (rep_dir / "requests.ndjson").write_text("\n".join(lines) + "\n")
 
 
+def _write_fake_storage_sizes(storage_root):
+    """Fixture sintética pra storage_bytes_for_cell/storage_cost_usd_hour
+    (analysis/report.py) — mesmo formato que
+    infra/scripts/measure_storage_size.py grava de verdade em
+    results/storage/<storage>.json, um valor plausível por
+    tabela/padrão/índice usado pelas células e1/e2-postgres e e1-valkey
+    (as únicas que os testes deste arquivo exercitam)."""
+    storage_root.mkdir(parents=True, exist_ok=True)
+    (storage_root / "postgres.json").write_text(
+        json.dumps(
+            {
+                "backend": "postgres",
+                "sizes": {
+                    "candidates": 1000,
+                    "item_contexts": 500,
+                    "prematerialized": 300,
+                    "inverted_lists": 100,
+                },
+            }
+        )
+    )
+    (storage_root / "valkey.json").write_text(
+        json.dumps(
+            {
+                "backend": "valkey",
+                "sizes": {
+                    "candidates:*": {"key_count": 10, "sampled": 10, "bytes_estimate": 2000},
+                    "item_contexts:*": {"key_count": 10, "sampled": 10, "bytes_estimate": 500},
+                    "candidates_set:*": {"key_count": 10, "sampled": 10, "bytes_estimate": 1500},
+                    "inverted:*": {"key_count": 10, "sampled": 10, "bytes_estimate": 400},
+                    "prematerialized:*": {"key_count": 10, "sampled": 10, "bytes_estimate": 300},
+                },
+            }
+        )
+    )
+
+
 def _build_fake_results(tmp_path, phase="triagem"):
     rng = np.random.default_rng(42)
     cells = {
@@ -90,8 +127,10 @@ def test_build_report_rejects_h0_and_dunn_points_at_the_shifted_cell(tmp_path):
     rep_dirs = discover_rep_dirs(results_root, "triagem")
     ensure_collected(rep_dirs)
     groups = load_cell_latencies(rep_dirs)
+    storage_root = tmp_path / "storage"
+    _write_fake_storage_sizes(storage_root)
 
-    report = build_report(groups)
+    report = build_report(groups, storage_root=storage_root)
 
     assert report["kruskal_wallis"]["reject_h0"] is True
     assert report["dunn_posthoc"]["e1-postgres|e1-valkey"] < 0.05
@@ -129,7 +168,9 @@ def test_build_report_includes_saturation_fields_and_pareto_frontier(tmp_path):
         "e2-postgres": {"approx_throughput": 5000.0, "censored": False, "lower_bound": None},
         "e1-valkey": {"approx_throughput": None, "censored": True, "lower_bound": 50000.0},
     }
-    report = build_report(groups, saturation_by_cell)
+    storage_root = tmp_path / "storage"
+    _write_fake_storage_sizes(storage_root)
+    report = build_report(groups, saturation_by_cell, storage_root=storage_root)
 
     by_id = {c["cell_id"]: c for c in report["cells"]}
     assert by_id["e1-postgres"]["saturation_throughput_approx"] == 5000.0
