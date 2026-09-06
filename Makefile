@@ -10,8 +10,8 @@ SAMPLE ?= 10000
 CELL ?= e1-postgres
 DB ?= postgres
 PHASE ?= triagem
-REGION ?= us-central1
-ZONE ?= us-central1-a
+REGION ?= us-east4
+ZONE ?= us-east4-a
 
 # cells/<id>.yaml segue sempre o padrão e<1-4>-<storage> — mesma
 # convenção já usada em infra/scripts/cloud_smoke_test.py:storage_for_cell,

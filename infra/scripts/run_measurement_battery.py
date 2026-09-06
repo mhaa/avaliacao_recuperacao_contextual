@@ -6,9 +6,10 @@ seletividade conforme docs/DESIGN.md ("Protocolo de medição" /
 "Delineamento em duas etapas"), e sobe `results/` direto da VM loadgen para
 o bucket de resultados (load/upload_results.py, via ADC/metadata server —
 não passa mais pelo host do operador). Também roda
-a busca de vazão de saturação (load/saturation.py) — a 3ª dimensão da
-fronteira de Pareto: rampa curta exploratória na triagem (1 patamar por
-combinação, busca binária ao violar o SLO, teto de 50.000 req/s), rampa
+a busca de vazão de saturação (load/saturation.py), cujo `S` é internalizado
+no custo da fronteira de Pareto 2D via `n(D) = ⌈D/S⌉` (analysis/pareto.py):
+rampa curta na triagem (passos de 25%, 2 min por sondagem, busca binária ao
+violar o SLO, teto de 50.000 req/s e 5 repetições do patamar aprovado), rampa
 fina de confirmação (5 repetições por patamar, incrementos de 10%) só nas
 células não dominadas.
 
@@ -114,7 +115,17 @@ CONFIRMATION_REPETITIONS = 5
 CONFIRMATION_WARMUP = "2m"
 CONFIRMATION_MEASURE = "3m"
 SHORT_RAMP_WARMUP = "0s"
-SHORT_RAMP_MEASURE = "1m"
+# 2m, não 1m: S entra direto em n(D) = ⌈D/S⌉ (analysis/pareto.py), ou seja, no
+# custo — uma janela curta demais deixa ruído de medição virar erro de custo.
+SHORT_RAMP_MEASURE = "2m"
+# 25% em vez de dobras: com dobras, o patamar de violação podia cair ao dobro
+# do valor real, e a busca binária tinha de recuperar toda essa faixa.
+SHORT_RAMP_STEP = 0.25
+# Repetições do patamar aprovado ao fim da rampa curta — é o que tira o S de
+# "ensaio único" (docs/DESIGN.md) sem multiplicar a busca inteira. 5 para
+# bater com o resto do protocolo (carga fixa e rampa de confirmação também
+# usam 5); com 3, um IC por bootstrap não se sustentaria.
+SHORT_RAMP_CONFIRM_REPETITIONS = 5
 
 # docs/ARCHITECTURE.md, "Topologia": memória nominal dos tipos de máquina
 # padrão — só para converter a fração que o coletor OpenTelemetry reporta
@@ -268,6 +279,8 @@ def build_remote_battery_command(
     results_mount: str,
     fixtures_mount: str,
     timestamp: str,
+    region: str | None = None,
+    zone: str | None = None,
 ) -> str:
     """Monta `docker run ... load/run_battery.py ...` como argv +
     shlex.join, mesmo padrão de segurança de
@@ -296,6 +309,13 @@ def build_remote_battery_command(
         "--timestamp",
         timestamp,
     ]
+    # Região/zona vão para o manifest.json de cada repetição (load/run_battery.py):
+    # sem elas, um resultado arquivado não diz em que região foi medido — e a
+    # região determina os preços que alimentam o modelo de custo.
+    if region:
+        battery_argv += ["--region", region]
+    if zone:
+        battery_argv += ["--zone", zone]
 
     docker_argv = [
         "docker",
@@ -688,6 +708,20 @@ def _write_saturation_json(
             }
             for p in saturation.probes
         ],
+        # Repetições do patamar aprovado, separadas da trilha de busca: é
+        # sobre elas que a análise calcula a dispersão de S (quantas violaram
+        # o SLO no mesmo patamar, e como o p99 variou). Lista vazia em
+        # execuções antigas ou em células censuradas.
+        "final_level_probes": [
+            {
+                "rate": p.rate,
+                "violated_slo": p.violated_slo,
+                "generator_cpu_percent": p.generator_cpu_percent,
+                "p99_ms": p.p99_ms,
+                "error_rate": p.error_rate,
+            }
+            for p in saturation.final_level_probes
+        ],
     }
     (out_dir / filename).write_text(json.dumps(payload, indent=2))
 
@@ -736,6 +770,14 @@ def main(argv: list[str] | None = None) -> int:
         "métricas de verdade para o Cloud Monitoring — recomendado só na primeira célula da "
         "triagem (o módulo Terraform é idêntico nas 14, um OK aqui vale para todas). Aborta "
         "(sem rodar o sweep) se a verificação falhar.",
+    )
+    parser.add_argument(
+        "--only-saturation",
+        action="store_true",
+        help="pula a bateria de carga fixa e roda SÓ a rampa de saturação — para re-medir S "
+        "com a metodologia nova sem descartar as repetições de latência já coletadas (que são "
+        "a parte cara). O saturation.json novo cai num diretório de timestamp próprio, sem "
+        "rep*/; analysis/report.py o encontra varrendo a árvore, não derivando dos rep_dirs.",
     )
     parser.add_argument(
         "--keep-infra",
@@ -946,7 +988,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             sampling_thread.start()
 
-        for i, (rate, tier) in enumerate(sweep, start=1):
+        if args.only_saturation:
+            print(
+                "\n--- --only-saturation: bateria de carga fixa PULADA "
+                "(as repetições de latência já coletadas são preservadas) ---"
+            )
+        for i, (rate, tier) in enumerate([] if args.only_saturation else sweep, start=1):
             print(f"\n--- combinação {i}/{len(sweep)}: rate={rate} tier={tier} ---")
             remote_cmd = build_remote_battery_command(
                 args.cell,
@@ -959,6 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
                 RESULTS_MOUNT,
                 FIXTURES_MOUNT,
                 timestamp,
+                region=args.region,
+                zone=args.zone,
             )
             # print(result.stdout): sem isso, o resultado desta combinação
             # fica completamente mudo no log — confirmado ao vivo: um crash
@@ -986,7 +1035,12 @@ def main(argv: list[str] | None = None) -> int:
                 label="short",
                 repetitions=1,
             )
-            saturation = run_saturation_search(probe_fn, step_mode="doubling")
+            saturation = run_saturation_search(
+                probe_fn,
+                step_mode="fine",
+                step=SHORT_RAMP_STEP,
+                confirm_repetitions=SHORT_RAMP_CONFIRM_REPETITIONS,
+            )
             _report_saturation(saturation)
             _write_saturation_json(saturation, args.cell, args.phase, timestamp)
         else:

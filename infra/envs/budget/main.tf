@@ -56,7 +56,7 @@ variable "currency_code" {
 variable "region" {
   type        = string
   description = "Região da Cloud Function da trava de segurança (module.budget_killswitch)."
-  default     = "us-central1"
+  default     = "us-east4"
 }
 
 variable "function_source_bucket" {

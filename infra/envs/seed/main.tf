@@ -47,13 +47,13 @@ variable "project_id" {
 variable "region" {
   type        = string
   description = "Região única do experimento (mesma de ../experiment)."
-  default     = "us-central1"
+  default     = "us-east4"
 }
 
 variable "zone" {
   type        = string
   description = "Zona dentro da região."
-  default     = "us-central1-a"
+  default     = "us-east4-a"
 }
 
 variable "storage" {

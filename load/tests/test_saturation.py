@@ -89,6 +89,48 @@ def test_unmeasured_generator_cpu_does_not_abort_the_search_and_is_flagged():
     assert len(calls) > 2
 
 
+def test_final_level_is_reprobed_the_requested_number_of_times():
+    """O S reportado deixa de ser ensaio único: o patamar aprovado é
+    re-sondado, e essas repetições ficam separadas da trilha de busca."""
+    calls: list[int] = []
+
+    def probe(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=rate > 1200, generator_cpu_percent=10.0)
+
+    result = run_saturation_search(
+        probe, start_rate=1000, ceiling=5000, step_mode="fine", step=0.25, confirm_repetitions=5
+    )
+
+    assert result.approx_throughput is not None
+    approx = int(result.approx_throughput)
+    assert len(result.final_level_probes) == 5
+    assert [p.rate for p in result.final_level_probes] == [approx] * 5
+    # As repetições entram também na trilha completa, e o valor aproximado
+    # NÃO é recalculado a partir delas.
+    assert calls[-5:] == [approx] * 5
+
+
+def test_a_censored_cell_has_no_final_level_to_confirm():
+    """Sem patamar de violação não há o que repetir — e o custo de uma célula
+    censurada nem usa S como valor pontual (⌈D/S⌉ = 1 sai da desigualdade)."""
+
+    def never_violates(rate: int) -> ProbeResult:
+        return ProbeResult(rate=rate, violated_slo=False, generator_cpu_percent=10.0)
+
+    result = run_saturation_search(
+        never_violates,
+        start_rate=1000,
+        ceiling=2000,
+        step_mode="fine",
+        step=0.25,
+        confirm_repetitions=5,
+    )
+
+    assert result.censored is True
+    assert result.final_level_probes == []
+
+
 def test_measured_zero_cpu_is_not_reported_as_unmeasured():
     # 0.0 é uma LEITURA (gerador ocioso); só None é ausência de leitura.
     def idle_generator(rate: int) -> ProbeResult:

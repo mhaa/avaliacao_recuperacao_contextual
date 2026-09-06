@@ -4,8 +4,8 @@
 # .tfvars versionado").
 
 project_id     = "your-gcp-project-id"
-region         = "us-central1"
-zone           = "us-central1-a"
+region         = "us-east4"
+zone           = "us-east4-a"
 storage        = "postgres"
-tools_image    = "us-central1-docker.pkg.dev/your-gcp-project-id/tcc/tools:latest"
+tools_image    = "us-east4-docker.pkg.dev/your-gcp-project-id/tcc/tools:latest"
 dataset_bucket = "your-gcp-project-id-tcc-dataset"

@@ -7,7 +7,7 @@
 # dedicada ao Terraform, que não deveria ter permissão de push de imagem).
 #
 # Uso: infra/scripts/build_and_push_images.sh <project-id> <region> [tag]
-# Exemplo: infra/scripts/build_and_push_images.sh meu-projeto us-central1 latest
+# Exemplo: infra/scripts/build_and_push_images.sh meu-projeto us-east4 latest
 
 set -euo pipefail
 

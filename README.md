@@ -283,11 +283,11 @@ cp terraform.tfvars.example terraform.tfvars   # nunca commitar
 **7. Smoke test em nuvem** — antes de qualquer bateria real, para cada banco:
 
 ```
-export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
-python infra/scripts/cloud_smoke_test.py e1-valkey <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
-python infra/scripts/cloud_smoke_test.py e1-scylla <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
-python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-central1 us-central1-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
+export TOOLS_IMAGE=us-east4-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python infra/scripts/cloud_smoke_test.py e1-postgres <project-id> us-east4 us-east4-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
+python infra/scripts/cloud_smoke_test.py e1-valkey <project-id> us-east4 us-east4-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
+python infra/scripts/cloud_smoke_test.py e1-scylla <project-id> us-east4 us-east4-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
+python infra/scripts/cloud_smoke_test.py e1-opensearch <project-id> us-east4 us-east4-a <terraform_state_bucket> <dataset_bucket> <results_bucket>
 ```
 
 **Só avance para a Fase 5 depois que o smoke test passar limpo** para a
@@ -319,12 +319,12 @@ infra/scripts/build_and_push_images.sh <project-id> <region>   # reconstrói too
 recarregar a base completa a cada `apply`/`destroy`):
 
 ```
-export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python -m infra.scripts.seed_dataset_snapshots postgres <project-id> us-central1 us-central1-a \
+export TOOLS_IMAGE=us-east4-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python -m infra.scripts.seed_dataset_snapshots postgres <project-id> us-east4 us-east4-a \
     <terraform_state_bucket> <dataset_bucket> <results_bucket>
-python -m infra.scripts.seed_dataset_snapshots scylla <project-id> us-central1 us-central1-a \
+python -m infra.scripts.seed_dataset_snapshots scylla <project-id> us-east4 us-east4-a \
     <terraform_state_bucket> <dataset_bucket> <results_bucket>
-python -m infra.scripts.seed_dataset_snapshots opensearch <project-id> us-central1 us-central1-a \
+python -m infra.scripts.seed_dataset_snapshots opensearch <project-id> us-east4 us-east4-a \
     <terraform_state_bucket> <dataset_bucket> <results_bucket>
 ```
 
@@ -342,19 +342,19 @@ saturação. Rode a primeira com `--verify-otel` (confirma que a instrumentaçã
 de recursos está exportando métricas — vale para as 14, não repita):
 
 ```
-export TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
-python -m infra.scripts.run_measurement_battery e1-postgres <project-id> us-central1 us-central1-a \
+export TOOLS_IMAGE=us-east4-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+python -m infra.scripts.run_measurement_battery e1-postgres <project-id> us-east4 us-east4-a \
     <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase triagem --verify-otel
 ```
 
 Demais 13 células (troque só o nome), via script ou `make`:
 
 ```
-python -m infra.scripts.run_measurement_battery e1-valkey <project-id> us-central1 us-central1-a \
+python -m infra.scripts.run_measurement_battery e1-valkey <project-id> us-east4 us-east4-a \
     <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase triagem
 # ou:
 make saturation-triagem CELL=e1-postgres PROJECT_ID=<project-id> TF_STATE_BUCKET=<terraform_state_bucket> \
-    RESULTS_BUCKET=<results_bucket> DATASET_BUCKET=<dataset_bucket> TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+    RESULTS_BUCKET=<results_bucket> DATASET_BUCKET=<dataset_bucket> TOOLS_IMAGE=us-east4-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 ```
 
 `--keep-infra` pula o destroy para investigar uma falha manualmente. Se a
@@ -370,21 +370,33 @@ docker compose run --rm --entrypoint python tools analysis/report.py \
     results --phase triagem --out results/report/triagem
 ```
 
+A fronteira é 2D (latência × custo(D)) e **depende da demanda**: use
+`pareto_frontier_union` de `report.json`, a união das fronteiras sobre todo o
+domínio — é o conjunto que segue para a confirmação, conservador de propósito
+(não descarta célula que vença só em alguma faixa). `frontier_segments` e
+`crossovers` mostram em que demanda a decisão muda.
+
 Leia `saturation_throughput_approx` (ou `saturation_lower_bound`, se
-censurada) de cada célula da fronteira em `report.json` — é o
-`--saturation-start` do próximo passo.
+censurada) de cada célula dessa união — é o `--saturation-start` do próximo
+passo.
+
+Para re-medir só a vazão de saturação (por exemplo, depois de mudar a
+metodologia da rampa) sem descartar as repetições de latência já coletadas,
+que são a parte cara, use `--only-saturation`: ele pula a bateria de carga
+fixa e grava um `saturation.json` novo, que `analysis/report.py` encontra
+varrendo a árvore de resultados.
 
 **Confirmação** — só as células da fronteira, varredura completa de carga ×
 seletividade + 5 repetições, mais a rampa fina de saturação:
 
 ```
-python -m infra.scripts.run_measurement_battery <cell-da-fronteira> <project-id> us-central1 us-central1-a \
+python -m infra.scripts.run_measurement_battery <cell-da-fronteira> <project-id> us-east4 us-east4-a \
     <terraform_state_bucket> <results_bucket> <dataset_bucket> --phase confirmacao \
     --saturation-start <valor-do-report.json-da-triagem>
 # ou:
 make saturation-confirmacao CELL=<cell-da-fronteira> START=<valor-do-report.json-da-triagem> \
     PROJECT_ID=<project-id> TF_STATE_BUCKET=<terraform_state_bucket> RESULTS_BUCKET=<results_bucket> \
-    DATASET_BUCKET=<dataset_bucket> TOOLS_IMAGE=us-central1-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
+    DATASET_BUCKET=<dataset_bucket> TOOLS_IMAGE=us-east4-docker.pkg.dev/<seu-projeto>/tcc/tools:latest
 
 docker compose run --rm --entrypoint python tools analysis/report.py \
     results --phase confirmacao --out results/report/confirmacao

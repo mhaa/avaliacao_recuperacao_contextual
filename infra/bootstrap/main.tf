@@ -32,7 +32,7 @@ variable "project_id" {
 variable "region" {
   type        = string
   description = "Região única do experimento (docs/DESIGN.md: \"Nuvem... região única\")."
-  default     = "us-central1"
+  default     = "us-east4"
 }
 
 provider "google" {

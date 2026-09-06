@@ -16,43 +16,84 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 def plot_pareto_frontier(
-    cells: list[dict], out_path: Path, frontier_cell_ids: set[str] | None = None
+    cells: list[dict],
+    out_path: Path,
+    frontier_cell_ids: set[str] | None = None,
+    demand_rps: float | None = None,
+    units_by_cell: dict[str, int] | None = None,
+    cost_by_cell: dict[str, float] | None = None,
 ) -> None:
-    """`cells`: [{"cell_id": str, "latency_p99_ms": float, "cost_usd_hour": float,
-    "saturation_throughput_approx": float|None, "saturation_censored": bool}, ...]
-    (os dois últimos campos são opcionais — docs/DESIGN.md, "Delineamento em
-    duas etapas": a triagem "identifica a fronteira de Pareto latência ×
-    custo", agora em 3 dimensões — analysis/pareto.py). Vazão de saturação
-    entra como anotação de texto, não um terceiro eixo (mais legível para o
-    texto do TCC do que um scatter 3D). `frontier_cell_ids` marca os pontos
-    não dominados (analysis/pareto.py:pareto_frontier) com um marcador
-    diferente dos dominados."""
+    """Fronteira de Pareto em 2 dimensões: latência p99 × custo mensal.
+
+    A vazão de saturação NÃO é um eixo — ela está internalizada no custo, via
+    o número de unidades de atendimento `n(D)` (docs/DESIGN.md, "Custo como
+    função da demanda"). Por isso o gráfico é sempre relativo a uma demanda:
+    `demand_rps` vai no título, e `units_by_cell`/`cost_by_cell` chegam prontos
+    de `report["demand_levels"]`, que já os calculou naquela demanda.
+
+    Células sem custo definido naquela demanda (sem `S` medido) não são
+    plotadas: não há onde colocá-las no eixo x, e inventar uma posição seria
+    pior que omiti-las — elas aparecem em `cells_without_cost`."""
     fig, ax = plt.subplots()
     frontier_cell_ids = frontier_cell_ids or set()
+    units_by_cell = units_by_cell or {}
+    cost_by_cell = cost_by_cell or {}
 
     for c in cells:
+        cost = cost_by_cell.get(c["cell_id"])
+        if cost is None:
+            continue
         in_frontier = c["cell_id"] in frontier_cell_ids
         ax.scatter(
-            [c["cost_usd_hour"]],
+            [cost],
             [c["latency_p99_ms"]],
             marker="o" if in_frontier else "x",
             s=80 if in_frontier else 40,
         )
-        throughput = c.get("saturation_throughput_approx")
-        censored = c.get("saturation_censored", False)
-        if censored:
-            lower_bound = c.get("saturation_lower_bound")
-            throughput_label = f"≥{lower_bound:.0f} (censurada)" if lower_bound else "censurada"
-        elif throughput is not None:
-            throughput_label = f"{throughput:.0f} req/s"
-        else:
-            throughput_label = ""
-        label = c["cell_id"] + (f"\n{throughput_label}" if throughput_label else "")
-        ax.annotate(label, (c["cost_usd_hour"], c["latency_p99_ms"]), fontsize=8)
+        units = units_by_cell.get(c["cell_id"])
+        label = c["cell_id"] + (f"\nn={units}" if units else "")
+        ax.annotate(label, (cost, c["latency_p99_ms"]), fontsize=8)
 
-    ax.set_xlabel("Custo (US$/hora)")
+    ax.set_xlabel("Custo total (US$/mês)")
     ax.set_ylabel("Latência p99 (ms)")
-    ax.set_title("Fronteira de Pareto — latência × custo × vazão de saturação (triagem)")
+    title = "Fronteira de Pareto — latência × custo"
+    if demand_rps is not None:
+        title += f" (D = {demand_rps:.0f} req/s)"
+    ax.set_title(title)
+    _save(fig, out_path)
+
+
+def plot_cost_vs_demand(cells: list[dict], crossovers: dict | None, out_path: Path) -> None:
+    """Curva em degraus de `C(D)` por célula, com os cruzamentos de fronteira
+    marcados — a figura que o texto promete ao falar nos "pontos em que a
+    configuração de menor custo total se altera".
+
+    `C(D) = n(D) · custo_por_unidade` é função escada, com degraus nos
+    múltiplos de `S`; `cost_curve` (analysis/pareto.py) já entrega os patamares
+    prontos em `cells[i]["cost_curve"]`.
+
+    Eixo x linear, não logarítmico: o primeiro patamar começa em D = 0, que não
+    tem lugar numa escala log."""
+    fig, ax = plt.subplots()
+
+    for c in cells:
+        curve = c.get("cost_curve") or []
+        if not curve:
+            continue
+        xs: list[float] = []
+        ys: list[float] = []
+        for step in curve:
+            xs.extend([step["demand_from_rps"], step["demand_to_rps"]])
+            ys.extend([step["cost_usd_month"], step["cost_usd_month"]])
+        ax.plot(xs, ys, label=c["cell_id"], linewidth=1.2)
+
+    for change in (crossovers or {}).get("frontier", []):
+        ax.axvline(change["demand_rps"], linestyle="--", color="grey", linewidth=0.8)
+
+    ax.set_xlabel("Demanda D (req/s)")
+    ax.set_ylabel("Custo total (US$/mês)")
+    ax.set_title("Custo × demanda — degraus nos múltiplos da vazão de saturação")
+    ax.legend(fontsize=7)
     _save(fig, out_path)
 
 

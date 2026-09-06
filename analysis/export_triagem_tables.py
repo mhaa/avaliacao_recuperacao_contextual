@@ -181,7 +181,7 @@ def export(results_root: Path, phase: str, out_dir: Path) -> None:
     if not rep_dirs:
         raise RuntimeError(f"Nenhum resultado encontrado em {results_root} para a fase {phase}.")
     ensure_collected(rep_dirs)
-    saturation_by_cell = load_cell_saturation(rep_dirs)
+    saturation_by_cell = load_cell_saturation(results_root, phase)
     groups = load_cell_latencies(rep_dirs)
 
     out_dir.mkdir(parents=True, exist_ok=True)

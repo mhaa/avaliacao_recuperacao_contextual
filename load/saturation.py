@@ -1,14 +1,26 @@
-"""Busca de vazão de saturação (docs/DESIGN.md, "Protocolo de medição" / "3ª
-dimensão da fronteira de Pareto") — patamares dobrando (rampa curta,
-triagem) ou incrementos de 10% (rampa de confirmação), busca binária de até
-3 iterações ao violar o SLO, teto de 50.000 req/s, censura quando o teto é
-alcançado sem violação, e checagem obrigatória do gerador de carga (CPU <
-60%, docs/DESIGN.md) a cada patamar — se o gerador saturar antes da célula, a
-execução inteira é inválida (`loadgen_bottleneck=True`), nunca interpretada
-como vazão da célula. Uma sondagem SEM leitura de CPU
-(`generator_cpu_percent=None`) não aborta a busca, mas marca
-`generator_cpu_unmeasured=True`: "não deu pra avaliar o portão" é estado
-próprio, nunca confundido com "gerador ocioso".
+"""Busca de vazão de saturação (docs/DESIGN.md, "Protocolo de medição").
+
+`S` não é mais uma dimensão própria da fronteira de Pareto: ele entra no
+custo, via `n(D) = ⌈D/S⌉` (analysis/pareto.py). Isso elevou a exigência sobre
+a precisão desta busca — um erro em `S` vira erro no custo — e é o motivo do
+protocolo atual:
+
+- patamares em incrementos finos (rampa curta da triagem: 25%; rampa de
+  confirmação: 10%) em vez de dobras, para o ponto de violação cair mais
+  perto do valor real;
+- busca binária de até 5 iterações ao violar o SLO. São elas, não os passos
+  finos, que determinam a resolução das células que saturam ABAIXO do rate
+  inicial (violam já na primeira sondagem e a busca desce de 0 até lá);
+- `confirm_repetitions` re-sonda o patamar aprovado, para o `S` reportado ter
+  dispersão em vez de ser ensaio único;
+- teto de 50.000 req/s, com censura quando alcançado sem violação.
+
+Checagem obrigatória do gerador de carga (CPU < 60%, docs/DESIGN.md) a cada
+patamar — se o gerador saturar antes da célula durante a BUSCA, a execução
+inteira é inválida (`loadgen_bottleneck=True`), nunca interpretada como vazão
+da célula. Uma sondagem SEM leitura de CPU (`generator_cpu_percent=None`) não
+aborta a busca, mas marca `generator_cpu_unmeasured=True`: "não deu pra
+avaliar o portão" é estado próprio, nunca confundido com "gerador ocioso".
 
 Lógica pura, sem I/O de rede: quem chama fecha sobre a execução real de um
 patamar (infra/scripts/run_measurement_battery.py) e passa aqui só como
@@ -25,7 +37,7 @@ from typing import Callable, Iterator
 GENERATOR_CPU_THRESHOLD = 60.0  # docs/DESIGN.md: "válido só se CPU do gerador < 60%"
 CEILING_RPS = 50_000  # teto da busca — decisão do usuário para este protocolo
 DEFAULT_START_RATE = 1_000  # nível intermediário, mesmo da carga fixa da triagem
-BINARY_SEARCH_ITERATIONS = 3
+BINARY_SEARCH_ITERATIONS = 5
 
 
 @dataclass(frozen=True)
@@ -60,6 +72,12 @@ class SaturationSearchResult:
     # 60% não pôde ser avaliado naquelas sondagens. Quem lê decide.
     generator_cpu_unmeasured: bool = False
     probes: list[ProbeResult] = field(default_factory=list)  # trilha de auditoria
+    # Repetições do patamar final aprovado (ver `confirm_repetitions` em
+    # run_saturation_search). Existe para o S reportado deixar de ser ensaio
+    # único: com elas dá para reportar dispersão do p99 e quantas repetições
+    # violaram o SLO naquele mesmo patamar. Vazia quando a confirmação não foi
+    # pedida, ou quando a célula ficou censurada/inválida.
+    final_level_probes: list[ProbeResult] = field(default_factory=list)
 
 
 def _generator_saturated(result: ProbeResult) -> bool:
@@ -129,12 +147,39 @@ def _binary_search(
     return low
 
 
+def _confirm_final_level(
+    probe_fn: Callable[[int], ProbeResult],
+    rate: int,
+    repetitions: int,
+    probes: list[ProbeResult],
+) -> list[ProbeResult]:
+    """Re-sonda `repetitions` vezes o patamar já aprovado pela busca.
+
+    Motivo: sem isso o `S` reportado vem de UMA sondagem, sem estimativa de
+    variância — e ele entra direto em `n(D) = ⌈D/S⌉`, ou seja, no custo. As
+    repetições não alteram o valor aproximado (mudar o resultado com base
+    nelas seria refazer a busca pela metade); elas ficam registradas para que
+    a análise possa reportar dispersão e quantas violaram o SLO no mesmo
+    patamar. Para cedo se o gerador saturar — nesse caso o problema é o
+    gerador, não a célula."""
+    confirmations: list[ProbeResult] = []
+    for _ in range(repetitions):
+        result = probe_fn(rate)
+        probes.append(result)
+        confirmations.append(result)
+        if _generator_saturated(result):
+            break
+    return confirmations
+
+
 def run_saturation_search(
     probe_fn: Callable[[int], ProbeResult],
     start_rate: int = DEFAULT_START_RATE,
     ceiling: int = CEILING_RPS,
     binary_search_iterations: int = BINARY_SEARCH_ITERATIONS,
     step_mode: str = "doubling",
+    step: float = 0.10,
+    confirm_repetitions: int = 0,
 ) -> SaturationSearchResult:
     """Roda a busca completa: sonda `doubling_sequence`/`fine_sequence`
     (conforme `step_mode`) a partir de `start_rate`. Se o gerador saturar em
@@ -149,7 +194,7 @@ def run_saturation_search(
     sequence = (
         doubling_sequence(start_rate, ceiling)
         if step_mode == "doubling"
-        else fine_sequence(start_rate, ceiling)
+        else fine_sequence(start_rate, ceiling, step)
     )
     probes: list[ProbeResult] = []
     last_valid = 0
@@ -179,13 +224,29 @@ def run_saturation_search(
                     generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
                     probes=probes,
                 )
+            # Confirmação só do patamar aprovado, e só quando há um: uma
+            # célula censurada não tem patamar de violação para repetir (e o
+            # custo dela nem usa S como valor pontual — ⌈D/S⌉ = 1 sai da
+            # própria desigualdade S ≥ teto).
+            final_level = (
+                _confirm_final_level(probe_fn, approx, confirm_repetitions, probes)
+                if confirm_repetitions > 0 and approx > 0
+                else []
+            )
             return SaturationSearchResult(
                 approx_throughput=float(approx),
                 censored=False,
                 lower_bound=None,
+                # `loadgen_bottleneck` segue False mesmo se o gerador saturar
+                # DURANTE a confirmação: a busca já terminou e o `approx` dela
+                # continua válido — o que se perde é só parte da repetição.
+                # Marcar a execução inteira como inválida aqui contradiria o
+                # próprio approx_throughput que estamos devolvendo; a lista
+                # `final_level_probes` mais curta que o pedido é o sinal.
                 loadgen_bottleneck=False,
                 generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
                 probes=probes,
+                final_level_probes=final_level,
             )
 
         last_valid = rate

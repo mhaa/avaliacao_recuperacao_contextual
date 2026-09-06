@@ -323,7 +323,7 @@ results/<cell>/<phase>/<timestamp>/
 ├── saturation_<tier>.json   # só na confirmação, um por seletividade
 ├── resources.csv            # só na confirmação — CPU/memória/rede das 3 VMs a cada 5s
 └── rep<N>/
-    ├── manifest.json         # célula, taxa, seletividade, timestamp, hash do commit
+    ├── manifest.json         # célula, taxa, seletividade, região/zona, timestamp, hash do commit
     ├── requests.ndjson       # uma linha JSON por requisição (console.log de load/scenarios.js)
     ├── k6-raw.json           # dump nativo do k6 (--out json=) — só diagnóstico
     ├── latencies.parquet     # gerado por analysis/collect.py a partir de requests.ndjson
@@ -340,9 +340,13 @@ de diagnóstico do próprio k6 — nada no pipeline o lê.
 `analysis/report.py results --phase <triagem|confirmacao> --out
 results/report/<phase>` agrega as repetições ainda não coletadas por célula,
 roda Kruskal-Wallis → Dunn (Bonferroni) → epsilon-quadrado → IC de bootstrap
-do p99, e escreve `report.json` (com `pareto_frontier` e
-`censorship_warning`) + `pareto.png`; na confirmação, também roda TOST
-par-a-par entre as células da fronteira.
+do p99, e escreve `report.json` — com `cost_model`, `demand_levels`,
+`frontier_segments`, `crossovers`, `pareto_frontier_union` e
+`censorship_warning` — mais um `pareto_D<nível>.png` por nível de demanda e
+`custo_vs_demanda.png`. A fronteira é 2D (latência × custo(D)) e depende da
+demanda, daí `pareto_frontier_union` (a união sobre o domínio) ser o conjunto
+que segue para a confirmação. Nela, também roda TOST par-a-par entre as
+células da fronteira.
 
 Guardar latências individuais, não só percentis agregados — o bootstrap e o
 TOST precisam da distribuição completa.

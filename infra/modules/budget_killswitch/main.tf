@@ -36,7 +36,7 @@ variable "project_id" {
 variable "region" {
   type        = string
   description = "Região onde a function é criada."
-  default     = "us-central1"
+  default     = "us-east4"
 }
 
 variable "function_source_bucket" {

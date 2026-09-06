@@ -95,7 +95,7 @@ def test_build_resultados_rows_aggregates_across_repetitions(tmp_path):
 
     from analysis.report import load_cell_saturation
 
-    saturation_by_cell = load_cell_saturation(rep_dirs)
+    saturation_by_cell = load_cell_saturation(results_root, "triagem")
     rows = build_resultados_rows(rep_dirs, groups, saturation_by_cell)
     by_id = {row["cell_id"]: row for row in rows}
 

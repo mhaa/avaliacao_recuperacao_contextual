@@ -38,7 +38,7 @@ variable "subnetwork_self_link" {
 
 variable "service_image" {
   type        = string
-  description = "Referência completa da imagem em Artifact Registry (ex.: us-central1-docker.pkg.dev/PROJECT/tcc/service:TAG)."
+  description = "Referência completa da imagem em Artifact Registry (ex.: us-east4-docker.pkg.dev/PROJECT/tcc/service:TAG)."
 }
 
 variable "database_internal_ip" {
@@ -84,8 +84,8 @@ resource "google_project_iam_member" "service_metric_writer" {
 
 locals {
   # Host do registro extraído da própria referência da imagem (ex.:
-  # "us-central1-docker.pkg.dev" de
-  # "us-central1-docker.pkg.dev/PROJECT/tcc/service:latest") — evita uma
+  # "us-east4-docker.pkg.dev" de
+  # "us-east4-docker.pkg.dev/PROJECT/tcc/service:latest") — evita uma
   # variável nova só para repetir o que `service_image` já contém.
   service_registry_host = split("/", var.service_image)[0]
 

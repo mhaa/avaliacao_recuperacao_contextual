@@ -199,6 +199,8 @@ def run_k6(
     selectivity_tier: str,
     smoke: bool,
     out_dir: Path,
+    region: str | None = None,
+    zone: str | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     json_out = out_dir / "k6-raw.json"
@@ -213,6 +215,14 @@ def run_k6(
         "k": k,
         "selectivity_tier": selectivity_tier,
         "smoke": smoke,
+        # Região/zona no manifesto, ao lado do hash do commit e pelo mesmo
+        # motivo: sem elas não há como saber, meses depois, em que região uma
+        # medição arquivada foi feita — e a região muda o preço de instância e
+        # de disco, ou seja, muda o modelo de custo inteiro
+        # (analysis/report.py). Ficam None quando a bateria roda fora da
+        # orquestração de nuvem (ex.: ambiente local).
+        "region": region,
+        "zone": zone,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
     }
@@ -260,6 +270,15 @@ def main(argv: list[str] | None = None) -> int:
         "usado por infra/scripts/run_measurement_battery.py para a varredura e a rampa curta de "
         "saturação (load/saturation.py) caírem no mesmo diretório results/<cell>/<phase>/<ts>/.",
     )
+    parser.add_argument(
+        "--region",
+        default=None,
+        help="região GCP da medição — gravada no manifest.json para a execução ser "
+        "reprodutível (a região muda o preço de instância/disco e, com isso, o modelo de "
+        "custo de analysis/report.py). Passada por "
+        "infra/scripts/run_measurement_battery.py.",
+    )
+    parser.add_argument("--zone", default=None, help="zona GCP da medição — idem --region.")
     args = parser.parse_args(argv)
 
     cell_ids = args.cells or list_viable_cell_ids()
@@ -282,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
             args.selectivity_tier,
             args.smoke,
             out_dir,
+            region=args.region,
+            zone=args.zone,
         )
     return 0
 

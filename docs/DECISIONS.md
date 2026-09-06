@@ -6,6 +6,73 @@ reaparecerem. Para o passo a passo de reprodução, veja o [README](../README.md
 para o "porquê" arquitetural atemporal, veja [ARCHITECTURE.md](ARCHITECTURE.md)
 e [DESIGN.md](DESIGN.md).
 
+## Fase 6 — custo em função da demanda, fronteira 2D (2026-09-06) <a id="fase-6-custo"></a>
+
+**O problema.** Com a triagem das 14 células concluída, a fronteira de Pareto
+colapsou para **uma** célula. A causa não era o dado: era o modelo. `custo`
+somava só os tipos de VM, idênticos nas 4 tecnologias, então empatava sempre;
+`vazão` empatava dentro da tolerância de 20%. Sobrou latência decidindo tudo,
+por diferenças de milissegundo.
+
+**A correção.** Internalizar a vazão no custo, via `n(D) = ⌈D/S⌉`, e reduzir a
+fronteira a **2 dimensões** (latência × custo(D)). Isso resolve de uma vez o
+empate e uma **dupla contagem** que passava despercebida: se o custo depende
+de `S`, manter `S` também como eixo próprio pesa a mesma grandeza duas vezes.
+`throughput_dominates` foi deletada, não deprecada — um terceiro eixo mantido
+em silêncio é exatamente a deriva que o CLAUDE.md proíbe.
+
+**`C_a` escala com `n(D)`.** Cada unidade de atendimento guarda uma réplica
+integral (não há sharding no delineamento), então provisionar ⌈D/S⌉ unidades
+replica o armazenamento junto. A versão anterior do texto cobrava uma cópia só
+para servir uma demanda que exige várias — inconsistência real, corrigida.
+
+**Memória não tem preço por GiB; ela limita unidades.** Três arranjos foram
+considerados. Cobrar RAM por GiB **duplica** o que `p_i` já paga (o
+`n2-standard-8` vem com 32 GB). Não cobrar nada dá ao Valkey parcela de
+estoque nula, tornando-o artificialmente o mais barato. O escolhido:
+`n(D) = máx(⌈D/S⌉, ⌈V_mem/M⌉)`, com M = 24 GiB. Disco, que é elástico e
+faturado à parte, continua em `C_a` por GiB. Ressalva registrada: com U atual
+o maior `V_mem` é ~3,5 GiB, então **o termo de capacidade ainda não é
+acionado** — ele só discrimina em extrapolação para U maior.
+
+**Unidades: `p_a` é mensal.** `C_f` saía em $/mês e `C_a` em $/hora — a soma
+não significava nada. `DISK_USD_PER_GB_HOUR` virou `DISK_USD_PER_GB_MONTH`;
+há teste travando a ordem de grandeza (10 GiB ≈ US$ 1,87/mês, não US$ 0,0026).
+
+**Censura ficou exata, não imputada.** De `S ≥ L` sai `1 ≤ n(D) ≤ ⌈D/L⌉`, e
+para todo `D ≤ L` isso dá `n = 1` **exatamente** — a desigualdade sozinha
+resolve, sem nunca usar o teto como se fosse o `S` medido. Acima de `L` a
+célula é indeterminada, e o domínio é limitado a `L` em vez de extrapolar.
+
+**A tolerância de 20% sobreviveu com papel novo**: em vez de comparar vazões,
+propaga a incerteza de `S` para um intervalo de unidades, e só há dominância
+em custo com intervalos disjuntos. Ela some sozinha quando ambas as células
+precisam de 1 unidade — o que mantém o armazenamento discriminando em demanda
+baixa.
+
+**Bug real encontrado por teste**: `Fraction(0.2)` captura o binário do float,
+não 1/5. Com isso `1000·(1−0,2)·3` e `1000·(1+0,2)·2` viram racionais
+distintos, e o conjunto de breakpoints ganhava **dois** pontos que imprimiam
+"2400", partindo em dois um segmento que deveria ser único. Corrigido
+convertendo floats por `Fraction(str(v))` — a intenção decimal, não o binário.
+
+**Armadilha do `--only-saturation`, corrigida junto.** `load_cell_saturation`
+derivava o diretório de cada célula a partir dos `rep_dirs`. Uma execução só
+de rampa grava um timestamp novo **sem** `rep*/`, que `discover_rep_dirs` não
+enxerga — o relatório seguiria lendo o `S` antigo, sem aviso, com todo o custo
+calculado sobre o valor errado. Agora a varredura é independente, com teste
+cobrindo latência de um timestamp e saturação de outro mais recente.
+
+**Rampa curta mais precisa**, porque `S` virou entrada do custo: passos de 25%
+(não dobras), 2 min por sondagem (não 1), busca binária de 5 iterações (não 3
+— é ela que dá resolução às células que saturam abaixo do rate inicial) e 5
+repetições do patamar final aprovado, para o `S` reportado ter dispersão.
+
+**Região**: tudo alinhado a `us-east4`, inclusive Artifact Registry. Região e
+zona passaram a ser gravadas no `manifest.json` — sem isso não há como saber,
+meses depois, em que região uma medição arquivada foi feita, e a região muda
+os preços que alimentam o modelo de custo inteiro.
+
 ## Etapa 3 — harness/ (oráculo + verificação) <a id="etapa-3"></a>
 
 Como o teste de ponta a ponta precisa de dado real equivalente ao que gerou o
