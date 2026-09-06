@@ -378,13 +378,23 @@ Duas famílias de cruzamento, ambas reportadas:
 
 Região do experimento: **`us-east4`**.
 
+Regra adotada: para cada item, usar o número mais **diretamente publicado**
+que existe, mesmo que isso implique fontes de regiões diferentes — o que é
+declarado, não escondido.
+
 - **Disco** (`pd-ssd`, `us-east4`): **$0,187/GiB-mês**. Fonte: tabela pública
-  da GCP, consultada em 2026-09-06.
-- **Computação**: `n2-standard-4` e `n2-standard-8` **derivados** do preço
-  baseline dos EUA pelo multiplicador regional público de `us-east4` (+8%) —
-  não encontrei tabela pública de N2 quebrada por região para `us-east4`.
-  Aproximação registrada aqui, não escondida: **conferir no console de
-  faturamento do próprio projeto antes de publicar o número no TCC**.
+  da GCP, consultada em 2026-09-06. Há tabela por região, então usa-se a da
+  região do experimento.
+- **Computação** (`n2-standard-4` = $0,1942/h, `n2-standard-8` = $0,3885/h):
+  preço de referência das regiões **baseline dos EUA**, aplicado **sem**
+  multiplicador regional. N2 não tem tabela pública quebrada por região, e
+  derivar `us-east4` multiplicando pelo prêmio de ~8% produziria uma
+  estimativa não conferida no lugar de um número citável. **Consequência a
+  declarar no texto**: o custo é expresso em preço de referência dos EUA, não
+  em preço específico de `us-east4` — que é cerca de 8% maior. Como o interesse
+  do trabalho está na comparação entre configurações, e o preço de instância é
+  idêntico nas quatro tecnologias, um deslocamento uniforme de escala não
+  altera nenhuma conclusão; apenas os valores absolutos.
 
 `dimensionamento.xlsx` (Etapa 1) segue válido como estimativa
 pré-provisionamento; estes números são o que a própria planilha previa

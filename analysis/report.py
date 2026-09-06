@@ -72,18 +72,15 @@ def storage_for_cell(cell_id: str) -> str:
 # montam as constantes e o custo POR UNIDADE.
 # --------------------------------------------------------------------------
 
-# ATENÇÃO — limitação registrada, não escondida: os dois preços de COMPUTAÇÃO
-# abaixo são DERIVADOS do preço baseline dos EUA pelo multiplicador regional
-# público de us-east4 (+8%), porque não encontrei tabela pública de N2
-# quebrada por região para us-east4. CONFERIR no console de faturamento do
-# próprio projeto antes de publicar qualquer número destes no TCC.
+# Preços de COMPUTAÇÃO: preço de referência publicado para as regiões baseline
+# dos EUA, aplicado SEM multiplicador regional. Decisão consciente: é um número
+# publicado e verificável, ao contrário de uma estimativa obtida multiplicando
+# a baseline por um prêmio regional que não foi conferido no console de
+# faturamento. O custo do trabalho é, portanto, expresso em preço de
+# referência dos EUA — não em preço específico de us-east4, que é cerca de 8%
+# maior. Isso precisa estar declarado no texto do TCC.
 # Consultado em 2026-09-06.
-US_EAST4_PREMIUM_OVER_US_BASELINE = 1.08
-MACHINE_HOURLY_USD_US_BASELINE = {"n2-standard-4": 0.1942, "n2-standard-8": 0.3885}
-MACHINE_HOURLY_USD = {
-    machine: price * US_EAST4_PREMIUM_OVER_US_BASELINE
-    for machine, price in MACHINE_HOURLY_USD_US_BASELINE.items()
-}
+MACHINE_HOURLY_USD = {"n2-standard-4": 0.1942, "n2-standard-8": 0.3885}
 
 HOURS_PER_MONTH = 730
 
@@ -403,11 +400,15 @@ def build_report(
             # C_a escala com n(D). É a premissa mais contestável do modelo.
             "replication": "full_replica_per_unit",
             "byte_unit": "GiB (1024^3) — a GCP rotula 'GB' mas fatura GiB",
-            "price_region": "us-east4",
+            "deployment_region": "us-east4",
             "price_sources": {
+                # Regiões diferentes de propósito: usa-se, para cada item, o
+                # número mais DIRETAMENTE publicado que existe. N2 não tem
+                # tabela pública quebrada por região; pd-ssd tem.
                 "compute": (
-                    "baseline dos EUA × 1,08 (prêmio regional público de us-east4); "
-                    "consultado em 2026-09-06 — CONFERIR no console de faturamento"
+                    "preço de referência das regiões baseline dos EUA, sem multiplicador "
+                    "regional; consultado em 2026-09-06. NÃO é o preço de us-east4, que é "
+                    "cerca de 8% maior — declarar no texto"
                 ),
                 "disk": "tabela pública da GCP, pd-ssd us-east4; consultado em 2026-09-06",
             },
