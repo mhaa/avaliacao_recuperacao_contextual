@@ -25,7 +25,7 @@ from pathlib import Path
 
 import polars as pl
 
-from analysis.collect import build_summary, parse_requests_ndjson
+from analysis.collect import MIN_OFFERED_RATIO, build_summary, parse_requests_ndjson
 
 PROBE_SCENARIOS = frozenset({"probe"})
 
@@ -67,13 +67,21 @@ def _cpu_percent_from_stat(before: tuple[int, ...], after: tuple[int, ...]) -> f
     return 100.0 * (delta_total - delta_idle) / delta_total
 
 
-def violated_slo(summary: dict) -> bool:
+def violated_slo(summary: dict, offered_ratio: float | None = None) -> bool:
     p99 = summary["latency_ms_p99"]
     error_rate = summary["error_rate"]
     if p99 is None or error_rate is None:
         # Nenhuma requisição com scenario=probe foi parseada — não é "passou
         # o SLO", é um resultado inválido; tratar como violação evita que a
         # busca de saturação avance com um patamar que não mediu nada.
+        return True
+    if offered_ratio is not None and offered_ratio < MIN_OFFERED_RATIO:
+        # docs/DESIGN.md, "Vazão ofertada verificada, não presumida": o k6
+        # esgotou maxVUs e descartou chegadas — o patamar não foi de fato
+        # oferecido, e p99/error_rate cobrem só as requisições sobreviventes.
+        # Um patamar que a célula não sustenta nem receber conta como
+        # violação (direção segura: subestima S em vez de superestimá-lo, e
+        # S entra direto no custo via n(D) = ⌈D/S⌉).
         return True
     return p99 > SLO_P99_MS or error_rate > SLO_ERROR_RATE
 
@@ -89,13 +97,31 @@ def main(argv: list[str] | None = None) -> int:
     # chegou à confirmação; a rampa curta da triagem sempre passa 1 só, onde
     # o bug era invisível).
     parser.add_argument("ndjson_path", type=Path, nargs="+")
+    parser.add_argument(
+        "--expected-requests",
+        type=int,
+        default=None,
+        help="quantas requisições a(s) janela(s) de medição deveriam ter emitido "
+        "(taxa × duração × repetições, calculado pelo orquestrador). Com isso, um déficit "
+        f"além de {1 - MIN_OFFERED_RATIO:.0%} (k6 descartando chegadas por maxVUs esgotado) "
+        "vira violated_slo=True — docs/DESIGN.md, 'Vazão ofertada verificada, não presumida'. "
+        "Sem o argumento (compatível com invocações antigas), o portão não é avaliado e "
+        "offered_ratio sai None.",
+    )
     args = parser.parse_args(argv)
 
     df = pl.concat(
         [parse_requests_ndjson(path, scenarios=PROBE_SCENARIOS) for path in args.ndjson_path]
     )
     summary = build_summary(df)
-    violated = violated_slo(summary)
+    # Contagem contra o esperado, não throughput/span como em
+    # analysis/collect.py:offered_load_fields: aqui o df concatena
+    # repetições separadas por aquecimentos e restarts de k6, então o span
+    # atravessa buracos legítimos e diluiria a razão.
+    offered_ratio = (
+        summary["request_count"] / args.expected_requests if args.expected_requests else None
+    )
+    violated = violated_slo(summary, offered_ratio)
 
     before = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_BEFORE"])
     after = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_AFTER"])
@@ -104,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"PROBE_RESULT violated_slo={violated} p99={summary['latency_ms_p99']} "
         f"error_rate={summary['error_rate']} request_count={summary['request_count']} "
+        f"offered_ratio={offered_ratio} "
         f"generator_cpu_percent={generator_cpu_percent}"
     )
     return 0

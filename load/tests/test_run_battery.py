@@ -76,9 +76,30 @@ def test_build_k6_cmd_smoke_sets_smoke_mode_env_var():
     assert "SMOKE_MODE=true" in cmd
 
 
+def test_build_k6_cmd_injects_user_count_when_given():
+    # docs/DESIGN.md, "Protocolo de medição": o Zipf amostra a base INTEIRA
+    # do ambiente — sem USER_COUNT no ambiente do k6, load/zipf.js usa o
+    # default dev-scale (10.000) e a medição real amostra ~5% da base.
+    cmd = build_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", False,
+        user_count=200_948,
+    )
+    assert "USER_COUNT=200948" in cmd
+
+
+def test_build_k6_cmd_without_user_count_omits_the_env_var():
+    # Só o smoke (dev-scale, mesma base do default do zipf.js) roda sem —
+    # main() recusa medição sem --user-count.
+    cmd = build_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 100, 20, "medium", True
+    )
+    assert not any(a.startswith("USER_COUNT=") for a in cmd)
+
+
 def test_build_probe_k6_cmd_sets_probe_mode_and_rate():
     cmd = build_probe_k6_cmd(
-        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 4000, "medium", "0s", "1m"
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 4000, "medium", "0s", "1m",
+        user_count=200_948,
     )
     assert "PROBE_MODE=true" in cmd
     assert "PROBE_RATE=4000" in cmd
@@ -89,7 +110,18 @@ def test_build_probe_k6_cmd_sets_probe_mode_and_rate():
 
 def test_build_probe_k6_cmd_passes_through_warmup_and_measure_durations():
     cmd = build_probe_k6_cmd(
-        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 11000, "low", "2m", "3m"
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 11000, "low", "2m", "3m",
+        user_count=200_948,
     )
     assert "PROBE_WARMUP=2m" in cmd
     assert "PROBE_MEASURE=3m" in cmd
+
+
+def test_build_probe_k6_cmd_always_injects_user_count():
+    # Sondagem é sempre medição (o S dela entra no custo via n(D) = ⌈D/S⌉) —
+    # user_count é keyword-only obrigatório, nunca um default silencioso.
+    cmd = build_probe_k6_cmd(
+        Path("out/k6-raw.json"), "e1-postgres", "http://svc", 4000, "medium", "0s", "1m",
+        user_count=200_948,
+    )
+    assert "USER_COUNT=200948" in cmd

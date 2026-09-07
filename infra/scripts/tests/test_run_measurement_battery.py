@@ -13,6 +13,7 @@ from infra.scripts.run_measurement_battery import (
     SELECTIVITY_TIERS,
     TRIAGEM_RATE,
     TRIAGEM_TIER,
+    _duration_seconds,
     _parse_probe_result,
     _write_saturation_json,
     build_remote_battery_command,
@@ -55,7 +56,7 @@ def test_build_remote_battery_command_includes_rate_and_tier():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
         1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "20260101T000000Z",
+        "20260101T000000Z", user_count=200_948,
     )
     assert "--rate 1000" in cmd
     assert "--selectivity-tier medium" in cmd
@@ -64,11 +65,24 @@ def test_build_remote_battery_command_includes_rate_and_tier():
     assert "--timestamp 20260101T000000Z" in cmd
 
 
+def test_build_remote_battery_command_passes_user_count_to_run_battery():
+    # docs/DESIGN.md, "Protocolo de medição": o Zipf do k6 amostra a base
+    # INTEIRA carregada — sem --user-count, load/run_battery.py recusa (e o
+    # default do zipf.js amostraria só 10.000 dos 200.948 usuários, o bug
+    # que invalidou a primeira triagem).
+    cmd = build_remote_battery_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
+        1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "20260101T000000Z", user_count=200_948,
+    )
+    assert "--user-count 200948" in cmd
+
+
 def test_build_remote_battery_command_mounts_results_dir():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
         100, "medium", 1, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "20260101T000000Z",
+        "20260101T000000Z", user_count=200_948,
     )
     assert "-v /home/tcc/results:/app/results" in cmd
 
@@ -77,7 +91,7 @@ def test_build_remote_battery_command_mounts_fixtures_dir_readonly():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
         100, "medium", 1, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "20260101T000000Z",
+        "20260101T000000Z", user_count=200_948,
     )
     assert "-v /home/tcc/load-fixtures:/app/load/fixtures:ro" in cmd
 
@@ -148,22 +162,43 @@ def test_build_remote_setup_command_skip_dataset_load_drops_schema_and_loader():
     assert "export_contexts_by_tier.py" in cmd
 
 
+def test_duration_seconds_parses_the_k6_durations_this_orchestrator_uses():
+    assert _duration_seconds("0s") == 0
+    assert _duration_seconds("30s") == 30
+    assert _duration_seconds("2m") == 120
+    assert _duration_seconds("3m") == 180
+
+
 def test_build_remote_probe_command_uses_probe_mode_and_rate():
     cmd = build_remote_probe_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "medium", 4000, "0s", "1m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/short-0-4000", 1,
+        "_saturation/e1-postgres/short-0-4000", 1, user_count=200_948,
     )
     assert "PROBE_MODE=true" in cmd
     assert "PROBE_RATE=4000" in cmd
     assert "analysis/probe_report.py" in cmd
 
 
+def test_build_remote_probe_command_injects_user_count_and_expected_requests():
+    # USER_COUNT: mesma razão da bateria de carga fixa (Zipf sobre a base
+    # inteira). --expected-requests: taxa × medição × repetições — é o que
+    # permite ao veredito da sondagem detectar o k6 descartando chegadas
+    # (docs/DESIGN.md, "Vazão ofertada verificada, não presumida").
+    cmd = build_remote_probe_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "_saturation/e1-postgres/confirm-low-0-1000", 5, user_count=200_948,
+    )
+    assert "USER_COUNT=200948" in cmd
+    assert f"--expected-requests {1000 * 180 * 5}" in cmd
+
+
 def test_build_remote_probe_command_repeats_k6_for_each_repetition():
     cmd = build_remote_probe_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/confirm-low-0-1000", 5,
+        "_saturation/e1-postgres/confirm-low-0-1000", 5, user_count=200_948,
     )
     assert cmd.count("PROBE_MODE=true") == 5
     for rep in range(5):
@@ -177,7 +212,7 @@ def test_build_remote_probe_command_captures_proc_stat_before_and_after():
     cmd = build_remote_probe_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "medium", 4000, "0s", "1m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/short-0-4000", 1,
+        "_saturation/e1-postgres/short-0-4000", 1, user_count=200_948,
     )
     assert "cat /proc/stat" in cmd
     assert "GENERATOR_CPU_STAT_BEFORE=" in cmd
@@ -225,6 +260,22 @@ def test_parse_probe_result_reads_p99_and_error_rate_as_none_when_literal_none()
     verdict = _parse_probe_result(stdout)
     assert verdict.p99_ms is None
     assert verdict.error_rate is None
+
+
+def test_parse_probe_result_reads_offered_ratio_and_tolerates_its_absence():
+    # Linha nova (com --expected-requests) traz offered_ratio; linhas de
+    # execuções antigas não têm o token — precisa continuar parseável.
+    with_ratio = (
+        "PROBE_RESULT violated_slo=True p99=50.0 error_rate=0.0 "
+        "request_count=90000 offered_ratio=0.43 generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(with_ratio).offered_ratio == 0.43
+
+    without_ratio = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 "
+        "request_count=1000 generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(without_ratio).offered_ratio is None
 
 
 def test_write_saturation_json_round_trips(tmp_path, monkeypatch):
@@ -288,6 +339,32 @@ def test_write_saturation_json_records_p99_and_error_rate_per_probe(tmp_path, mo
     assert payload["probes"][0]["error_rate"] == 0.0
     assert payload["probes"][1]["p99_ms"] == 250.0
     assert payload["probes"][1]["error_rate"] == 0.02
+
+
+def test_write_saturation_json_records_offered_ratio_per_probe(tmp_path, monkeypatch):
+    # Auditoria da vazão ofertada (docs/DESIGN.md): distingue, no arquivo,
+    # "violou o SLO" de "o k6 nem conseguiu ofertar o patamar". None em
+    # sondagens antigas (sem --expected-requests).
+    monkeypatch.chdir(tmp_path)
+    result = SaturationSearchResult(
+        approx_throughput=1000.0,
+        censored=False,
+        lower_bound=None,
+        loadgen_bottleneck=False,
+        probes=[
+            ProbeResult(
+                rate=2000, violated_slo=True, generator_cpu_percent=20.0,
+                p99_ms=50.0, error_rate=0.0, offered_ratio=0.43,
+            ),
+            ProbeResult(rate=1000, violated_slo=False, generator_cpu_percent=10.0),
+        ],
+    )
+    _write_saturation_json(result, "e1-postgres", "triagem", "20260101T000000Z")
+
+    out = tmp_path / "results" / "e1-postgres" / "triagem" / "20260101T000000Z" / "saturation.json"
+    payload = json.loads(out.read_text())
+    assert payload["probes"][0]["offered_ratio"] == 0.43
+    assert payload["probes"][1]["offered_ratio"] is None
 
 
 def test_write_saturation_json_records_p99_and_error_rate_as_null_when_unmeasured(

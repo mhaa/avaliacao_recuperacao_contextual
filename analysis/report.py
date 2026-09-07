@@ -499,6 +499,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     ensure_collected(rep_dirs)
+
+    # docs/DESIGN.md, "Vazão ofertada verificada, não presumida": uma
+    # repetição com offered_load_ok=False teve chegadas descartadas pelo k6
+    # (maxVUs esgotado) — as latências dela são só das requisições
+    # sobreviventes. Ela CONTINUA no relatório (o déficit em si é resultado:
+    # a célula não sustenta o alvo), mas nunca sem este aviso.
+    for rep_dir in rep_dirs:
+        rep_summary = json.loads((rep_dir / "summary.json").read_text())
+        if rep_summary.get("offered_load_ok") is False:
+            print(
+                f"AVISO: {rep_dir} — vazão ofertada em {rep_summary['offered_ratio']:.0%} do "
+                f"alvo de {rep_summary['target_rate']} req/s (k6 descartou chegadas). As "
+                "latências desta repetição subestimam a cauda sob o modelo aberto pretendido."
+            )
+
     # results_root/phase, não rep_dirs: uma execução só-rampa grava um
     # timestamp novo sem rep*/ — ver load_cell_saturation.
     saturation_by_cell = load_cell_saturation(args.results_root, args.phase)

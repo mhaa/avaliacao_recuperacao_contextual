@@ -362,8 +362,20 @@ rampa reportar `loadgen_bottleneck` (gerador saturou antes da célula), escale
 a VM do gerador e repita só a rampa. `--yes` pula a confirmação interativa
 "sim" de apply/destroy — o aviso `FATURÁVEL` continua sendo impresso, só não
 bloqueia em `input()`; use apenas em execução supervisionada (célula por
-célula, com aprovação já dada fora do comando), nunca como default. Consolide
-e ache a fronteira de Pareto:
+célula, com aprovação já dada fora do comando), nunca como default.
+
+Dois portões de validade acompanham toda bateria e sondagem
+(docs/DESIGN.md, "Protocolo de medição"): o orquestrador injeta
+`USER_COUNT` no k6 (default `--user-count 200948`, a base real completa —
+sem isso o Zipf de `load/zipf.js` amostraria só o default dev-scale de
+10.000 usuários, encolhendo o working set; sobrescreva apenas na varredura
+de escalabilidade), e a **vazão ofertada** é comparada com a taxa-alvo:
+uma repetição em que o k6 descartou chegadas (maxVUs esgotado) sai marcada
+em `summary.json` (`offered_load_ok=false`), e uma sondagem de saturação
+nessa condição conta como violação de SLO — as latências registradas nesses
+casos cobrem só as requisições sobreviventes.
+
+Consolide e ache a fronteira de Pareto:
 
 ```
 docker compose run --rm --entrypoint python tools analysis/report.py \

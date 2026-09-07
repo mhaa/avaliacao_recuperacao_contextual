@@ -4,9 +4,14 @@
 // disponível no runtime JS do k6: a CDF é pré-computada uma única vez,
 // normalizada, e amostrada por busca binária a cada requisição.
 //
-// USER_COUNT precisa ser passado por __ENV: localmente U=10.000, na nuvem
-// U=1.000.000 (docs/DESIGN.md, "Parâmetros fixos") — nunca hardcoded aqui, já
-// que os dois ambientes usam este mesmo script.
+// USER_COUNT precisa ser passado por __ENV: localmente/smoke U=10.000, na
+// medição principal em nuvem U=200.948 e na varredura de escalabilidade até
+// U=3.000.000 (docs/DESIGN.md, "Parâmetros fixos") — nunca hardcoded aqui, já
+// que todos os ambientes usam este mesmo script. O default abaixo cobre SÓ o
+// dev-scale: load/run_battery.py recusa medição sem --user-count, e
+// infra/scripts/run_measurement_battery.py injeta o valor em toda
+// combinação e sondagem — confiar neste default numa medição real já fez,
+// uma vez, a nuvem amostrar 10.000 dos 200.948 usuários carregados.
 //
 // `SharedArray` garante que a tabela seja computada uma vez por execução do
 // k6, não uma vez por VU — para USER_COUNT=1.000.000 recomputar por VU

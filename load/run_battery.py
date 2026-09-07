@@ -126,6 +126,8 @@ def build_k6_cmd(
     k: int,
     selectivity_tier: str,
     smoke: bool,
+    *,
+    user_count: int | None = None,
 ) -> list[str]:
     # requests.ndjson (não k6-raw.json): analysis/collect.py lê daqui — uma
     # linha por requisição escrita por console.log() em load/scenarios.js,
@@ -169,6 +171,14 @@ def build_k6_cmd(
         "-e",
         f"SELECTIVITY_TIER={selectivity_tier}",
     ]
+    # USER_COUNT alimenta a CDF de Zipf de load/zipf.js. O default de lá
+    # (10.000) só vale para a massa de desenvolvimento — numa medição real
+    # omiti-lo faz o k6 amostrar 10.000 dos 200.948 usuários carregados, um
+    # working set ~5% do pretendido que cabe em cache em qualquer tecnologia
+    # (foi exatamente o que aconteceu na primeira triagem; main() abaixo
+    # torna o parâmetro obrigatório fora do smoke por isso).
+    if user_count is not None:
+        cmd += ["-e", f"USER_COUNT={user_count}"]
     if smoke:
         # --vus/--duration na CLI do k6 são ignorados quando
         # options.scenarios já está definido no .js (é sempre o caso aqui) —
@@ -186,11 +196,15 @@ def build_probe_k6_cmd(
     selectivity_tier: str,
     warmup: str,
     measure: str,
+    *,
+    user_count: int,
 ) -> list[str]:
     """Sondagem de um único patamar (load/saturation.py) — PROBE_MODE em
     load/scenarios.js, sem RATE/K fixos de constant-arrival-rate normal
     (a duração/aquecimento vêm do algoritmo de busca, não de --repetitions/
-    --phase)."""
+    --phase). `user_count` é obrigatório (sem default): sondagem é sempre
+    medição — o S que sai dela entra em n(D) = ⌈D/S⌉, e uma sondagem sobre
+    a população default de load/zipf.js mediria outro working set."""
     requests_out = Path(json_out).with_name("requests.ndjson").as_posix()
     return [
         "k6",
@@ -206,6 +220,8 @@ def build_probe_k6_cmd(
         f"TARGET_URL={target_url}",
         "-e",
         f"SELECTIVITY_TIER={selectivity_tier}",
+        "-e",
+        f"USER_COUNT={user_count}",
         "-e",
         "PROBE_MODE=true",
         "-e",
@@ -229,10 +245,13 @@ def run_k6(
     out_dir: Path,
     region: str | None = None,
     zone: str | None = None,
+    user_count: int | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     json_out = out_dir / "k6-raw.json"
-    cmd = build_k6_cmd(json_out, cell_id, target_url, rate, k, selectivity_tier, smoke)
+    cmd = build_k6_cmd(
+        json_out, cell_id, target_url, rate, k, selectivity_tier, smoke, user_count=user_count
+    )
 
     manifest = {
         "cell_id": cell_id,
@@ -243,6 +262,11 @@ def run_k6(
         "k": k,
         "selectivity_tier": selectivity_tier,
         "smoke": smoke,
+        # População amostrada pelo Zipf do k6 — None só em smoke (usa o
+        # default dev-scale de load/zipf.js). Registrado para que um
+        # resultado arquivado diga sobre QUAL base de usuários foi medido,
+        # e para analysis/collect.py calcular a razão de vazão ofertada.
+        "user_count": user_count,
         # Região/zona no manifesto, ao lado do hash do commit e pelo mesmo
         # motivo: sem elas não há como saber, meses depois, em que região uma
         # medição arquivada foi feita — e a região muda o preço de instância e
@@ -307,7 +331,24 @@ def main(argv: list[str] | None = None) -> int:
         "infra/scripts/run_measurement_battery.py.",
     )
     parser.add_argument("--zone", default=None, help="zona GCP da medição — idem --region.")
+    parser.add_argument(
+        "--user-count",
+        type=int,
+        default=None,
+        help="tamanho da base de usuários carregada, injetado como USER_COUNT no k6 "
+        "(load/zipf.js). Obrigatório fora de --smoke: o default do zipf.js (10.000) só vale "
+        "para a massa de desenvolvimento — numa medição real, omitir isto faz o Zipf amostrar "
+        "uma fração da base carregada, encolhendo o working set (docs/DESIGN.md, 'Protocolo "
+        "de medição').",
+    )
     args = parser.parse_args(argv)
+
+    if not args.smoke and args.user_count is None:
+        parser.error(
+            "--user-count é obrigatório fora de --smoke (docs/DESIGN.md: o Zipf amostra a "
+            "base de usuários INTEIRA do ambiente; sem isto o k6 usaria o default dev-scale "
+            "de load/zipf.js)."
+        )
 
     cell_ids = args.cells or list_viable_cell_ids()
     order = shuffled_cell_order(cell_ids, args.seed)
@@ -331,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir,
             region=args.region,
             zone=args.zone,
+            user_count=args.user_count,
         )
     return 0
 

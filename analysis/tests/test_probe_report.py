@@ -31,6 +31,20 @@ def test_violated_slo_true_when_no_requests_were_parsed():
     assert violated_slo({"latency_ms_p99": None, "error_rate": None}) is True
 
 
+def test_violated_slo_true_when_offered_load_fell_short():
+    # docs/DESIGN.md, "Vazão ofertada verificada, não presumida": p99/erro
+    # dentro do SLO mas o k6 descartou chegadas (maxVUs esgotado) — o
+    # patamar não foi de fato oferecido, conta como violação.
+    summary = {"latency_ms_p99": 50.0, "error_rate": 0.0}
+    assert violated_slo(summary, offered_ratio=0.43) is True
+
+
+def test_violated_slo_ignores_offered_ratio_when_unknown_or_sufficient():
+    summary = {"latency_ms_p99": 50.0, "error_rate": 0.0}
+    assert violated_slo(summary, offered_ratio=None) is False
+    assert violated_slo(summary, offered_ratio=0.99) is False
+
+
 def test_parse_proc_stat_cpu_fields_reads_the_first_8_jiffie_counters():
     # Formato real de /proc/stat: "cpu" seguido de espaço duplo, depois
     # user nice system idle iowait irq softirq steal guest guest_nice.
@@ -110,3 +124,38 @@ def test_main_consolidates_multiple_ndjson_paths_into_one_verdict(tmp_path, monk
     assert exit_code == 0
     out = capsys.readouterr().out
     assert "request_count=2" in out
+
+
+def test_main_expected_requests_shortfall_flips_the_verdict(tmp_path, monkeypatch, capsys):
+    # 1 requisição registrada de 10 esperadas, latência ótima: sem o portão
+    # de vazão ofertada o veredito seria "passou o SLO" — com ele, é
+    # violated_slo=True (o patamar não foi de fato oferecido).
+    ndjson_path = tmp_path / "requests.ndjson"
+    ndjson_path.write_text(_probe_request(10.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main(["--expected-requests", "10", str(ndjson_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "violated_slo=True" in out
+    assert "offered_ratio=0.1" in out
+
+
+def test_main_without_expected_requests_reports_offered_ratio_none(tmp_path, monkeypatch, capsys):
+    # Compatibilidade com invocações antigas: sem --expected-requests o
+    # portão não é avaliado (offered_ratio=None) e o SLO decide sozinho.
+    ndjson_path = tmp_path / "requests.ndjson"
+    ndjson_path.write_text(_probe_request(10.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main([str(ndjson_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "violated_slo=False" in out
+    assert "offered_ratio=None" in out

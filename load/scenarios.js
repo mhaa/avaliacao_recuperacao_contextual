@@ -117,6 +117,14 @@ const constantRateScenarios = {
   },
 };
 
+// PROBE_WARMUP é um cenário de TRÁFEGO REAL na mesma taxa, descartado pela
+// coleta (analysis/collect.py e analysis/probe_report.py filtram por
+// scenario == 'probe'; 'probe_warmup' fica de fora, como 'warmup' na carga
+// fixa). A versão anterior usava PROBE_WARMUP só como startTime do cenário
+// único — 2 min de OCIOSIDADE, não de aquecimento: a medição da rampa de
+// confirmação começava a frio (conexões novas, pools vazios) e as leituras
+// de /proc/stat que cercam a sondagem diluíam a CPU do gerador com o tempo
+// parado, afrouxando o portão dos 60% do docs/DESIGN.md.
 const probeScenarios = {
   probe: {
     executor: 'constant-arrival-rate',
@@ -128,6 +136,16 @@ const probeScenarios = {
     maxVUs: Math.max(200, PROBE_RATE * 2),
   },
 };
+if (PROBE_MODE && PROBE_WARMUP !== '0s') {
+  probeScenarios.probe_warmup = {
+    executor: 'constant-arrival-rate',
+    rate: PROBE_RATE,
+    timeUnit: '1s',
+    duration: PROBE_WARMUP,
+    preAllocatedVUs: Math.max(50, Math.ceil(PROBE_RATE * 0.5)),
+    maxVUs: Math.max(200, PROBE_RATE * 2),
+  };
+}
 
 const smokeScenarios = {
   smoke: {

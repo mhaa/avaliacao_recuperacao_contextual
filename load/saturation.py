@@ -59,6 +59,12 @@ class ProbeResult:
     generator_cpu_percent: float | None
     p99_ms: float | None = None
     error_rate: float | None = None
+    # request_count / esperado da sondagem (analysis/probe_report.py). Abaixo
+    # de analysis/collect.py:MIN_OFFERED_RATIO o veredito violated_slo já vem
+    # True de lá — o valor fica aqui só como trilha de auditoria em
+    # saturation.json (por que ESTA sondagem violou: SLO ou déficit de
+    # oferta). None em sondagens antigas, sem --expected-requests.
+    offered_ratio: float | None = None
 
 
 @dataclass(frozen=True)

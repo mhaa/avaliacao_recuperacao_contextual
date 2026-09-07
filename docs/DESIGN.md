@@ -157,8 +157,24 @@ Resposta: lista ordenada de k itens, cada um com `item_id`, `score`, `rank`.
 - Carga: 100, 1.000 e 10.000 req/s.
 - SLO: p99 > 200 ms ou taxa de erro > 1%.
 - Seletividade do predicado: ~2%, ~20%, ~60% dos candidatos sobrevivem.
-- Distribuição de acesso: Zipf com expoente 1,0 (não uniforme).
+- Distribuição de acesso: Zipf com expoente 1,0 (não uniforme), **sobre a base
+  de usuários inteira do ambiente** (U da tabela de parâmetros). `load/zipf.js`
+  não conhece U — o orquestrador injeta `USER_COUNT` no k6 em toda execução de
+  medição (`load/run_battery.py` recusa rodar sem `--user-count` fora do modo
+  smoke); confiar no default do script já fez, uma vez, a nuvem amostrar só
+  10.000 dos 200.948 usuários.
 - Modelo aberto (taxa de chegada constante), para evitar omissão coordenada.
+- **Vazão ofertada verificada, não presumida.** O modelo aberto só se sustenta
+  enquanto o k6 tem VUs livres: quando a célula degrada a ponto de esgotar
+  `maxVUs`, o k6 descarta chegadas e as latências registradas passam a ser só
+  das requisições sobreviventes (omissão coordenada reaparecendo pela porta dos
+  fundos). Por isso toda repetição/sondagem compara o volume registrado com o
+  esperado da taxa-alvo: abaixo de 95%
+  (`analysis/collect.py:MIN_OFFERED_RATIO`), uma sondagem de saturação conta
+  como violação do SLO (o patamar não foi de fato oferecido) e uma repetição de
+  carga fixa é marcada em `summary.json` (`offered_ratio`,
+  `offered_load_ok=false`) — as latências dela nunca devem ser lidas como se o
+  modelo aberto tivesse sido mantido.
 - 2 min de aquecimento descartados + 5 min de medição (carga fixa).
 - 5 repetições por célula, em ordem aleatorizada.
 - Gerador de carga em instância separada; **válida só se CPU do gerador < 60%,

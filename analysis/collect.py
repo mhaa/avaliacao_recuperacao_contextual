@@ -36,6 +36,16 @@ MEASUREMENT_SCENARIOS = frozenset({"measurement"})
 # de analysis/smoke_report.py:SMOKE_SCENARIOS).
 PROBE_SCENARIOS = frozenset({"probe"})
 
+# docs/DESIGN.md, "Vazão ofertada verificada, não presumida": abaixo desta
+# fração da taxa-alvo, o k6 esgotou maxVUs e descartou chegadas — as
+# latências registradas são só das requisições sobreviventes, e o modelo
+# aberto deixou de valer. 0,95 é folgado para o jitter de agendamento do
+# constant-arrival-rate (que erra por ±1-2%) e distante dos déficits reais
+# de sobrecarga (e1-valkey na triagem entregou ~43% do alvo). Único lugar
+# desta constante: analysis/probe_report.py importa daqui para o veredito
+# de sondagem usar o MESMO limiar que marca as repetições de carga fixa.
+MIN_OFFERED_RATIO = 0.95
+
 
 def parse_requests_ndjson(
     path: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS
@@ -139,11 +149,52 @@ def build_summary(latencies_df: pl.DataFrame) -> dict:
     }
 
 
+def offered_load_fields(summary: dict, target_rate: float | None) -> dict:
+    """`target_rate`/`offered_ratio`/`offered_load_ok` para o summary.json.
+
+    A razão usa a vazão medida sobre o span do próprio arquivo
+    (`throughput_rps`), não uma duração fixa de cenário — assim não acopla
+    este módulo ao '5m' de load/scenarios.js. `offered_load_ok=False`
+    significa que o k6 descartou chegadas por esgotar maxVUs (docs/DESIGN.md,
+    "Vazão ofertada verificada, não presumida"): as latências desta repetição
+    são só das requisições sobreviventes. Tudo None quando não há taxa-alvo
+    conhecida (sem manifest, smoke) ou nenhuma requisição foi medida."""
+    throughput = summary.get("throughput_rps")
+    if target_rate is None or not target_rate or throughput is None:
+        return {"target_rate": target_rate, "offered_ratio": None, "offered_load_ok": None}
+    ratio = throughput / target_rate
+    return {
+        "target_rate": target_rate,
+        "offered_ratio": ratio,
+        "offered_load_ok": ratio >= MIN_OFFERED_RATIO,
+    }
+
+
 def collect(run_dir: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS) -> None:
     latencies_df = parse_requests_ndjson(run_dir / "requests.ndjson", scenarios=scenarios)
     latencies_df.write_parquet(run_dir / "latencies.parquet")
 
     summary = build_summary(latencies_df)
+
+    # A taxa-alvo vem do manifest.json que load/run_battery.py escreve ao
+    # lado do requests.ndjson. Ausência é normal (sondagens de saturação não
+    # têm manifesto; probe_report.py faz o mesmo portão pelo caminho dele) —
+    # nesse caso os campos ficam None, nunca inventados.
+    manifest_path = run_dir / "manifest.json"
+    target_rate = None
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if not manifest.get("smoke"):
+            target_rate = manifest.get("rate")
+    summary.update(offered_load_fields(summary, target_rate))
+    if summary["offered_load_ok"] is False:
+        print(
+            f"AVISO: {run_dir} — vazão ofertada de {summary['throughput_rps']:.0f} req/s ficou "
+            f"abaixo de {MIN_OFFERED_RATIO:.0%} do alvo de {target_rate} req/s: o k6 descartou "
+            "chegadas (maxVUs esgotado) e as latências registradas são só das requisições "
+            "sobreviventes — não leia esta repetição como modelo aberto sustentado."
+        )
+
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"Coletado: {run_dir} ({summary['request_count']} requisições)")
 

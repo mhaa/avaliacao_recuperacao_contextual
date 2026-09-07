@@ -92,6 +92,14 @@ from load.saturation import GENERATOR_CPU_THRESHOLD, ProbeResult, run_saturation
 # docs/DESIGN.md, "Protocolo de medição".
 RATES = [100, 1_000, 10_000]
 SELECTIVITY_TIERS = ["high", "medium", "low"]
+# docs/DESIGN.md, "Parâmetros fixos": U da medição principal — a base real
+# completa do MovieLens 32M, que é o que build_remote_setup_command carrega
+# (mode="full"). Injetado como USER_COUNT no k6 (load/zipf.js) em TODA
+# combinação e sondagem: sem isso o Zipf usa o default dev-scale (10.000) e
+# amostra ~5% da base carregada — foi o que invalidou a primeira triagem.
+# Sobrescreva com --user-count apenas na varredura de escalabilidade
+# (U sintético de 1-3 milhões).
+MAIN_MEASUREMENT_USER_COUNT = 200_948
 # docs/DESIGN.md, "Delineamento em duas etapas": a triagem roda com seletividade
 # e carga fixas em nível intermediário, para achar a fronteira de Pareto;
 # só a confirmação varre tudo.
@@ -268,6 +276,18 @@ def _remote_pull_with_login(image: str, retries: int = 20, sleep_s: int = 20) ->
     return f"{login_cmd} && {pull_loop}"
 
 
+def _duration_seconds(duration: str) -> int:
+    """'0s'/'2m'/'3m' (o subconjunto de duração k6 que este orquestrador
+    usa) em segundos — para converter taxa × duração em contagem esperada
+    de requisições (`--expected-requests` de analysis/probe_report.py)."""
+    unit, value = duration[-1], int(duration[:-1])
+    if unit == "s":
+        return value
+    if unit == "m":
+        return value * 60
+    raise ValueError(f"duração k6 não suportada: {duration!r} (use Ns ou Nm)")
+
+
 def build_remote_battery_command(
     cell_id: str,
     target_url: str,
@@ -281,6 +301,8 @@ def build_remote_battery_command(
     timestamp: str,
     region: str | None = None,
     zone: str | None = None,
+    *,
+    user_count: int,
 ) -> str:
     """Monta `docker run ... load/run_battery.py ...` como argv +
     shlex.join, mesmo padrão de segurança de
@@ -308,6 +330,11 @@ def build_remote_battery_command(
         tier,
         "--timestamp",
         timestamp,
+        # Sem isso load/run_battery.py recusa rodar (e com razão): o Zipf do
+        # k6 precisa amostrar a base carregada INTEIRA, não o default
+        # dev-scale de load/zipf.js — ver MAIN_MEASUREMENT_USER_COUNT.
+        "--user-count",
+        str(user_count),
     ]
     # Região/zona vão para o manifest.json de cada repetição (load/run_battery.py):
     # sem elas, um resultado arquivado não diz em que região foi medido — e a
@@ -347,6 +374,8 @@ def build_remote_probe_command(
     fixtures_mount: str,
     remote_subdir: str,
     repetitions: int,
+    *,
+    user_count: int,
 ) -> str:
     """Sondagem de um único patamar da busca de saturação
     (load/saturation.py) — roda k6 (PROBE_MODE) `repetitions` vezes (1 na
@@ -376,12 +405,21 @@ def build_remote_probe_command(
         # saturação real, um caminho _saturation/<cell>/<probe>/rep<N>/
         # nunca criado antes.
         steps.append(shlex.join(["mkdir", "-p", rep_dir]))
-        k6_argv = build_probe_k6_cmd(json_out, cell_id, target_url, rate, tier, warmup, measure)
+        k6_argv = build_probe_k6_cmd(
+            json_out, cell_id, target_url, rate, tier, warmup, measure, user_count=user_count
+        )
         steps.append(shlex.join(str(a) for a in k6_argv))
     steps.append('AFTER_STAT="$(cat /proc/stat | head -1)"')
+    # taxa × janela de medição × repetições: o que o constant-arrival-rate
+    # DEVERIA ter emitido nos cenários 'probe' (o warmup fica de fora — a
+    # coleta filtra por scenario='probe'). Um déficit além do limiar de
+    # analysis/collect.py:MIN_OFFERED_RATIO vira violated_slo=True no
+    # veredito (docs/DESIGN.md, "Vazão ofertada verificada, não presumida").
+    expected_requests = rate * _duration_seconds(measure) * repetitions
     steps.append(
         'GENERATOR_CPU_STAT_BEFORE="$BEFORE_STAT" GENERATOR_CPU_STAT_AFTER="$AFTER_STAT" '
-        "python analysis/probe_report.py " + shlex.join(ndjson_paths)
+        "python analysis/probe_report.py "
+        f"--expected-requests {expected_requests} " + shlex.join(ndjson_paths)
     )
     inner = " && ".join(steps)
 
@@ -453,6 +491,9 @@ class _ProbeVerdict:
     p99_ms: float | None
     error_rate: float | None
     generator_cpu_percent: float
+    # None em saídas de probe_report.py anteriores a --expected-requests
+    # (o token offered_ratio= não existia na linha PROBE_RESULT).
+    offered_ratio: float | None = None
 
 
 def _parse_probe_result(stdout: str) -> _ProbeVerdict:
@@ -471,6 +512,7 @@ def _parse_probe_result(stdout: str) -> _ProbeVerdict:
                 p99_ms=_parse_optional_float(tokens.get("p99")),
                 error_rate=_parse_optional_float(tokens.get("error_rate")),
                 generator_cpu_percent=float(tokens["generator_cpu_percent"]),
+                offered_ratio=_parse_optional_float(tokens.get("offered_ratio")),
             )
     raise RuntimeError(
         f"analysis/probe_report.py não imprimiu PROBE_RESULT na saída remota:\n{stdout}"
@@ -616,6 +658,8 @@ def make_probe_fn(
     fixtures_mount: str,
     label: str,
     repetitions: int = 1,
+    *,
+    user_count: int,
 ) -> Callable[[int], ProbeResult]:
     """Fecha sobre o contexto de rede/infra de uma célula e devolve um
     probe_fn(rate) -> ProbeResult para load.saturation.run_saturation_search
@@ -641,6 +685,7 @@ def make_probe_fn(
             fixtures_mount,
             remote_subdir,
             repetitions,
+            user_count=user_count,
         )
         result = gcloud_ssh(loadgen_instance, zone, project_id, remote_cmd)
         verdict = _parse_probe_result(result.stdout)
@@ -651,6 +696,7 @@ def make_probe_fn(
             generator_cpu_percent=verdict.generator_cpu_percent,
             p99_ms=verdict.p99_ms,
             error_rate=verdict.error_rate,
+            offered_ratio=verdict.offered_ratio,
         )
 
     return probe_fn
@@ -705,6 +751,9 @@ def _write_saturation_json(
                 "generator_cpu_percent": p.generator_cpu_percent,
                 "p99_ms": p.p99_ms,
                 "error_rate": p.error_rate,
+                # Auditoria: distingue "violou o SLO" de "o k6 nem conseguiu
+                # ofertar o patamar" (docs/DESIGN.md, vazão ofertada).
+                "offered_ratio": p.offered_ratio,
             }
             for p in saturation.probes
         ],
@@ -719,6 +768,7 @@ def _write_saturation_json(
                 "generator_cpu_percent": p.generator_cpu_percent,
                 "p99_ms": p.p99_ms,
                 "error_rate": p.error_rate,
+                "offered_ratio": p.offered_ratio,
             }
             for p in saturation.final_level_probes
         ],
@@ -755,6 +805,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--phase", required=True, choices=["triagem", "confirmacao"])
     parser.add_argument("--repetitions", type=int, default=REPETITIONS)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--user-count",
+        type=int,
+        default=MAIN_MEASUREMENT_USER_COUNT,
+        help="base de usuários que o Zipf do k6 amostra (USER_COUNT em load/zipf.js). O "
+        "default é a base real completa que build_remote_setup_command carrega "
+        "(docs/DESIGN.md, U da medição principal); sobrescreva SÓ na varredura de "
+        "escalabilidade, junto com a massa sintética correspondente.",
+    )
     parser.add_argument(
         "--saturation-start",
         type=float,
@@ -1008,6 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
                 timestamp,
                 region=args.region,
                 zone=args.zone,
+                user_count=args.user_count,
             )
             # print(result.stdout): sem isso, o resultado desta combinação
             # fica completamente mudo no log — confirmado ao vivo: um crash
@@ -1034,6 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
                 FIXTURES_MOUNT,
                 label="short",
                 repetitions=1,
+                user_count=args.user_count,
             )
             saturation = run_saturation_search(
                 probe_fn,
@@ -1060,6 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
                     FIXTURES_MOUNT,
                     label=f"confirm-{tier}",
                     repetitions=CONFIRMATION_REPETITIONS,
+                    user_count=args.user_count,
                 )
                 saturation = run_saturation_search(
                     probe_fn, start_rate=int(args.saturation_start), step_mode="fine"
