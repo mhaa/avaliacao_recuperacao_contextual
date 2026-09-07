@@ -583,9 +583,15 @@ def verify_otel_pipeline(
             continue
 
         for sample in samples:
+            memory_available = (
+                f"{sample.memory_available_mb:.0f}MB"
+                if sample.memory_available_mb is not None
+                else "n/a"
+            )
             print(
                 f"  {sample.component}: cpu={sample.cpu_percent:.1f}% "
-                f"memory={sample.memory_mb:.0f}MB network={sample.network_mbps:.2f}Mbps"
+                f"memory={sample.memory_mb:.0f}MB network={sample.network_mbps:.2f}Mbps "
+                f"memory_available={memory_available}"
             )
         print("OK: as 3 VMs estão exportando CPU/memória/rede para o Cloud Monitoring.")
         return True

@@ -47,6 +47,32 @@ def test_write_resources_csv_round_trips(tmp_path):
     assert rows[0]["component"] == "database"
     assert float(rows[0]["cpu_percent"]) == 12.3
     assert rows[1]["component"] == "service"
+    assert rows[0]["memory_available_mb"] == ""
+
+
+def test_write_resources_csv_includes_memory_available_when_present(tmp_path):
+    samples = [
+        ResourceSample(
+            component="database", cpu_percent=12.3, memory_mb=512.0, memory_available_mb=2048.0
+        ),
+    ]
+    out = tmp_path / "resources.csv"
+    write_resources_csv(samples, out)
+
+    with out.open() as f:
+        rows = list(csv.DictReader(f))
+
+    assert float(rows[0]["memory_available_mb"]) == 2048.0
+
+
+def test_classify_bottleneck_ignores_memory_available_field():
+    samples = [
+        ResourceSample(
+            component="database", cpu_percent=95.0, memory_mb=1000.0, memory_available_mb=None
+        ),
+        ResourceSample(component="service", cpu_percent=40.0, memory_mb=500.0),
+    ]
+    assert classify_bottleneck(samples) == "database_cpu"
 
 
 def test_classify_bottleneck_picks_the_resource_closest_to_its_ceiling():

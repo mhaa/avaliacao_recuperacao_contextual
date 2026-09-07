@@ -28,6 +28,11 @@ class ResourceSample:
     # local, que é um snapshot instantâneo sem série temporal.
     network_mbps: float | None = None
     timestamp: datetime | None = None
+    # MemAvailable (system.linux.memory.available) — métrica opcional do
+    # scraper hostmetrics/memory, lida em modo best-effort por
+    # GCPMonitoringCollector; None enquanto a série ainda não propagou ou
+    # sempre no `docker stats` local, que não tem equivalente.
+    memory_available_mb: float | None = None
 
 
 class ResourceCollector(Protocol):
@@ -99,6 +104,16 @@ class GCPMonitoringCollector:
 
     Memória já vem em MB direto de `_MEMORY_METRIC` (bytes, convertidos
     abaixo) — nenhuma conversão de fração por tipo de máquina é necessária.
+
+    `_MEMORY_AVAILABLE_METRIC` (MemAvailable do `/proc/meminfo`) é uma
+    métrica separada e opcional do mesmo scraper `hostmetrics/memory` —
+    diferente de `system.memory.usage`, não vem habilitada por padrão no
+    OTel Collector Contrib 0.112.0 (precisou de
+    `scrapers.memory.metrics."system.linux.memory.available".enabled:
+    true` nos 3 `main.tf`). Por ser recém-habilitada e nada no projeto
+    depender dela ainda, é lida em modo best-effort em `collect()`: se a
+    série ainda não propagou, o campo fica `None` em vez de derrubar a
+    coleta inteira (CPU/rede/memória-used continuam obrigatórias).
     """
 
     _CPU_METRIC = "compute.googleapis.com/instance/cpu/utilization"
@@ -114,6 +129,8 @@ class GCPMonitoringCollector:
     # princípio). Valor é INT64 (bytes), não DOUBLE — ver `_mean_value`.
     _MEMORY_METRIC = "workload.googleapis.com/system.memory.usage"
     _MEMORY_STATE_FILTER = 'metric.labels.state = "used"'
+    # MemAvailable — sem atributo `state` (diferente de system.memory.usage).
+    _MEMORY_AVAILABLE_METRIC = "workload.googleapis.com/system.linux.memory.available"
 
     def __init__(
         self,
@@ -166,6 +183,16 @@ class GCPMonitoringCollector:
                 interval,
                 extra_filter=self._MEMORY_STATE_FILTER,
             )
+            # Best-effort: MemAvailable é recém-habilitada (ver docstring da
+            # classe) — uma janela sem série ainda não deve derrubar CPU/
+            # rede/memória-used, que já funcionam e nada aqui depende dela.
+            try:
+                memory_available_bytes = self._mean_value(
+                    client, project_name, self._MEMORY_AVAILABLE_METRIC, instance_name, interval
+                )
+                memory_available_mb = memory_available_bytes / (1024**2)
+            except ValueError:
+                memory_available_mb = None
             samples.append(
                 ResourceSample(
                     component=component,
@@ -173,6 +200,7 @@ class GCPMonitoringCollector:
                     memory_mb=memory_bytes / (1024**2),
                     network_mbps=(received_bytes + sent_bytes) * 8 / 1_000_000 / window_seconds,
                     timestamp=self._end_time,
+                    memory_available_mb=memory_available_mb,
                 )
             )
         return samples
@@ -309,7 +337,16 @@ def write_resources_csv(samples: list[ResourceSample], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["component", "timestamp", "cpu_percent", "memory_mb", "network_mbps"])
+        writer.writerow(
+            [
+                "component",
+                "timestamp",
+                "cpu_percent",
+                "memory_mb",
+                "network_mbps",
+                "memory_available_mb",
+            ]
+        )
         for sample in samples:
             writer.writerow(
                 [
@@ -318,5 +355,6 @@ def write_resources_csv(samples: list[ResourceSample], path: Path) -> None:
                     sample.cpu_percent,
                     sample.memory_mb,
                     sample.network_mbps if sample.network_mbps is not None else "",
+                    sample.memory_available_mb if sample.memory_available_mb is not None else "",
                 ]
             )

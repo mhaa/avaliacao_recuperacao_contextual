@@ -101,6 +101,9 @@ locals {
         root_path: /hostfs
         scrapers:
           memory:
+            metrics:
+              system.linux.memory.available:
+                enabled: true
           cpu:
           network:
     processors:
