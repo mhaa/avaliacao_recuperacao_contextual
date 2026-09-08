@@ -188,14 +188,15 @@ A triagem busca até que vazão cada célula sustenta antes de violar o SLO — 
 gargalos diferem por estratégia (E-1 tende a saturar por rede/CPU da
 aplicação; E-2 relacional, por CPU do banco; E-3, por memória), então uma
 célula que perde em latência sob carga fixa pode ainda assim saturar mais
-tarde, o que a torna mais barata em produção: **menos instâncias para a mesma
-demanda**.
+tarde, o que a torna mais barata por requisição: **mais capacidade pela mesma
+unidade**.
 
 Essa última frase é, literalmente, a fórmula de custo — e é por isso que a
-vazão **não** é um eixo próprio da fronteira. `S` entra em `n(D) = ⌈D/S⌉`
-(ver "Custo como função da demanda"), logo o custo já depende dela; mantê-la
-também como terceiro eixo contaria a mesma grandeza duas vezes e distorceria
-a dominância. A fronteira é **2D: latência × custo(D)**.
+vazão **não** é um eixo próprio da fronteira. `S` entra no DENOMINADOR do
+custo (ver "Custo — por milhão de requisições"), logo o custo já depende
+dela; mantê-la também como terceiro eixo contaria a mesma grandeza duas vezes
+e distorceria a dominância. A fronteira é **2D: latência × custo por milhão
+de requisições**.
 
 Isso eleva a exigência sobre a precisão da busca: um erro em `S` vira erro no
 custo. Daí o protocolo abaixo.
@@ -217,13 +218,13 @@ custo. Daí o protocolo abaixo.
   gerador seguir abaixo de 60%), a vazão fica **censurada**:
   `saturation_censored=true`, `saturation_lower_bound=50000` — não é o
   valor medido, é só "sabemos que é pelo menos isso".
-- Consequência da censura sob o modelo de custo, e ela é boa: do fato medido
-  `S ≥ L` sai `1 ≤ n(D) ≤ ⌈D/L⌉`, e para **qualquer `D ≤ L`** temos
-  `⌈D/L⌉ = 1`, logo `n(D) = 1` **exatamente**. Dentro do domínio medido, uma
-  célula censurada tem custo perfeitamente determinado — sem nunca imputar o
-  teto como se fosse o `S` medido. Acima de `L` ela é genuinamente
-  indeterminada, e o domínio de demanda é limitado a `L` por isso
-  (`analysis/pareto.py:demand_domain_max`), em vez de extrapolar.
+- Consequência da censura sob o modelo de custo: do fato medido `S ≥ L`,
+  como o custo é DECRESCENTE em `S`, só se conhece um **teto** de custo por
+  milhão de requisições (usando `L`) — nunca um piso, que exigiria um teto de
+  `S` que não foi medido. Uma célula censurada nunca fica sem custo (entra no
+  plano com esse teto), mas fica sem PONTO: nunca aparece em
+  `cheapest_cell_ids`, e só domina/é dominada dentro do que o teto permite
+  (`analysis/pareto.py`).
 
 **Rampa de confirmação** — só nas células não dominadas (fronteira):
 - 5 repetições por patamar, em ordem aleatorizada.
@@ -261,49 +262,46 @@ Reportar também a magnitude do efeito.
 
 1. **Triagem** — todas as células viáveis, com seletividade e carga fixas em nível
    intermediário, mais a rampa curta de saturação. Identifica a fronteira de
-   Pareto em **2 dimensões**: latência × custo(D), com a vazão de saturação
-   internalizada no custo (`analysis/pareto.py`). Como a fronteira depende de
-   `D`, o que segue para a confirmação é a **união** das fronteiras sobre todo
-   o domínio de demanda (`pareto_frontier_union`) — conservador de propósito:
-   não descarta célula que vença apenas em alguma faixa.
+   Pareto em **2 dimensões**: latência × custo por milhão de requisições, com
+   a vazão de saturação internalizada no custo (`analysis/pareto.py`). A
+   fronteira é calculada uma vez — não depende de uma demanda externa — e
+   segue inteira para a confirmação.
 2. **Confirmação** — só as células da fronteira, com varredura completa de
    seletividade e carga e as 5 repetições, mais a rampa de confirmação.
 
 ### Regra de tolerância na dominância (propagação da incerteza de S)
 
-A rampa curta mede `S` com precisão limitada — por isso a tolerância de 20%
-sobrevive, mas com papel novo: em vez de comparar vazões (não há mais eixo de
-vazão), ela **propaga a incerteza de `S` para o número de unidades**:
+A rampa curta mede `S` com precisão limitada — por isso sobrevive uma
+tolerância de 20%, alargando `S` para os dois lados antes de converter em
+custo:
 
 ```
-n_lo(D) = ⌈D / (S·1,20)⌉      n_hi(D) = ⌈D / (S·0,80)⌉
-a domina b em custo  ⟺  C_hi(a) < C_lo(b)
+custo_lo = C(S·1,20)      custo_hi = C(S·0,80)
+a domina b em custo  ⟺  custo_hi(a) < custo_lo(b)
 ```
 
+(`C` é decrescente em `S` — quanto maior a vazão de saturação, menor o custo
+por requisição — então o extremo ALTO de `S` dá o custo BAIXO, e vice-versa.)
 Só há dominância em custo quando os intervalos são **disjuntos** — o que
 preserva a intenção original (não descartar a vencedora por ruído; o custo de
 levar uma célula a mais para a confirmação é muito menor que o de perder a
 certa) sem precisar de um eixo separado.
 
-Duas propriedades que tornam essa forma a correta:
-
-- **A tolerância some onde deve.** Com `D ≤ 0,8·S` nas duas células, ambos os
-  extremos dão 1 unidade, o intervalo degenera num ponto, e diferenças
-  pequenas de armazenamento voltam a discriminar exatamente. Em demanda baixa
-  nada é borrado.
-- **Ela alarga com `D`, o que é honesto**: um erro de 20% em `S` custa 20% de
-  uma contagem de máquinas cada vez maior.
-
 A tolerância incide **apenas sobre `S`**, que é medido — nunca sobre o termo
-de capacidade de memória nem sobre o `lower_bound` de uma célula censurada,
-que são exatos. Alargar um limite seria inventar incerteza sobre um fato.
+de capacidade de memória, que é exato. Alargar um limite seria inventar
+incerteza sobre um fato.
+
+Células censuradas (`S ≥ L`, sem ponto medido) não recebem banda de
+tolerância: o piso de custo fica em 0 (sem um teto medido de `S`, não há como
+calcular um piso de custo honesto) e o teto vem de `L` diretamente — alargar
+um limite em cima de outro limite seria inventar incerteza sobre um fato, o
+mesmo erro que a tolerância evita para as não censuradas.
 
 Se mais da metade das células viáveis ficar censurada, isso é sinalizado
-explicitamente: todas colapsam em `n = 1` no domínio medido, então o custo
-deixa de discriminá-las entre si e a comparação recai sobre armazenamento por
-unidade e latência.
+explicitamente: para essas, o custo só tem um teto, nunca um ponto, e a
+comparação pontual (`cheapest_cell_ids`) recai sobre as demais.
 
-## Custo como função da demanda e pontos de cruzamento
+## Custo — por milhão de requisições, na capacidade máxima de uma unidade
 
 Até a triagem das 14 células ser concluída, o custo era só **computação**
 (soma dos tipos de VM), idêntico nas 4 tecnologias — que usam os mesmos tipos
@@ -312,21 +310,33 @@ fronteira colapsou para 1 célula, decidida por ruído de milissegundo em
 latência, porque `custo` (empatado) e `vazão` (dentro da tolerância de 20%)
 não discriminavam nada.
 
-O modelo atual corrige as duas coisas de uma vez — internaliza a vazão e
-acrescenta armazenamento:
+O modelo atual corrige isso normalizando o custo mensal de UMA unidade de
+atendimento pela capacidade máxima que essa unidade sustenta por mês — o
+custo passa a ser expresso em **\$ por milhão de requisições**, não em \$
+totais para uma demanda externa escolhida:
 
 ```
-n(D)   = máx( ⌈D / S⌉ , ⌈V_mem / M⌉ )     unidades de atendimento
-C_f(D) = n(D) · p_i · h                    fluxo    [p_i em $/hora, h = 730 h/mês]
-C_a(D) = n(D) · V_disco · p_a              estoque  [p_a em $/GiB-MÊS]
-C(D)   = C_f(D) + C_a(D)
+n   = ⌈V_mem / M⌉                        unidades (piso de memória; 1 em disco)
+C_f = n · p_i · h                        fluxo    [p_i em $/hora, h = 730 h/mês]
+C_a = n · V_disco · p_a                  estoque  [p_a em $/GiB-MÊS]
+C   = (C_f + C_a) · 10^6 / (S · 2.592.000)   [$ por milhão de requisições]
 ```
+
+Não existe mais uma demanda `D` externa a escolher: a análise sempre opera na
+capacidade máxima de UMA unidade de atendimento. O `n` acima é só o piso de
+memória (`⌈V_mem/M⌉` — ver "Ressalva obrigatória" abaixo), que hoje nunca
+ultrapassa 1 nos dados reais. `2.592.000` são os segundos em 30 dias,
+convertendo a vazão de saturação (req/s) em capacidade mensal (req/mês) —
+nota: `h = 730` horas/mês (média, 30,42 dias) usa uma convenção mensal
+ligeiramente diferente de `2.592.000` (30 dias exatos); a discrepância de
+~1,4% entre as duas não muda nenhuma comparação (afeta todas as células
+igualmente) — declarar no texto do TCC.
 
 - **Unidade de atendimento** = 1 VM de banco (`n2-standard-8`) + 1 VM de
   serviço (`n2-standard-8`). A VM geradora **não** entra: é aparato de
   medição, não capacidade produtiva.
 - **Sem sharding**: cada unidade mantém réplica integral da base — é por isso
-  que `C_a` carrega o fator `n(D)`. É a premissa mais contestável do modelo e
+  que `C_a` carrega o fator `n`. É a premissa mais contestável do modelo e
   precisa estar declarada no texto do TCC.
 - **`p_a` é mensal**, não horário: `C_a` tem de sair na mesma unidade de
   `C_f = n·p_i·h`, ou a soma não significa nada.
@@ -354,54 +364,12 @@ Ele só passa a discriminar em extrapolação para U maior, que é justamente
 onde H1 (armazenamento proporcional a U×C×k) se manifesta em custo. Declarar,
 ou o leitor supõe que o termo está fazendo um trabalho que ainda não faz.
 
-### Qual `D` se usa
-
-Não existe custo escalar. A saída é:
-
-| Uso | `D` | Por quê |
-|---|---|---|
-| Comparação principal do texto e eixo de custo do Pareto | **10.000 req/s** | maior nível do próprio delineamento, e o único em que `n(D)` discrimina forte (varia de 6 a 40 com os `S` atuais) |
-| Tabelas de resultado | 100 / 1.000 / 10.000 | completude e coerência com o protocolo |
-| Seleção para a confirmação | nenhum | união da fronteira sobre `(0, D_max]` |
-
-Em **D = 100** todas as células dão `n = 1` e o custo se reduz à parcela de
-armazenamento — **regime degenerado**, a ser declarado como tal, nunca usado
-para concluir nada.
-
-### Detecção exata dos pontos de cruzamento
-
-`C_k(D) = n(D)·U_k` é função escada, constante em `(m·S_k, (m+1)·S_k]`. Como
-a dominância consulta também `n_lo` e `n_hi`, a fronteira só muda onde uma
-das três famílias salta — basta enumerar `{m·S, m·S(1+TOL), m·S(1−TOL)}`,
-avaliar cada intervalo no seu extremo **direito** (fechado, logo representante
-interior legítimo — sem epsilon, sem amostragem densa) e fundir os
-consecutivos com a mesma decisão. As fronteiras que sobrevivem à fusão **são**
-os pontos de cruzamento, exatamente.
-
-Aritmética em `fractions.Fraction`, nunca `float`: `S·(1±TOL)` não é diádico,
-e um `ceil` na fronteira do degrau erraria o cruzamento por um segmento
-inteiro, silenciosamente.
-
-Duas famílias de cruzamento, ambas reportadas:
-- **`crossovers.frontier`** — o conjunto não dominado mudou. São os pontos de
-  decisão arquitetural substantivos.
-- **`crossovers.cost`** — o conjunto de células mais baratas mudou. Vem com
-  `relative_gap` e `within_tolerance`, porque uma troca de "mais barato" com
-  diferença de fração de por cento é ruído dentro da própria incerteza de `S`
-  — reportá-la como achado seria over-claiming. `cost_summary` conta quantas
-  ficaram dentro da tolerância e expõe `cost_discriminates`, para que "o custo
-  não discriminou" seja lido do relatório em vez de deduzido contando linhas.
-
-**As faixas (`frontier_segments`) fundem SÓ pela fronteira.** Fundir também
-pela configuração mais barata produzia dezenas de faixas onde a decisão
-arquitetural era idêntica e apenas o argmin oscilava entre curvas-escada que
-se entrelaçam: nos dados reais, 32 faixas escondendo 3 mudanças de fronteira.
-Com a fusão só pela fronteira, sobram 4 faixas e as 3 mudanças ficam visíveis.
-
-**Empate de custo é reportado como empate.** `cheapest_cell_ids` é uma lista,
-não uma célula. Com memória fora do preço por GiB, as células Valkey têm custo
-por unidade idêntico ao centavo; desempatar por ordem alfabética fazia o
-relatório afirmar "e1-valkey é a mais barata até 375 req/s", o que é artefato
+Como o custo não depende mais de uma demanda externa, não há mais "pontos de
+cruzamento" a detectar variando `D` — a fronteira é calculada uma vez.
+**Empate de custo continua reportado como empate**: `cheapest_cell_ids` é uma
+lista, não uma célula. Com memória fora do preço por GiB, células Valkey de
+mesma estratégia têm custo por unidade idêntico ao centavo; desempatar por
+ordem alfabética afirmaria "e1-valkey é a mais barata", o que seria artefato
 de desempate, não resultado.
 
 ### Preços
@@ -431,10 +399,11 @@ pré-provisionamento; estes números são o que a própria planilha previa
 substituir "após carga piloto" — a carga piloto já aconteceu.
 
 **Ordem de grandeza que orienta a leitura**: a parcela de estoque fica entre
-0,02% e ~2,5% do custo de uma unidade. Ou seja, `n(D)` domina a comparação, e
-o armazenamento age como desempate **dentro** de um mesmo patamar de `n`.
-Atribuir à ocupação de armazenamento um peso que os dados não sustentam é o
-erro de leitura a evitar.
+0,02% e ~2,5% do custo de uma unidade. Ou seja, a computação (`C_f`) domina o
+numerador, e o armazenamento age como desempate fino. O que de fato
+discrimina o custo por milhão de requisições entre células é a vazão de
+saturação `S`, no denominador. Atribuir à ocupação de armazenamento um peso
+que os dados não sustentam é o erro de leitura a evitar.
 
 **Nota histórica — a razão memória:disco não é mais usada.** Uma versão
 anterior deste modelo precificava memória por GiB e comparava as duas razões

@@ -340,13 +340,11 @@ de diagnóstico do próprio k6 — nada no pipeline o lê.
 `analysis/report.py results --phase <triagem|confirmacao> --out
 results/report/<phase>` agrega as repetições ainda não coletadas por célula,
 roda Kruskal-Wallis → Dunn (Bonferroni) → epsilon-quadrado → IC de bootstrap
-do p99, e escreve `report.json` — com `cost_model`, `demand_levels`,
-`frontier_segments`, `crossovers`, `pareto_frontier_union` e
-`censorship_warning` — mais um `pareto_D<nível>.png` por nível de demanda e
-`custo_vs_demanda.png`. A fronteira é 2D (latência × custo(D)) e depende da
-demanda, daí `pareto_frontier_union` (a união sobre o domínio) ser o conjunto
-que segue para a confirmação. Nela, também roda TOST par-a-par entre as
-células da fronteira.
+do p99, e escreve `report.json` — com `cost_model`, `pareto_frontier`,
+`cheapest_cell_ids` e `censorship_warning` — mais `pareto.png`. A fronteira é
+2D (latência × custo por milhão de requisições) e não depende de uma demanda
+externa: é calculada uma vez e segue inteira para a confirmação. Nela,
+também roda TOST par-a-par entre as células da fronteira.
 
 Guardar latências individuais, não só percentis agregados — o bootstrap e o
 TOST precisam da distribuição completa.

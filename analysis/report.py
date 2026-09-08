@@ -23,21 +23,18 @@ import polars as pl
 
 from analysis.collect import collect
 from analysis.pareto import (
+    SECONDS_PER_MONTH,
     TOLERANCE,
     capacity_units,
     cells_without_cost,
     censorship_warning,
-    cost_at,
-    cost_curve,
+    cheapest_cells,
+    cost_per_million_requests,
+    cost_per_million_requests_bounds,
     cost_undefined_reason,
-    crossovers,
-    demand_domain_max,
-    frontier_segments,
     pareto_frontier,
-    units_at,
 )
 from analysis.plots import (
-    plot_cost_vs_demand,
     plot_pareto_frontier,
     plot_percentile_comparison,
 )
@@ -60,16 +57,18 @@ def storage_for_cell(cell_id: str) -> str:
     return cell_id.split("-", 1)[1]
 
 # --------------------------------------------------------------------------
-# Modelo de custo — ver docs/DESIGN.md, "Custo como função da demanda e pontos
-# de cruzamento":
+# Modelo de custo — ver docs/DESIGN.md, "Custo como função da demanda":
 #
-#     n(D)   = máx( ⌈D / S⌉ , ⌈V_mem / M⌉ )
-#     C_f(D) = n(D) · p_i · h
-#     C_a(D) = n(D) · V_disco · p_a
-#     C(D)   = C_f(D) + C_a(D) = n(D) · unit_cost_usd_month
+#     n   = ⌈V_mem / M⌉                    (1 para mecanismos em disco)
+#     C_f = n · p_i · h
+#     C_a = n · V_disco · p_a
+#     C   = (C_f + C_a) · 10^6 / (S · 2.592.000)   [$ por milhão de requisições]
 #
-# A aritmética de n(D) e da fronteira vive em analysis/pareto.py; aqui só se
-# montam as constantes e o custo POR UNIDADE.
+# A análise sempre opera na capacidade máxima de UMA unidade de atendimento —
+# não há mais demanda `D` externa a varrer. A aritmética de custo/dominância
+# vive em analysis/pareto.py; aqui só se montam as constantes e o custo POR
+# UNIDADE (unit_cost_usd_month), que pareto.py normaliza pela vazão de
+# saturação de cada célula.
 # --------------------------------------------------------------------------
 
 # Preços de COMPUTAÇÃO: preço de referência publicado para as regiões baseline
@@ -87,8 +86,9 @@ HOURS_PER_MONTH = 730
 # p_i — uma UNIDADE DE ATENDIMENTO é 1 VM de banco (n2-standard-8) + 1 VM de
 # serviço (n2-standard-8). A VM geradora de carga NÃO entra: é aparato de
 # medição, não capacidade produtiva. Sai igual nas 4 tecnologias porque todas
-# usam os mesmos tipos de máquina — a discriminação de custo vem de S (via
-# n(D)) e da parcela de armazenamento por unidade.
+# usam os mesmos tipos de máquina — a discriminação de custo vem do
+# denominador (S, a vazão de saturação) e da parcela de armazenamento por
+# unidade.
 SERVICE_UNIT_USD_HOUR = {
     storage: 2 * MACHINE_HOURLY_USD["n2-standard-8"]
     for storage in ("postgres", "valkey", "scylla", "opensearch")
@@ -105,21 +105,12 @@ DISK_USD_PER_GB_MONTH = 0.187
 #
 # Memória NÃO tem preço próprio neste modelo, de propósito: a RAM já está paga
 # dentro de p_i (o n2-standard-8 vem com 32 GB), e cobrá-la de novo por GiB
-# seria dupla contagem. O que ela faz é LIMITAR quantas unidades cabem,
-# entrando em n(D) via ⌈V_mem/M⌉. É essa assimetria que representa a diferença
-# real entre os dois meios: disco é elástico e faturado à parte; memória é
-# limitada e já embutida na instância.
+# seria dupla contagem. O que ela faz é LIMITAR quantas unidades cabem, via
+# ⌈V_mem/M⌉ (analysis/pareto.py:capacity_units). É essa assimetria que
+# representa a diferença real entre os dois meios: disco é elástico e
+# faturado à parte; memória é limitada e já embutida na instância.
 MEMORY_PER_UNIT_BYTES = 24 * 1024**3
 
-# Níveis de demanda do próprio delineamento (docs/DESIGN.md, "Protocolo de
-# medição"). D = 10.000 é a referência da comparação principal do TCC: é o
-# único dos três em que n(D) discrimina de fato (varia de 6 a 40 com os S
-# atuais). Em D = 100 todas as células dão n = 1 e o custo se reduz à parcela
-# de armazenamento — regime degenerado, a ser declarado como tal.
-DEFAULT_DEMAND_LEVELS = (100.0, 1000.0, 10000.0)
-# Teto da rampa curta (load/saturation.py:CEILING_RPS) — e exatamente o D
-# máximo em que uma célula censurada ainda tem n determinado.
-DEFAULT_DEMAND_MAX_RPS = 50_000.0
 # Carga fixa sob a qual a latência da triagem foi medida. Vai para o
 # report.json porque o eixo de latência e o eixo de custo são observáveis
 # independentes: sem registrar o ponto de operação da latência, o leitor não
@@ -192,9 +183,9 @@ def storage_bytes_for_cell(cell_id: str, storage_root: Path = _DEFAULT_STORAGE_R
 
 def storage_medium_for_cell(cell_id: str) -> str:
     """"memory" ou "disk" — decide por qual caminho o volume afeta o custo:
-    disco entra em C_a (elástico, faturado por GiB); memória entra em n(D)
-    (limitada, já paga em p_i). Único lugar do projeto que testa por
-    tecnologia residente em memória."""
+    disco entra em C_a (elástico, faturado por GiB); memória entra no piso de
+    capacidade ⌈V_mem/M⌉ (limitada, já paga em p_i). Único lugar do projeto
+    que testa por tecnologia residente em memória."""
     return "memory" if storage_for_cell(cell_id) == "valkey" else "disk"
 
 
@@ -217,7 +208,8 @@ def unit_compute_cost_usd_month(cell_id: str) -> float:
 
 
 def unit_cost_usd_month(cell_id: str, storage_root: Path = _DEFAULT_STORAGE_ROOT) -> float:
-    """Custo de UMA unidade de atendimento — é isto que n(D) multiplica."""
+    """Custo de UMA unidade de atendimento — o numerador que
+    analysis/pareto.py normaliza pela vazão de saturação de cada célula."""
     return unit_compute_cost_usd_month(cell_id) + unit_storage_cost_usd_month(cell_id, storage_root)
 
 # Margem de equivalência prática para o TOST na confirmação — placeholder,
@@ -292,8 +284,6 @@ def build_report(
     groups: dict[str, list[float]],
     saturation_by_cell: dict[str, dict] | None = None,
     storage_root: Path = _DEFAULT_STORAGE_ROOT,
-    demand_levels: tuple[float, ...] = DEFAULT_DEMAND_LEVELS,
-    demand_max_rps: float = DEFAULT_DEMAND_MAX_RPS,
 ) -> dict:
     saturation_by_cell = saturation_by_cell or {}
     labels = list(groups)
@@ -339,8 +329,7 @@ def build_report(
         ci = bootstrap_percentile_ci(latencies, percentile=0.99)
         bootstrap_ci_p99[cell_id] = {"low": ci.low, "high": ci.high}
 
-    domain_max, clamp_warning = demand_domain_max(cells, demand_max_rps)
-    cost_model_warnings = [clamp_warning] if clamp_warning else []
+    cost_model_warnings = []
 
     for cell in cells:
         reason = cost_undefined_reason(cell)
@@ -351,7 +340,15 @@ def build_report(
         # não está discriminando nada — declarar isso é melhor que deixar o
         # leitor supor que está.
         cell["capacity_bound_units"] = capacity_units(cell)
-        cell["cost_curve"] = cost_curve(cell, domain_max) if reason is None else []
+        # Estimativa PONTUAL — None para censuradas (só têm um teto, não um
+        # ponto; ver cost_per_million_requests_usd_bounds).
+        cell["cost_per_million_requests_usd"] = (
+            cost_per_million_requests(cell) if reason is None else None
+        )
+        bounds = cost_per_million_requests_bounds(cell) if reason is None else None
+        cell["cost_per_million_requests_usd_bounds"] = (
+            {"low": bounds[0], "high": bounds[1]} if bounds is not None else None
+        )
 
     without_cost = cells_without_cost(cells)
     for entry in without_cost:
@@ -359,54 +356,21 @@ def build_report(
             f"{entry['cell_id']} fora do plano de custo — {entry['reason']}."
         )
 
-    segments = frontier_segments(cells, domain_max)
-    crossover_report = crossovers(cells, domain_max)
-    frontier_union = sorted({cid for seg in segments for cid in seg["pareto_frontier"]})
-
-    summary = crossover_report["cost_summary"]
-    if summary["total"] and not summary["cost_discriminates"]:
-        cost_model_warnings.append(
-            f"{summary['within_tolerance']}/{summary['total']} das trocas de configuração mais "
-            "barata ficaram dentro da tolerância de S — o custo não discrimina as células; a "
-            "decisão vem da fronteira, não do argmin. Não reportar essas trocas como achado."
-        )
-
-    demand_level_reports = []
-    for demand in demand_levels:
-        if demand > float(domain_max):
-            cost_model_warnings.append(
-                f"nível de demanda {demand:.0f} req/s ignorado: acima do domínio "
-                f"({float(domain_max):.0f} req/s)."
-            )
-            continue
-        priced = [
-            {
-                "cell_id": c["cell_id"],
-                "units": units_at(c, demand),
-                "cost_usd_month": cost_at(c, demand),
-            }
-            for c in cells
-            if c["cost_defined"]
-        ]
-        frontier_here = pareto_frontier(cells, demand)
-        demand_level_reports.append(
-            {
-                "demand_rps": demand,
-                "cells": sorted(priced, key=lambda entry: entry["cell_id"]),
-                "pareto_frontier": sorted(c["cell_id"] for c in frontier_here),
-            }
-        )
+    frontier = pareto_frontier(cells)
+    tied_cheapest = cheapest_cells(cells)
 
     return {
         "cost_model": {
             "hours_per_month": HOURS_PER_MONTH,
+            "seconds_per_month": SECONDS_PER_MONTH,
             "service_unit_usd_hour": SERVICE_UNIT_USD_HOUR["postgres"],
             "service_unit_usd_month": SERVICE_UNIT_USD_HOUR["postgres"] * HOURS_PER_MONTH,
             "disk_usd_per_gb_month": DISK_USD_PER_GB_MONTH,
             "memory_per_unit_bytes": MEMORY_PER_UNIT_BYTES,
             "tolerance": TOLERANCE,
             # Sem sharding: cada unidade guarda uma réplica integral, por isso
-            # C_a escala com n(D). É a premissa mais contestável do modelo.
+            # C_a escala com o piso de capacidade. É a premissa mais
+            # contestável do modelo.
             "replication": "full_replica_per_unit",
             "byte_unit": "GiB (1024^3) — a GCP rotula 'GB' mas fatura GiB",
             "deployment_region": "us-east4",
@@ -422,12 +386,6 @@ def build_report(
                 "disk": "tabela pública da GCP, pd-ssd us-east4; consultado em 2026-09-06",
             },
             "latency_reference_load_rps": LATENCY_REFERENCE_LOAD_RPS,
-            "saturation_ceiling_rps": DEFAULT_DEMAND_MAX_RPS,
-            "demand_domain": {
-                "min_rps": 0.0,
-                "max_rps": float(domain_max),
-                "clamped_reason": clamp_warning,
-            },
         },
         "kruskal_wallis": {
             "h_statistic": kruskal.h_statistic,
@@ -439,14 +397,8 @@ def build_report(
         "bootstrap_ci_p99": bootstrap_ci_p99,
         "cells": cells,
         "cells_without_cost": without_cost,
-        "demand_levels": demand_level_reports,
-        "frontier_segments": segments,
-        "crossovers": crossover_report,
-        # Renomeado de "pareto_frontier": a semântica mudou para "união sobre
-        # o domínio de demanda", que é o conjunto que segue para a
-        # confirmação. Reusar a chave antiga deixaria consumidores
-        # desatualizados errados em vez de ruidosamente quebrados.
-        "pareto_frontier_union": frontier_union,
+        "pareto_frontier": sorted(c["cell_id"] for c in frontier),
+        "cheapest_cell_ids": tied_cheapest,
         "censorship_warning": censorship_warning(cells),
         "cost_model_warnings": cost_model_warnings,
     }
@@ -476,21 +428,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("results_root", type=Path)
     parser.add_argument("--phase", required=True, choices=["triagem", "confirmacao"])
     parser.add_argument("--out", type=Path, default=Path("results/report"))
-    parser.add_argument(
-        "--demand-levels",
-        type=float,
-        nargs="+",
-        default=list(DEFAULT_DEMAND_LEVELS),
-        help="níveis de demanda (req/s) para as tabelas de custo; a comparação principal do "
-        "TCC é ancorada no maior deles (docs/DESIGN.md).",
-    )
-    parser.add_argument(
-        "--demand-max",
-        type=float,
-        default=DEFAULT_DEMAND_MAX_RPS,
-        help="limite superior do domínio varrido para achar os pontos de cruzamento; é "
-        "reduzido automaticamente se alguma célula censurada não permitir ir tão longe.",
-    )
     args = parser.parse_args(argv)
 
     rep_dirs = discover_rep_dirs(args.results_root, args.phase)
@@ -547,28 +484,20 @@ def main(argv: list[str] | None = None) -> int:
                 "Trate como não validada nessa dimensão."
             )
 
-    report = build_report(
-        groups,
-        saturation_by_cell,
-        demand_levels=tuple(args.demand_levels),
-        demand_max_rps=args.demand_max,
-    )
+    report = build_report(groups, saturation_by_cell)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "report.json").write_text(json.dumps(report, indent=2))
 
-    # Um gráfico de Pareto por nível de demanda: a fronteira depende de D, e
-    # um PNG único teria de escolher um D sem dizer qual.
-    for level in report["demand_levels"]:
-        demand = level["demand_rps"]
-        plot_pareto_frontier(
-            report["cells"],
-            args.out / f"pareto_D{demand:.0f}.png",
-            frontier_cell_ids=set(level["pareto_frontier"]),
-            demand_rps=demand,
-            units_by_cell={c["cell_id"]: c["units"] for c in level["cells"]},
-            cost_by_cell={c["cell_id"]: c["cost_usd_month"] for c in level["cells"]},
-        )
-    plot_cost_vs_demand(report["cells"], report["crossovers"], args.out / "custo_vs_demanda.png")
+    plot_pareto_frontier(
+        report["cells"],
+        args.out / "pareto.png",
+        frontier_cell_ids=set(report["pareto_frontier"]),
+        cost_by_cell={
+            c["cell_id"]: c["cost_per_million_requests_usd"]
+            for c in report["cells"]
+            if c["cost_per_million_requests_usd"] is not None
+        },
+    )
 
     if report["censorship_warning"]:
         print(f"AVISO: {report['censorship_warning']}")

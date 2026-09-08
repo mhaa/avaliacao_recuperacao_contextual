@@ -6,6 +6,44 @@ reaparecerem. Para o passo a passo de reprodução, veja o [README](../README.md
 para o "porquê" arquitetural atemporal, veja [ARCHITECTURE.md](ARCHITECTURE.md)
 e [DESIGN.md](DESIGN.md).
 
+## Fase 6b — custo por milhão de requisições, sem demanda externa (2026-09-08) <a id="fase-6b-custo"></a>
+
+**A correção sobre a correção.** A Fase 6 (abaixo) internalizou a vazão no
+custo via `n(D) = ⌈D/S⌉`, mas manteve o custo como função de uma demanda `D`
+escolhida externamente (10.000 req/s para a comparação principal). Isso foi
+substituído: o custo passou a ser `C = (C_f + C_a) · 10^6 / (S · 2.592.000)`
+— **\$ por milhão de requisições**, avaliado sempre na capacidade máxima de
+UMA unidade de atendimento, sem escolher `D`. `n` deixou de vir de `⌈D/S⌉` e
+passou a ser só o piso de memória `⌈V_mem/M⌉` (`capacity_units`), que
+continua inerte nos dados atuais.
+
+**O que isso aposentou.** Toda a maquinaria de variar `D` para achar "pontos
+de cruzamento" — `frontier_segments`, `crossovers`, `demand_domain_max`,
+`cost_curve`, `breakpoints`, `demand_levels` em `report.json`,
+`pareto_D<nível>.png`/`custo_vs_demanda.png` — deixou de fazer sentido, já
+que o custo não varia mais com `D`, e foi removida (não deprecada — mesma
+disciplina da Fase 6 contra eixo/código morto mantido em silêncio).
+`analysis/pareto.py` ganhou `cost_per_million_requests`/
+`cost_per_million_requests_bounds`; a fronteira agora é calculada uma vez
+(`pareto_frontier(cells)`, sem `demand`).
+
+**Células censuradas mudaram de "n=1 exato" para "só teto de custo".** Sob o
+modelo antigo, `S ≥ L` e `D ≤ L` davam `n(D) = 1` exatamente — custo
+determinado. Sob o novo, o custo divide por `S` diretamente: um PISO de `S`
+não vira um PONTO de custo, só um TETO (o custo é decrescente em `S`).
+Censuradas agora entram no plano de custo com um teto (nunca ficam de fora),
+mas nunca têm ponto — não aparecem em `cheapest_cell_ids`, e a banda de
+tolerância de ±20% não se aplica a elas (só a `S` medido, nunca a um limite).
+
+**Por que a inconsistência de unidade de tempo (`h=730` vs. `2.592.000s`) foi
+aceita.** `HOURS_PER_MONTH=730` (média de 30,42 dias) já existia para `C_f`;
+a normalização nova usa `2.592.000` s (30 dias exatos) para converter `S`
+(req/s) em capacidade mensal. As duas convenções mensais divergem em ~1,4%,
+mas afetam todas as 14 células igualmente — não muda nenhuma comparação,
+só os valores absolutos. Declarado no texto do TCC em vez de forçar as duas
+constantes a uma correspondência exata que nenhuma das duas fontes (preço
+por hora, protocolo de saturação por segundo) pede naturalmente.
+
 ## Fase 6 — custo em função da demanda, fronteira 2D (2026-09-06) <a id="fase-6-custo"></a>
 
 **O problema.** Com a triagem das 14 células concluída, a fronteira de Pareto

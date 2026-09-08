@@ -144,12 +144,11 @@ def test_build_report_rejects_h0_and_dunn_points_at_the_shifted_cell(tmp_path):
     assert cell_ids == set(cells)
 
     # Sem saturação nenhuma, NENHUMA célula pode ser posta no plano de custo
-    # (n(D) é indeterminado). Isso não pode explodir nem passar silencioso: a
+    # (S é indeterminado). Isso não pode explodir nem passar silencioso: a
     # estatística continua válida, o custo simplesmente não existe, e o
     # relatório tem de dizer isso em voz alta.
     assert all(c["cost_defined"] is False for c in report["cells"])
-    assert all(seg["pareto_frontier"] == [] for seg in report["frontier_segments"])
-    assert report["pareto_frontier_union"] == []
+    assert report["pareto_frontier"] == []
     assert {c["cell_id"] for c in report["cells_without_cost"]} == set(cells)
     assert report["cost_model_warnings"]
 
@@ -193,7 +192,7 @@ def test_load_cell_saturation_finds_a_ramp_only_run_that_has_no_repetitions(tmp_
     assert result["e1-postgres"]["approx_throughput"] == 1750.0
 
 
-def test_build_report_emits_demand_levels_segments_and_crossovers(tmp_path):
+def test_build_report_computes_cost_per_million_requests_and_the_frontier(tmp_path):
     results_root, cells = _build_fake_results(tmp_path)
     rep_dirs = discover_rep_dirs(results_root, "triagem")
     ensure_collected(rep_dirs)
@@ -211,21 +210,15 @@ def test_build_report_emits_demand_levels_segments_and_crossovers(tmp_path):
     by_id = {c["cell_id"]: c for c in report["cells"]}
     assert by_id["e1-postgres"]["saturation_throughput_approx"] == 5000.0
     assert by_id["e1-valkey"]["saturation_censored"] is True
-    # Censurada: n = 1 exato em todo o domínio medido, nunca o teto como S.
+    # Censurada: fica no plano de custo (tem um TETO via o lower_bound), mas
+    # sem estimativa pontual — cost_undefined_reason não a exclui.
     assert by_id["e1-valkey"]["cost_defined"] is True
+    assert by_id["e1-valkey"]["cost_per_million_requests_usd"] is None
+    assert by_id["e1-valkey"]["cost_per_million_requests_usd_bounds"]["low"] == 0.0
 
-    assert [level["demand_rps"] for level in report["demand_levels"]] == [100.0, 1000.0, 10000.0]
-
-    segments = report["frontier_segments"]
-    assert segments[0]["demand_from_rps_exclusive"] == 0.0
-    # Domínio limitado ao lower_bound da célula censurada.
-    assert segments[-1]["demand_to_rps_inclusive"] == 50000.0
-    for previous, current in zip(segments, segments[1:]):
-        assert previous["demand_to_rps_inclusive"] == current["demand_from_rps_exclusive"]
-
-    assert set(report["crossovers"]) == {"frontier", "cost", "cost_summary"}
-    union = {cid for seg in segments for cid in seg["pareto_frontier"]}
-    assert set(report["pareto_frontier_union"]) == union
+    assert by_id["e1-postgres"]["cost_per_million_requests_usd"] > 0
+    assert isinstance(report["pareto_frontier"], list)
+    assert isinstance(report["cheapest_cell_ids"], list)
     assert "censorship_warning" in report
 
 

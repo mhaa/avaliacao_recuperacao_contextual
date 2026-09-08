@@ -19,24 +19,18 @@ def plot_pareto_frontier(
     cells: list[dict],
     out_path: Path,
     frontier_cell_ids: set[str] | None = None,
-    demand_rps: float | None = None,
-    units_by_cell: dict[str, int] | None = None,
     cost_by_cell: dict[str, float] | None = None,
 ) -> None:
-    """Fronteira de Pareto em 2 dimensões: latência p99 × custo mensal.
+    """Fronteira de Pareto em 2 dimensões: latência p99 × custo por milhão de
+    requisições, na capacidade máxima de UMA unidade de atendimento
+    (docs/DESIGN.md) — não depende mais de uma demanda `D` externa.
 
-    A vazão de saturação NÃO é um eixo — ela está internalizada no custo, via
-    o número de unidades de atendimento `n(D)` (docs/DESIGN.md, "Custo como
-    função da demanda"). Por isso o gráfico é sempre relativo a uma demanda:
-    `demand_rps` vai no título, e `units_by_cell`/`cost_by_cell` chegam prontos
-    de `report["demand_levels"]`, que já os calculou naquela demanda.
-
-    Células sem custo definido naquela demanda (sem `S` medido) não são
-    plotadas: não há onde colocá-las no eixo x, e inventar uma posição seria
-    pior que omiti-las — elas aparecem em `cells_without_cost`."""
+    Células sem custo definido (sem `S` medido, ou censuradas sem
+    `lower_bound`) não são plotadas: não há onde colocá-las no eixo x, e
+    inventar uma posição seria pior que omiti-las — elas aparecem em
+    `cells_without_cost`."""
     fig, ax = plt.subplots()
     frontier_cell_ids = frontier_cell_ids or set()
-    units_by_cell = units_by_cell or {}
     cost_by_cell = cost_by_cell or {}
 
     for c in cells:
@@ -50,50 +44,11 @@ def plot_pareto_frontier(
             marker="o" if in_frontier else "x",
             s=80 if in_frontier else 40,
         )
-        units = units_by_cell.get(c["cell_id"])
-        label = c["cell_id"] + (f"\nn={units}" if units else "")
-        ax.annotate(label, (cost, c["latency_p99_ms"]), fontsize=8)
+        ax.annotate(c["cell_id"], (cost, c["latency_p99_ms"]), fontsize=8)
 
-    ax.set_xlabel("Custo total (US$/mês)")
+    ax.set_xlabel("Custo (US$ por milhão de requisições)")
     ax.set_ylabel("Latência p99 (ms)")
-    title = "Fronteira de Pareto — latência × custo"
-    if demand_rps is not None:
-        title += f" (D = {demand_rps:.0f} req/s)"
-    ax.set_title(title)
-    _save(fig, out_path)
-
-
-def plot_cost_vs_demand(cells: list[dict], crossovers: dict | None, out_path: Path) -> None:
-    """Curva em degraus de `C(D)` por célula, com os cruzamentos de fronteira
-    marcados — a figura que o texto promete ao falar nos "pontos em que a
-    configuração de menor custo total se altera".
-
-    `C(D) = n(D) · custo_por_unidade` é função escada, com degraus nos
-    múltiplos de `S`; `cost_curve` (analysis/pareto.py) já entrega os patamares
-    prontos em `cells[i]["cost_curve"]`.
-
-    Eixo x linear, não logarítmico: o primeiro patamar começa em D = 0, que não
-    tem lugar numa escala log."""
-    fig, ax = plt.subplots()
-
-    for c in cells:
-        curve = c.get("cost_curve") or []
-        if not curve:
-            continue
-        xs: list[float] = []
-        ys: list[float] = []
-        for step in curve:
-            xs.extend([step["demand_from_rps"], step["demand_to_rps"]])
-            ys.extend([step["cost_usd_month"], step["cost_usd_month"]])
-        ax.plot(xs, ys, label=c["cell_id"], linewidth=1.2)
-
-    for change in (crossovers or {}).get("frontier", []):
-        ax.axvline(change["demand_rps"], linestyle="--", color="grey", linewidth=0.8)
-
-    ax.set_xlabel("Demanda D (req/s)")
-    ax.set_ylabel("Custo total (US$/mês)")
-    ax.set_title("Custo × demanda — degraus nos múltiplos da vazão de saturação")
-    ax.legend(fontsize=7)
+    ax.set_title("Fronteira de Pareto — latência × custo por milhão de requisições")
     _save(fig, out_path)
 
 

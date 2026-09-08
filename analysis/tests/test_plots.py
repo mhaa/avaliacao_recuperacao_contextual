@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from analysis.plots import (
     plot_cache_hit_rate,
-    plot_cost_vs_demand,
     plot_latency_vs_throughput,
     plot_pareto_frontier,
     plot_percentile_comparison,
@@ -24,36 +23,8 @@ def test_plot_pareto_frontier_writes_a_png(tmp_path):
         cells,
         out,
         frontier_cell_ids={"e3-valkey"},
-        demand_rps=10_000.0,
-        units_by_cell={"e1-postgres": 14, "e3-valkey": 7},
-        cost_by_cell={"e1-postgres": 5948.0, "e3-valkey": 3049.0},
+        cost_by_cell={"e1-postgres": 0.0459, "e3-valkey": 0.0117},
     )
-    assert out.stat().st_size > 0
-
-
-def test_plot_cost_vs_demand_writes_a_png(tmp_path):
-    cells = [
-        {
-            "cell_id": "e3-postgres",
-            "cost_curve": [
-                {
-                    "demand_from_rps": 0.0,
-                    "demand_to_rps": 1750.0,
-                    "units": 1,
-                    "cost_usd_month": 427.64,
-                },
-                {
-                    "demand_from_rps": 1750.0,
-                    "demand_to_rps": 3500.0,
-                    "units": 2,
-                    "cost_usd_month": 855.28,
-                },
-            ],
-        }
-    ]
-    crossovers = {"frontier": [{"demand_rps": 1750.0}], "cost": []}
-    out = tmp_path / "custo_vs_demanda.png"
-    plot_cost_vs_demand(cells, crossovers, out)
     assert out.stat().st_size > 0
 
 
