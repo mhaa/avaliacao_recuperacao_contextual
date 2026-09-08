@@ -77,8 +77,8 @@ contém ranking; o catálogo é O(itens) e não contém nenhum. Carregá-lo na
 aplicação é o que a definição de E-1 ("avalia o predicado no processo do
 serviço") já pede — não é pré-materialização disfarçada.
 
-Custo: ~20-40 MB por processo de serviço (4 workers Hypercorn numa
-`n2-standard-4` de 16 GB). O volume ocupado no banco não muda — o catálogo
+Custo: ~20-40 MB por processo de serviço (8 workers Hypercorn numa
+`n2-standard-8` de 32 GB). O volume ocupado no banco não muda — o catálogo
 continua normalizado em cada tecnologia, apenas deixa de ser lido por
 requisição. A leitura em massa é a primitiva `load_item_contexts`, chamada uma
 única vez na montagem da célula, nunca no caminho de requisição.
@@ -323,7 +323,7 @@ C(D)   = C_f(D) + C_a(D)
 ```
 
 - **Unidade de atendimento** = 1 VM de banco (`n2-standard-8`) + 1 VM de
-  serviço (`n2-standard-4`). A VM geradora **não** entra: é aparato de
+  serviço (`n2-standard-8`). A VM geradora **não** entra: é aparato de
   medição, não capacidade produtiva.
 - **Sem sharding**: cada unidade mantém réplica integral da base — é por isso
   que `C_a` carrega o fator `n(D)`. É a premissa mais contestável do modelo e
@@ -540,7 +540,7 @@ valores — todas usam o default de `infra/modules/*`):
 | VM | Tipo | vCPU / RAM |
 |---|---|---|
 | banco | `n2-standard-8` | 8 / 32 GB |
-| serviço | `n2-standard-4` | 4 / 16 GB |
+| serviço | `n2-standard-8` | 8 / 32 GB |
 | gerador de carga (loadgen) | `n2-standard-8` | 8 / 32 GB |
 | disco de dados | `pd-ssd`, 200 GB | — |
 

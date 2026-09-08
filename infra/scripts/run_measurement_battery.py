@@ -142,7 +142,7 @@ SHORT_RAMP_CONFIRM_REPETITIONS = 5
 # `machine_type` for sobrescrito em terraform.tfvars, ajustar aqui também.
 DEFAULT_MEMORY_MB_BY_COMPONENT = {
     "database": 32768.0,  # n2-standard-8
-    "service": 16384.0,  # n2-standard-4
+    "service": 32768.0,  # n2-standard-8
     "loadgen": 32768.0,  # n2-standard-8
 }
 

@@ -99,7 +99,10 @@ vCPU extra ajuda.
 ## 5. Custo por requisição, célula a célula
 
 Estado do código após a mudança do catálogo (README, "Fase 2.6"). Ordens de
-grandeza, não previsões precisas.
+grandeza, não previsões precisas — a tabela abaixo presume 4 workers
+Hypercorn (`n2-standard-4`); com a VM de serviço em `n2-standard-8` (8
+workers), o teto de cada célula tende a subir, sujeito a re-medição real em
+vez de re-especulação.
 
 | Célula | Trabalho por requisição | CPU/req est. | Teto est. (30%) |
 |---|---|---|---|
@@ -124,7 +127,7 @@ Se essa célula saturar cedo, é resultado, não bug.
 
 ## 6. O piso da bancada
 
-O caminho é k6 → Hypercorn/FastAPI (`n2-standard-4`, 4 workers) → banco →
+O caminho é k6 → Hypercorn/FastAPI (`n2-standard-8`, 8 workers) → banco →
 volta. Um POST FastAPI com validação Pydantic de entrada **e de saída**
 (`response_model=Response` revalida cada item) custa alguns ms de p99 sozinho.
 Rede intra-VPC: ~0,2–0,5 ms por hop, desprezível.
@@ -135,7 +138,7 @@ seja o banco. Consequências:
 - Em E-3, mede-se majoritariamente o overhead do FastAPI, não a tecnologia.
   Isso comprime a diferença entre Valkey e Scylla e **é uma ameaça à validade
   que precisa estar no texto do TCC**.
-- A VM de serviço (`n2-standard-4`) é frequentemente o gargalo real, não o
+- A VM de serviço (`n2-standard-8`) é frequentemente o gargalo real, não o
   banco. Já houve precedente: o serviço ficou preso em ~28% de CPU com
   latências de 10–24 s até o número de workers ser corrigido.
 

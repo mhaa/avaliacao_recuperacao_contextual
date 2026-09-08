@@ -293,7 +293,7 @@ comparáveis — ver [DESIGN.md](DESIGN.md#ambientes)).
 
 Três VMs por medição, em zona única, sub-rede privada (ver a tabela de
 hardware idêntico em [DESIGN.md](DESIGN.md#equivalência-de-infraestrutura-entre-células)):
-banco (`n2-standard-8`), serviço (`n2-standard-4`), gerador de carga
+banco (`n2-standard-8`), serviço (`n2-standard-8`), gerador de carga
 (`n2-standard-8`, **obrigatoriamente separado** — a metodologia exige
 verificar que a CPU do gerador ficou abaixo de 60%, para descartar que ele
 seja o gargalo). Sem IP público nas VMs de banco e serviço; acesso por IAP.

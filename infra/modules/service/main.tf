@@ -48,8 +48,8 @@ variable "database_internal_ip" {
 
 variable "machine_type" {
   type        = string
-  description = "Tipo de máquina — n2-standard-4 (docs/ARCHITECTURE.md, topologia)."
-  default     = "n2-standard-4"
+  description = "Tipo de máquina — n2-standard-8 (docs/ARCHITECTURE.md, topologia)."
+  default     = "n2-standard-8"
 }
 
 resource "google_service_account" "service" {

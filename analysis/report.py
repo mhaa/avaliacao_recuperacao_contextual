@@ -85,12 +85,12 @@ MACHINE_HOURLY_USD = {"n2-standard-4": 0.1942, "n2-standard-8": 0.3885}
 HOURS_PER_MONTH = 730
 
 # p_i — uma UNIDADE DE ATENDIMENTO é 1 VM de banco (n2-standard-8) + 1 VM de
-# serviço (n2-standard-4). A VM geradora de carga NÃO entra: é aparato de
+# serviço (n2-standard-8). A VM geradora de carga NÃO entra: é aparato de
 # medição, não capacidade produtiva. Sai igual nas 4 tecnologias porque todas
 # usam os mesmos tipos de máquina — a discriminação de custo vem de S (via
 # n(D)) e da parcela de armazenamento por unidade.
 SERVICE_UNIT_USD_HOUR = {
-    storage: MACHINE_HOURLY_USD["n2-standard-8"] + MACHINE_HOURLY_USD["n2-standard-4"]
+    storage: 2 * MACHINE_HOURLY_USD["n2-standard-8"]
     for storage in ("postgres", "valkey", "scylla", "opensearch")
 }
 
