@@ -134,8 +134,15 @@ def build_k6_cmd(
     # não mais um join de métricas do k6 por tag (ver o comentário no topo
     # de load/scenarios.js sobre por que tag por requisição afundava o k6
     # sob cardinalidade em bateria real). --out json=... continua sendo
-    # gravado (k6-raw.json) só como saída nativa de diagnóstico do k6 —
-    # nada mais o lê.
+    # gravado (k6-raw.json) só como saída nativa de diagnóstico do k6 — o
+    # chamador (run_k6 abaixo / infra/scripts/run_measurement_battery.py:
+    # make_probe_fn) sobe esse arquivo pro bucket e apaga a cópia local
+    # logo em seguida, nunca deixando mais de 1 k6-raw.json por vez no
+    # disco da loadgen — sem isso, ele se acumula (confirmado ao vivo
+    # derrubando e3-postgres com "no space left on device" na confirmação:
+    # ~5GB por repetição em patamares de carga alta, sem limpeza entre
+    # sondagens da busca de saturação, enche o disco de 100GB da loadgen
+    # antes do fim da varredura).
     # Path(...).as_posix(): infra/scripts/run_measurement_battery.py roda
     # NO HOST (README.md, Fase 5 — "roda no HOST, não dentro do container
     # tools"), que aqui é Windows. Path(str) sem .as_posix() vira
@@ -246,6 +253,7 @@ def run_k6(
     region: str | None = None,
     zone: str | None = None,
     user_count: int | None = None,
+    results_bucket: str | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     json_out = out_dir / "k6-raw.json"
@@ -280,6 +288,18 @@ def run_k6(
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     result = subprocess.run(cmd, check=False)
+    if results_bucket and json_out.exists():
+        # Sobe k6-raw.json e apaga a cópia local imediatamente — nunca deixa
+        # mais de 1 por vez no disco da loadgen (ver comentário em
+        # build_k6_cmd acima sobre o "no space left on device" que isso já
+        # causou). Roda ANTES do tratamento de returncode abaixo: mesmo um
+        # k6 exit 99 (SLO violado) já escreveu um k6-raw.json válido que
+        # precisa subir e ser limpo do mesmo jeito.
+        subprocess.run(
+            [sys.executable, "load/upload_one_file.py", str(json_out), results_bucket, f"{cell_id}/{out_dir.relative_to(RESULTS_DIR / cell_id).as_posix()}/k6-raw.json"],
+            check=True,
+        )
+        json_out.unlink()
     if result.returncode == 99:
         # k6 usa o exit code 99 especificamente para "o teste rodou até o
         # fim, mas um ou mais thresholds (load/scenarios.js: p99<200ms,
@@ -332,6 +352,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--zone", default=None, help="zona GCP da medição — idem --region.")
     parser.add_argument(
+        "--results-bucket",
+        default=None,
+        help="bucket de resultados — quando dado, cada k6-raw.json individual sobe pra "
+        "gs://<bucket>/<cell>/<phase>/<timestamp>/rep<N>/k6-raw.json e a cópia local é apagada "
+        "logo em seguida (load/upload_one_file.py), em vez de acumular no disco da loadgen até "
+        "o upload final em bloco de load/upload_results.py. Sem isto (ex.: --smoke local), o "
+        "k6-raw.json de cada repetição fica no disco local, como antes.",
+    )
+    parser.add_argument(
         "--user-count",
         type=int,
         default=None,
@@ -373,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
             region=args.region,
             zone=args.zone,
             user_count=args.user_count,
+            results_bucket=args.results_bucket,
         )
     return 0
 

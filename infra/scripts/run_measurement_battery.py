@@ -301,6 +301,7 @@ def build_remote_battery_command(
     timestamp: str,
     region: str | None = None,
     zone: str | None = None,
+    results_bucket: str | None = None,
     *,
     user_count: int,
 ) -> str:
@@ -343,6 +344,8 @@ def build_remote_battery_command(
         battery_argv += ["--region", region]
     if zone:
         battery_argv += ["--zone", zone]
+    if results_bucket:
+        battery_argv += ["--results-bucket", results_bucket]
 
     docker_argv = [
         "docker",
@@ -374,6 +377,7 @@ def build_remote_probe_command(
     fixtures_mount: str,
     remote_subdir: str,
     repetitions: int,
+    results_bucket: str | None = None,
     *,
     user_count: int,
 ) -> str:
@@ -409,6 +413,21 @@ def build_remote_probe_command(
             json_out, cell_id, target_url, rate, tier, warmup, measure, user_count=user_count
         )
         steps.append(shlex.join(str(a) for a in k6_argv))
+        if results_bucket:
+            # Sobe k6-raw.json e apaga a cópia local logo após ESTA
+            # repetição — a busca de saturação encadeia todas as
+            # repetições de todas as sondagens numa única invocação de
+            # container (steps unidos por &&), então sem isto o disco da
+            # loadgen acumula um k6-raw.json por repetição de CADA
+            # sondagem até o fim da busca inteira. Confirmado ao vivo:
+            # ~5GB por repetição em patamares de carga alta encheu o disco
+            # de 100GB e derrubou e3-postgres com "no space left on
+            # device" na rampa fina de confirmação.
+            blob_name = f"{remote_subdir}/rep{rep}/k6-raw.json"
+            steps.append(
+                shlex.join(["python", "load/upload_one_file.py", json_out, results_bucket, blob_name])
+            )
+            steps.append(shlex.join(["rm", "-f", json_out]))
     steps.append('AFTER_STAT="$(cat /proc/stat | head -1)"')
     # taxa × janela de medição × repetições: o que o constant-arrival-rate
     # DEVERIA ter emitido nos cenários 'probe' (o warmup fica de fora — a
@@ -664,6 +683,7 @@ def make_probe_fn(
     fixtures_mount: str,
     label: str,
     repetitions: int = 1,
+    results_bucket: str | None = None,
     *,
     user_count: int,
 ) -> Callable[[int], ProbeResult]:
@@ -691,6 +711,7 @@ def make_probe_fn(
             fixtures_mount,
             remote_subdir,
             repetitions,
+            results_bucket=results_bucket,
             user_count=user_count,
         )
         result = gcloud_ssh(loadgen_instance, zone, project_id, remote_cmd)
@@ -1073,6 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
                 timestamp,
                 region=args.region,
                 zone=args.zone,
+                results_bucket=args.results_bucket,
                 user_count=args.user_count,
             )
             # print(result.stdout): sem isso, o resultado desta combinação
@@ -1100,6 +1122,7 @@ def main(argv: list[str] | None = None) -> int:
                 FIXTURES_MOUNT,
                 label="short",
                 repetitions=1,
+                results_bucket=args.results_bucket,
                 user_count=args.user_count,
             )
             saturation = run_saturation_search(
@@ -1127,6 +1150,7 @@ def main(argv: list[str] | None = None) -> int:
                     FIXTURES_MOUNT,
                     label=f"confirm-{tier}",
                     repetitions=CONFIRMATION_REPETITIONS,
+                    results_bucket=args.results_bucket,
                     user_count=args.user_count,
                 )
                 saturation = run_saturation_search(

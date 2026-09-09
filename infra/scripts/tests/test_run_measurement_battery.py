@@ -78,6 +78,28 @@ def test_build_remote_battery_command_passes_user_count_to_run_battery():
     assert "--user-count 200948" in cmd
 
 
+def test_build_remote_battery_command_passes_results_bucket_to_run_battery():
+    # Sem isto, load/run_battery.py:run_k6 não sabe pra onde subir cada
+    # k6-raw.json individual e o deixa acumulado no disco da loadgen até o
+    # upload final em bloco — o "no space left on device" que derrubou
+    # e3-postgres.
+    cmd = build_remote_battery_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
+        1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "20260101T000000Z", results_bucket="my-results-bucket", user_count=200_948,
+    )
+    assert "--results-bucket my-results-bucket" in cmd
+
+
+def test_build_remote_battery_command_omits_results_bucket_flag_when_absent():
+    cmd = build_remote_battery_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
+        1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "20260101T000000Z", user_count=200_948,
+    )
+    assert "--results-bucket" not in cmd
+
+
 def test_build_remote_battery_command_mounts_results_dir():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
@@ -203,6 +225,37 @@ def test_build_remote_probe_command_repeats_k6_for_each_repetition():
     assert cmd.count("PROBE_MODE=true") == 5
     for rep in range(5):
         assert f"rep{rep}/k6-raw.json" in cmd
+
+
+def test_build_remote_probe_command_uploads_and_deletes_k6_raw_json_per_rep():
+    # Bug real: sem isto, cada sondagem da rampa fina de confirmação
+    # (5 repetições, várias sondagens até convergir) deixa um k6-raw.json
+    # de vários GB no disco da loadgen sem nunca limpar — encheu o disco
+    # de 100GB e derrubou e3-postgres com "no space left on device".
+    cmd = build_remote_probe_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "_saturation/e1-postgres/confirm-low-0-1000", 2,
+        results_bucket="my-results-bucket", user_count=200_948,
+    )
+    assert "load/upload_one_file.py" in cmd
+    for rep in range(2):
+        rep_dir = f"/app/results/_saturation/e1-postgres/confirm-low-0-1000/rep{rep}"
+        assert (
+            f"load/upload_one_file.py {rep_dir}/k6-raw.json my-results-bucket "
+            f"_saturation/e1-postgres/confirm-low-0-1000/rep{rep}/k6-raw.json" in cmd
+        )
+        assert f"rm -f {rep_dir}/k6-raw.json" in cmd
+
+
+def test_build_remote_probe_command_omits_upload_step_without_results_bucket():
+    cmd = build_remote_probe_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "_saturation/e1-postgres/confirm-low-0-1000", 1, user_count=200_948,
+    )
+    assert "load/upload_one_file.py" not in cmd
+    assert "rm -f" not in cmd
 
 
 def test_build_remote_probe_command_captures_proc_stat_before_and_after():
