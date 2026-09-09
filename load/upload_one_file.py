@@ -28,8 +28,17 @@ from google.cloud import storage
 
 
 def upload_one_file(local_path: Path, bucket_name: str, blob_name: str) -> None:
+    # if_generation_match=0: exige que o objeto NÃO exista ainda (cada
+    # blob_name é único por timestamp+rep, nunca reescrito de propósito) —
+    # sem isso, o upload resumível do cliente GCS assume que pode estar
+    # sobrescrevendo algo e pede storage.objects.delete, que a service
+    # account da loadgen não tem (só roles/storage.objectCreator,
+    # infra/modules/loadgen/main.tf:loadgen_results_writer). Confirmado ao
+    # vivo: 403 "does not have storage.objects.delete access" sem isto.
     client = storage.Client()
-    client.bucket(bucket_name).blob(blob_name).upload_from_filename(str(local_path))
+    client.bucket(bucket_name).blob(blob_name).upload_from_filename(
+        str(local_path), if_generation_match=0
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

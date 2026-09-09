@@ -15,7 +15,7 @@ class _FakeBlob:
         self._store = store
         self._name = name
 
-    def upload_from_filename(self, path: str) -> None:
+    def upload_from_filename(self, path: str, **kwargs) -> None:
         self._store[self._name] = Path(path).read_bytes()
 
 

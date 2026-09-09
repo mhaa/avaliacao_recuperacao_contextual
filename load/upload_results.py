@@ -34,7 +34,14 @@ def upload_directory(local_dir: Path, bucket_name: str, prefix: str) -> int:
     for path in sorted(local_dir.rglob("*")):
         if path.is_file():
             rel = path.relative_to(local_dir).as_posix()
-            bucket.blob(f"{prefix}/{rel}").upload_from_filename(str(path))
+            # if_generation_match=0: exige que o objeto NÃO exista ainda —
+            # sem isso, o upload resumível do cliente GCS pede
+            # storage.objects.delete, que a service account da loadgen não
+            # tem (só roles/storage.objectCreator, infra/modules/loadgen/
+            # main.tf:loadgen_results_writer). Confirmado ao vivo em
+            # load/upload_one_file.py (mesma SA, mesmo bucket): 403 "does
+            # not have storage.objects.delete access" sem isto.
+            bucket.blob(f"{prefix}/{rel}").upload_from_filename(str(path), if_generation_match=0)
             count += 1
     return count
 
