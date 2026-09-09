@@ -74,6 +74,26 @@ def build_run_plan(cell_ids: list[str], repetitions: int) -> list[tuple[str, int
     return [(cell_id, rep) for cell_id in cell_ids for rep in range(repetitions)]
 
 
+def combo_out_dir(
+    results_dir: Path, cell_id: str, phase: str, timestamp: str, rate: int, tier: str, repetition: int
+) -> Path:
+    """results/<cell>/<phase>/<timestamp>/[<rate>-<tier>/]rep<N> —
+    docs/ARCHITECTURE.md, "Coleta de resultados". Só a confirmação recebe o
+    segmento <rate>-<tier>/: ela varre 9 combinações (RATES × SELECTIVITY_TIERS
+    em infra/scripts/run_measurement_battery.py) que, sem isso, cairiam todas
+    nos mesmos 5 diretórios rep0..rep4 sob o mesmo timestamp — cada combinação
+    sobrescrevendo a repetição da anterior. Confirmado ao vivo: um upload
+    individual por repetição (load/upload_one_file.py, if_generation_match=0)
+    começou a rejeitar a 2ª combinação com 412 Precondition Failed porque o
+    objeto de rep0 já existia no bucket, vindo da 1ª — antes disso o mesmo bug
+    era silencioso localmente (sem erro, só perda de dado). A triagem nunca
+    tem esse problema — só roda 1 combinação fixa (TRIAGEM_RATE/TRIAGEM_TIER)
+    — então mantém o layout antigo, sem quebrar resultados já coletados."""
+    if phase == "confirmacao":
+        return results_dir / cell_id / phase / timestamp / f"{rate}-{tier}" / f"rep{repetition}"
+    return results_dir / cell_id / phase / timestamp / f"rep{repetition}"
+
+
 def target_url_for(
     cell_id: str, target_url: str | None, targets: dict[str, str] | None
 ) -> str:
@@ -388,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for cell_id, repetition in build_run_plan(order, args.repetitions):
         url = target_url_for(cell_id, args.target_url, targets)
-        out_dir = RESULTS_DIR / cell_id / args.phase / timestamp / f"rep{repetition}"
+        out_dir = combo_out_dir(RESULTS_DIR, cell_id, args.phase, timestamp, args.rate, args.selectivity_tier, repetition)
         run_k6(
             cell_id,
             repetition,

@@ -29,13 +29,16 @@ def _request_line(time: str, latency_ms: float) -> str:
     )
 
 
-def _write_fake_run(rep_dir, latencies: list[float]) -> None:
+def _write_fake_run(rep_dir, latencies: list[float], cell_id: str) -> None:
     rep_dir.mkdir(parents=True, exist_ok=True)
     lines = [
         _request_line(f"2026-01-01T00:02:{i % 60:02d}.000Z", latency)
         for i, latency in enumerate(latencies)
     ]
     (rep_dir / "requests.ndjson").write_text("\n".join(lines) + "\n")
+    # load_cell_latencies (analysis/report.py) lê cell_id daqui agora, não
+    # da profundidade do caminho.
+    (rep_dir / "manifest.json").write_text(json.dumps({"cell_id": cell_id}))
 
 
 def _build_fake_results(tmp_path, phase="triagem"):
@@ -45,7 +48,7 @@ def _build_fake_results(tmp_path, phase="triagem"):
     }
     for cell_id, latencies in cells.items():
         rep_dir = tmp_path / cell_id / phase / "20260101T000000Z" / "rep0"
-        _write_fake_run(rep_dir, latencies)
+        _write_fake_run(rep_dir, latencies, cell_id)
     return tmp_path, cells
 
 

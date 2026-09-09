@@ -36,7 +36,7 @@ def _request_line(scenario: str, time: str, latency_ms: float, status: int, requ
     )
 
 
-def _write_fake_run(rep_dir, latencies: list[float]) -> None:
+def _write_fake_run(rep_dir, latencies: list[float], cell_id: str) -> None:
     rep_dir.mkdir(parents=True, exist_ok=True)
     lines = []
     for i, latency in enumerate(latencies):
@@ -44,6 +44,9 @@ def _write_fake_run(rep_dir, latencies: list[float]) -> None:
         time = f"2026-01-01T00:02:{i % 60:02d}.000Z"
         lines.append(_request_line("measurement", time, latency, 200, request_id))
     (rep_dir / "requests.ndjson").write_text("\n".join(lines) + "\n")
+    # load_cell_latencies lê cell_id daqui, não da profundidade do caminho
+    # (analysis/report.py) — precisa existir mesmo em fixture sintética.
+    (rep_dir / "manifest.json").write_text(json.dumps({"cell_id": cell_id}))
 
 
 def _write_fake_storage_sizes(storage_root):
@@ -92,7 +95,7 @@ def _build_fake_results(tmp_path, phase="triagem"):
     }
     for cell_id, latencies in cells.items():
         rep_dir = tmp_path / cell_id / phase / "20260101T000000Z" / "rep0"
-        _write_fake_run(rep_dir, latencies)
+        _write_fake_run(rep_dir, latencies, cell_id)
     return tmp_path, cells
 
 
@@ -124,6 +127,31 @@ def test_load_cell_latencies_groups_by_cell(tmp_path):
 
     assert set(groups) == set(cells)
     assert len(groups["e1-postgres"]) == 100
+
+
+def test_confirmacao_combos_do_not_collide_on_the_same_rep_numbers(tmp_path):
+    """Regressão do bug real que derrubou e3-postgres em produção: a
+    confirmação varre 9 combinações (rate, tier), cada uma com suas 5
+    repetições. Sem o segmento <rate>-<tier>/ no caminho (load/run_battery.py:
+    combo_out_dir), a 2ª combinação sobrescreveria rep0..rep4 da 1ª —
+    localmente sem erro nenhum, e no bucket com 412 Precondition Failed
+    (load/upload_one_file.py, if_generation_match=0). Aqui simula 2
+    combinações da MESMA célula, MESMO timestamp, MESMOS números de
+    repetição (rep0), só o segmento de combo diferente — como
+    load/run_battery.py escreve de verdade — e confere que nenhuma
+    sobrescreve a outra e que ambas entram no pool da célula."""
+    base = tmp_path / "e3-postgres" / "confirmacao" / "20260101T000000Z"
+    _write_fake_run(base / "100-low" / "rep0", [5.0] * 10, "e3-postgres")
+    _write_fake_run(base / "10000-high" / "rep0", [50.0] * 10, "e3-postgres")
+
+    rep_dirs = discover_rep_dirs(tmp_path, "confirmacao")
+    assert len(rep_dirs) == 2  # nenhuma combinação sobrescreveu a outra
+
+    ensure_collected(rep_dirs)
+    groups = load_cell_latencies(rep_dirs)
+
+    assert len(groups["e3-postgres"]) == 20  # as 2 combinações, não só a última
+    assert sorted(groups["e3-postgres"]) == [5.0] * 10 + [50.0] * 10
 
 
 def test_build_report_rejects_h0_and_dunn_points_at_the_shifted_cell(tmp_path):

@@ -319,23 +319,48 @@ configurado **antes** da primeira VM.
 
 ```
 results/<cell>/<phase>/<timestamp>/
-├── saturation.json          # só na triagem — vazão de saturação (rampa curta)
-├── saturation_<tier>.json   # só na confirmação, um por seletividade
-├── resources.csv            # só na confirmação — CPU/memória/rede das 3 VMs a cada 5s
-└── rep<N>/
-    ├── manifest.json         # célula, taxa, seletividade, região/zona, timestamp, hash do commit
-    ├── requests.ndjson       # uma linha JSON por requisição (console.log de load/scenarios.js)
-    ├── k6-raw.json           # dump nativo do k6 (--out json=) — só diagnóstico
-    ├── latencies.parquet     # gerado por analysis/collect.py a partir de requests.ndjson
-    └── summary.json          # percentis/vazão/erro, calculado em Python sobre latencies.parquet
+├── saturation.json              # só na triagem — vazão de saturação (rampa curta)
+├── saturation_<tier>.json       # só na confirmação, um por seletividade
+├── resources.csv                # só na confirmação — CPU/memória/rede das 3 VMs a cada 5s
+└── rep<N>/                      # triagem: 1 única combinação (rate,tier) fixa — rep<N> direto
+    ...                          # confirmação: <rate>-<tier>/rep<N> — ver abaixo
 ```
+
+Dentro de cada diretório de repetição (`rep<N>/`, direto na triagem ou sob
+`<rate>-<tier>/` na confirmação):
+```
+manifest.json         # célula, taxa, seletividade, região/zona, timestamp, hash do commit
+requests.ndjson       # uma linha JSON por requisição (console.log de load/scenarios.js)
+latencies.parquet     # gerado por analysis/collect.py a partir de requests.ndjson
+summary.json          # percentis/vazão/erro, calculado em Python sobre latencies.parquet
+```
+
+Confirmação varre 9 combinações (3 taxas × 3 seletividades), cada uma com
+suas próprias 5 repetições — sem o segmento `<rate>-<tier>/`, todas as
+combinações cairiam nos mesmos 5 diretórios `rep0`..`rep4` sob o mesmo
+`<timestamp>`, cada combinação sobrescrevendo a anterior (bug real,
+detectado ao vivo: um upload individual por repetição — ver abaixo —
+começou a rejeitar a 2ª combinação com 412 Precondition Failed porque o
+objeto de `rep0` já existia no bucket, vindo da 1ª combinação. Localmente
+o mesmo bug era silencioso: sem erro nenhum, só perda de dados). A
+triagem nunca teve esse problema — só roda 1 combinação fixa
+(`TRIAGEM_RATE`/`TRIAGEM_TIER`), então `analysis/report.py` continua
+descobrindo `rep<N>/` em qualquer profundidade (`**/rep*/requests.ndjson`),
+sem depender de quantos níveis existem entre `<timestamp>` e `rep<N>`; o
+`cell_id` de cada repetição vem de `manifest.json`, nunca da profundidade
+do caminho.
 
 `manifest.json` inclui o **hash do commit** — se a implementação mudar no
 meio de uma bateria, é o que permite saber quais medições vieram de qual
 versão. `requests.ndjson` nunca deve ser lido à mão (centenas de milhares de
 linhas numa bateria real); é insumo de `analysis/collect.py`, chamado
-automaticamente por `analysis/report.py`. `k6-raw.json` é só a saída nativa
-de diagnóstico do próprio k6 — nada no pipeline o lê.
+automaticamente por `analysis/report.py`. `k6-raw.json` (saída nativa de
+diagnóstico do k6, `--out json=...`) não fica mais no disco: cada repetição
+sobe o seu pro bucket (`load/upload_one_file.py`) e apaga a cópia local
+assim que o k6 termina — em carga alta ele passa de ~5GB por repetição, e
+sem essa limpeza incremental já encheu o disco da loadgen e derrubou uma
+medição real com "no space left on device". Nada no pipeline de análise o
+lê de volta.
 
 `analysis/report.py results --phase <triagem|confirmacao> --out
 results/report/<phase>` agrega as repetições ainda não coletadas por célula,

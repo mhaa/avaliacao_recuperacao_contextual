@@ -13,6 +13,7 @@ from load.run_battery import (
     build_k6_cmd,
     build_probe_k6_cmd,
     build_run_plan,
+    combo_out_dir,
     list_viable_cell_ids,
     shuffled_cell_order,
     target_url_for,
@@ -46,6 +47,27 @@ def test_shuffled_cell_order_is_a_permutation_not_a_subset():
 def test_build_run_plan_runs_all_repetitions_of_a_cell_before_the_next():
     plan = build_run_plan(["a", "b"], repetitions=3)
     assert plan == [("a", 0), ("a", 1), ("a", 2), ("b", 0), ("b", 1), ("b", 2)]
+
+
+def test_combo_out_dir_triagem_has_no_combo_segment():
+    # Triagem só roda 1 combinação fixa — sem risco de colisão, mantém o
+    # layout antigo (results já coletados dependem disso).
+    out_dir = combo_out_dir(Path("results"), "e1-postgres", "triagem", "20260101T000000Z", 1000, "medium", 2)
+    assert out_dir == Path("results/e1-postgres/triagem/20260101T000000Z/rep2")
+
+
+def test_combo_out_dir_confirmacao_segregates_by_rate_and_tier():
+    # Bug real: sem o segmento <rate>-<tier>/, as 9 combinações da
+    # confirmação cairiam todas nos mesmos rep0..rep4, cada uma
+    # sobrescrevendo a repetição da anterior.
+    out_dir = combo_out_dir(Path("results"), "e3-postgres", "confirmacao", "20260101T000000Z", 10000, "high", 0)
+    assert out_dir == Path("results/e3-postgres/confirmacao/20260101T000000Z/10000-high/rep0")
+
+
+def test_combo_out_dir_confirmacao_different_combos_never_collide():
+    a = combo_out_dir(Path("results"), "e3-postgres", "confirmacao", "20260101T000000Z", 100, "low", 0)
+    b = combo_out_dir(Path("results"), "e3-postgres", "confirmacao", "20260101T000000Z", 10000, "high", 0)
+    assert a != b
 
 
 def test_target_url_for_uses_per_cell_mapping_when_given():

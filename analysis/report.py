@@ -220,11 +220,16 @@ EQUIVALENCE_MARGIN_MS = 10.0
 def discover_rep_dirs(results_root: Path, phase: str) -> list[Path]:
     # requests.ndjson, não k6-raw.json: é o arquivo que analysis/collect.py
     # de fato lê agora (console.log de load/scenarios.js, uma linha por
-    # requisição) — k6-raw.json (saída nativa --out json= do k6) continua
-    # sendo gravado, mas nada mais o lê.
+    # requisição) — k6-raw.json não fica mais no disco (load/upload_one_file.py
+    # sobe e apaga cada um logo após a repetição).
+    # "**" (não "*/*"): triagem grava rep<N>/ direto sob <timestamp>/, mas
+    # confirmação grava sob <timestamp>/<rate>-<tier>/rep<N>/ (um nível a mais
+    # — load/run_battery.py:combo_out_dir, docs/ARCHITECTURE.md) para as 9
+    # combinações não caírem nos mesmos 5 diretórios. "**" casa as duas
+    # profundidades sem este código precisar saber qual é qual.
     return sorted(
         p.parent
-        for p in results_root.glob(f"*/{phase}/*/rep*/requests.ndjson")
+        for p in results_root.glob(f"*/{phase}/**/rep*/requests.ndjson")
     )
 
 
@@ -260,11 +265,15 @@ def load_cell_saturation(results_root: Path, phase: str) -> dict[str, dict]:
 
 
 def load_cell_latencies(rep_dirs: list[Path]) -> dict[str, list[float]]:
-    """Agrupa por cell_id (results/<cell_id>/<phase>/<timestamp>/rep<N>/),
-    concatenando latency_ms de todas as repetições daquela célula."""
+    """Agrupa por cell_id, concatenando latency_ms de todas as repetições
+    daquela célula — na triagem, de results/<cell_id>/<phase>/<timestamp>/
+    rep<N>/; na confirmação, de .../<timestamp>/<rate>-<tier>/rep<N>/ (um
+    nível a mais, load/run_battery.py:combo_out_dir). cell_id vem de
+    manifest.json, não da profundidade do caminho — as duas layouts
+    convivem sem este código precisar saber qual é qual."""
     by_cell: dict[str, list[float]] = {}
     for rep_dir in rep_dirs:
-        cell_id = rep_dir.parents[2].name
+        cell_id = json.loads((rep_dir / "manifest.json").read_text())["cell_id"]
         df = pl.read_parquet(rep_dir / "latencies.parquet")
         by_cell.setdefault(cell_id, []).extend(df["latency_ms"].to_list())
     return by_cell

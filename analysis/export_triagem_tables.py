@@ -215,7 +215,12 @@ def export(results_root: Path, phase: str, out_dir: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results_root", type=Path)
-    parser.add_argument("--phase", required=True, choices=["triagem", "confirmacao"])
+    # Só "triagem": os nomes de arquivo abaixo são fixos "triagem_*.csv"
+    # independente da fase, e _rep_summaries/_run_timestamp_of assumem o
+    # layout rep<N> direto sob <timestamp> (sem o <rate>-<tier>/ extra da
+    # confirmação, load/run_battery.py:combo_out_dir) — "confirmacao" nunca
+    # funcionou de verdade aqui, era uma opção morta.
+    parser.add_argument("--phase", required=True, choices=["triagem"])
     parser.add_argument("--out", type=Path, default=Path("docs/resultados_triagem"))
     args = parser.parse_args(argv)
     export(args.results_root, args.phase, args.out)
