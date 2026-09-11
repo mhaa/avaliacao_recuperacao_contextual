@@ -89,8 +89,18 @@ from infra.scripts.cloud_smoke_test import (
 from load.run_battery import build_probe_k6_cmd
 from load.saturation import GENERATOR_CPU_THRESHOLD, ProbeResult, run_saturation_search
 
-# docs/DESIGN.md, "Protocolo de medição".
-RATES = [100, 1_000, 10_000]
+# docs/DESIGN.md, "Protocolo de medição". Só os dois primeiros níveis são
+# fixos — o 3º nível ("alto") da confirmação não é mais um valor fixo (era
+# 10_000): passa a ser a vazão de saturação medida pela própria rampa de
+# confirmação de cada seletividade (main(), high_rate_by_tier), porque
+# 10.000 req/s já testava direto a região de falha profunda para as células
+# medidas, sem discriminar nada. build_sweep() monta o 3º nível a partir daí.
+FIXED_LOAD_LEVELS = [100, 1_000]
+# Fallback só para o caso raro de uma rampa de confirmação terminar em
+# gargalo do gerador (loadgen_bottleneck=True) sem nenhum S nem lower_bound
+# utilizável — sem isso o nível "alto" dessa seletividade ficaria sem valor.
+# Ver _high_rate_from_saturation.
+LEGACY_HIGH_RATE_FALLBACK = 10_000
 SELECTIVITY_TIERS = ["high", "medium", "low"]
 # docs/DESIGN.md, "Parâmetros fixos": U da medição principal — a base real
 # completa do MovieLens 32M, que é o que build_remote_setup_command carrega
@@ -151,12 +161,42 @@ DEFAULT_MEMORY_MB_BY_COMPONENT = {
 RESOURCE_SAMPLE_INTERVAL_SECONDS = 5
 
 
-def build_sweep(phase: str) -> list[tuple[int, str]]:
+def build_sweep(
+    phase: str, high_rate_by_tier: dict[str, int] | None = None
+) -> list[tuple[int, str]]:
     if phase == "triagem":
         return [(TRIAGEM_RATE, TRIAGEM_TIER)]
     if phase == "confirmacao":
-        return [(rate, tier) for rate in RATES for tier in SELECTIVITY_TIERS]
+        if high_rate_by_tier is None:
+            raise ValueError(
+                "build_sweep('confirmacao') exige high_rate_by_tier — o nível de carga "
+                "'alto' vem da rampa de confirmação de cada seletividade, rodada antes."
+            )
+        return [(rate, tier) for rate in FIXED_LOAD_LEVELS for tier in SELECTIVITY_TIERS] + [
+            (high_rate_by_tier[tier], tier) for tier in SELECTIVITY_TIERS
+        ]
     raise ValueError(f"fase desconhecida: {phase!r}")
+
+
+def _high_rate_from_saturation(saturation: SaturationSearchResult, tier: str) -> int:
+    """Deriva o nível de carga 'alto' da confirmação a partir da rampa de
+    saturação daquela seletividade (docs/DESIGN.md, "Protocolo de medição").
+    Caso normal: o S aproximado. Célula censurada nessa seletividade: usa o
+    lower_bound — por definição a rampa não violou o SLO até esse teto, ainda
+    não é região de falha. Gargalo do gerador (nem approx nem lower_bound
+    utilizável): não há nenhum S confiável dessa rampa — cai no fallback fixo
+    antigo, com aviso explícito (caso raro numa célula que já passou pela
+    triagem, mas sem isso o nível 'alto' ficaria sem valor)."""
+    if saturation.approx_throughput is not None:
+        return round(saturation.approx_throughput)
+    if saturation.lower_bound is not None:
+        return round(saturation.lower_bound)
+    print(
+        f"AVISO: rampa de confirmação da seletividade {tier} não obteve S nem lower_bound "
+        f"(gargalo do gerador) — usando fallback fixo de {LEGACY_HIGH_RATE_FALLBACK} req/s "
+        "como nível de carga 'alto' dessa seletividade."
+    )
+    return LEGACY_HIGH_RATE_FALLBACK
 
 
 def shuffled_sweep(sweep: list[tuple[int, str]], seed: int) -> list[tuple[int, str]]:
@@ -889,8 +929,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     storage = storage_for_cell(args.cell)
-    sweep = shuffled_sweep(build_sweep(args.phase), args.seed)
-    print(f"sweep embaralhado (seed={args.seed}, fase={args.phase}): {sweep}")
+    if args.phase == "triagem":
+        sweep = shuffled_sweep(build_sweep(args.phase), args.seed)
+        print(f"sweep embaralhado (seed={args.seed}, fase={args.phase}): {sweep}")
+        billable_combo_count = len(sweep)
+    else:
+        # Confirmação: o sweep depende do nível "alto" de cada seletividade,
+        # só conhecido depois das 3 rampas de saturação (mais abaixo, antes
+        # do laço da bateria) — a contagem em si (não os valores) já é fixa.
+        sweep = None
+        billable_combo_count = len(SELECTIVITY_TIERS) * (len(FIXED_LOAD_LEVELS) + 1)
 
     # Reuso de snapshot de disco (infra/scripts/seed_dataset_snapshots.py) —
     # a carga completa é idêntica entre todas as células de uma mesma
@@ -929,9 +977,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _confirm_billable(
             f"terraform apply da célula '{args.cell}' em {args.project_id}/{args.region} vai "
-            f"criar VMs reais (banco + serviço + loadgen) e rodar {len(sweep)} combinação(ões) "
-            f"de carga/seletividade x {args.repetitions} repetições, mais a busca de vazão de "
-            "saturação — pode levar horas e cobra o tempo todo.",
+            f"criar VMs reais (banco + serviço + loadgen) e rodar {billable_combo_count} "
+            f"combinação(ões) de carga/seletividade x {args.repetitions} repetições, mais a "
+            "busca de vazão de saturação — pode levar horas e cobra o tempo todo.",
             auto_approve=args.yes,
         )
         applied = True
@@ -1074,6 +1122,41 @@ def main(argv: list[str] | None = None) -> int:
             )
             sampling_thread.start()
 
+            # As 3 rampas de saturação rodam ANTES da bateria de carga fixa —
+            # o nível "alto" dela (build_sweep) vem diretamente daqui, uma
+            # vazão por seletividade (docs/DESIGN.md, "Rampa de confirmação").
+            high_rate_by_tier: dict[str, int] = {}
+            for tier in SELECTIVITY_TIERS:
+                print(f"\n--- rampa de confirmação de saturação — seletividade {tier} ---")
+                probe_fn = make_probe_fn(
+                    args.cell,
+                    target_url,
+                    tier,
+                    CONFIRMATION_WARMUP,
+                    CONFIRMATION_MEASURE,
+                    loadgen_instance,
+                    args.zone,
+                    args.project_id,
+                    tools_image,
+                    RESULTS_MOUNT,
+                    FIXTURES_MOUNT,
+                    label=f"confirm-{tier}",
+                    repetitions=CONFIRMATION_REPETITIONS,
+                    results_bucket=args.results_bucket,
+                    user_count=args.user_count,
+                )
+                saturation = run_saturation_search(
+                    probe_fn, start_rate=int(args.saturation_start), step_mode="fine"
+                )
+                _report_saturation(saturation, label=tier)
+                _write_saturation_json(
+                    saturation, args.cell, args.phase, timestamp, filename=f"saturation_{tier}.json"
+                )
+                high_rate_by_tier[tier] = _high_rate_from_saturation(saturation, tier)
+
+            sweep = shuffled_sweep(build_sweep(args.phase, high_rate_by_tier), args.seed)
+            print(f"sweep embaralhado (seed={args.seed}, fase={args.phase}): {sweep}")
+
         if args.only_saturation:
             print(
                 "\n--- --only-saturation: bateria de carga fixa PULADA "
@@ -1133,33 +1216,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             _report_saturation(saturation)
             _write_saturation_json(saturation, args.cell, args.phase, timestamp)
-        else:
-            for tier in SELECTIVITY_TIERS:
-                print(f"\n--- rampa de confirmação de saturação — seletividade {tier} ---")
-                probe_fn = make_probe_fn(
-                    args.cell,
-                    target_url,
-                    tier,
-                    CONFIRMATION_WARMUP,
-                    CONFIRMATION_MEASURE,
-                    loadgen_instance,
-                    args.zone,
-                    args.project_id,
-                    tools_image,
-                    RESULTS_MOUNT,
-                    FIXTURES_MOUNT,
-                    label=f"confirm-{tier}",
-                    repetitions=CONFIRMATION_REPETITIONS,
-                    results_bucket=args.results_bucket,
-                    user_count=args.user_count,
-                )
-                saturation = run_saturation_search(
-                    probe_fn, start_rate=int(args.saturation_start), step_mode="fine"
-                )
-                _report_saturation(saturation, label=tier)
-                _write_saturation_json(
-                    saturation, args.cell, args.phase, timestamp, filename=f"saturation_{tier}.json"
-                )
 
         if sampling_thread is not None:
             stop_sampling.set()

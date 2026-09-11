@@ -8,12 +8,16 @@ from __future__ import annotations
 import json
 import threading
 
+import pytest
+
 from infra.scripts.run_measurement_battery import (
-    RATES,
+    FIXED_LOAD_LEVELS,
+    LEGACY_HIGH_RATE_FALLBACK,
     SELECTIVITY_TIERS,
     TRIAGEM_RATE,
     TRIAGEM_TIER,
     _duration_seconds,
+    _high_rate_from_saturation,
     _parse_probe_result,
     _write_saturation_json,
     build_remote_battery_command,
@@ -26,30 +30,76 @@ from infra.scripts.run_measurement_battery import (
 )
 from load.saturation import ProbeResult, SaturationSearchResult
 
+# Vazão de saturação fictícia por seletividade — mesmo papel do
+# high_rate_by_tier real de main() (vem das 3 rampas de confirmação), só que
+# fixado aqui para os testes não dependerem de nenhuma medição.
+_HIGH_RATE_BY_TIER = {"high": 4587, "medium": 3672, "low": 3317}
+
 
 def test_build_sweep_triagem_is_a_single_mid_level_combination():
     assert build_sweep("triagem") == [(TRIAGEM_RATE, TRIAGEM_TIER)]
 
 
 def test_build_sweep_confirmacao_is_the_full_cross_product():
-    sweep = build_sweep("confirmacao")
-    assert len(sweep) == len(RATES) * len(SELECTIVITY_TIERS)
-    assert set(sweep) == {(rate, tier) for rate in RATES for tier in SELECTIVITY_TIERS}
+    sweep = build_sweep("confirmacao", _HIGH_RATE_BY_TIER)
+    assert len(sweep) == (len(FIXED_LOAD_LEVELS) + 1) * len(SELECTIVITY_TIERS)
+    expected_fixed = {(rate, tier) for rate in FIXED_LOAD_LEVELS for tier in SELECTIVITY_TIERS}
+    expected_high = {(_HIGH_RATE_BY_TIER[tier], tier) for tier in SELECTIVITY_TIERS}
+    assert set(sweep) == expected_fixed | expected_high
+
+
+def test_build_sweep_confirmacao_uses_the_per_tier_high_rate_not_a_fixed_value():
+    # Bug real que este teste evita: um "10.000" fixo continuaria testando
+    # direto a região de falha, ignorando a vazão de saturação medida.
+    sweep = build_sweep("confirmacao", _HIGH_RATE_BY_TIER)
+    for tier, high_rate in _HIGH_RATE_BY_TIER.items():
+        assert (high_rate, tier) in sweep
+
+
+def test_build_sweep_confirmacao_requires_high_rate_by_tier():
+    with pytest.raises(ValueError):
+        build_sweep("confirmacao")
 
 
 def test_shuffled_sweep_is_deterministic_given_the_same_seed():
-    sweep = build_sweep("confirmacao")
+    sweep = build_sweep("confirmacao", _HIGH_RATE_BY_TIER)
     assert shuffled_sweep(sweep, seed=1) == shuffled_sweep(sweep, seed=1)
 
 
 def test_shuffled_sweep_differs_across_seeds():
-    sweep = build_sweep("confirmacao")
+    sweep = build_sweep("confirmacao", _HIGH_RATE_BY_TIER)
     assert shuffled_sweep(sweep, seed=1) != shuffled_sweep(sweep, seed=2)
 
 
 def test_shuffled_sweep_is_a_permutation_not_a_subset():
-    sweep = build_sweep("confirmacao")
+    sweep = build_sweep("confirmacao", _HIGH_RATE_BY_TIER)
     assert sorted(shuffled_sweep(sweep, seed=7)) == sorted(sweep)
+
+
+def _fake_saturation(approx_throughput=None, lower_bound=None, loadgen_bottleneck=False):
+    return SaturationSearchResult(
+        approx_throughput=approx_throughput,
+        censored=lower_bound is not None and approx_throughput is None,
+        lower_bound=lower_bound,
+        loadgen_bottleneck=loadgen_bottleneck,
+        generator_cpu_unmeasured=False,
+        probes=[],
+    )
+
+
+def test_high_rate_from_saturation_uses_approx_throughput_when_available():
+    saturation = _fake_saturation(approx_throughput=3791.4)
+    assert _high_rate_from_saturation(saturation, "high") == 3791
+
+
+def test_high_rate_from_saturation_falls_back_to_lower_bound_when_censored():
+    saturation = _fake_saturation(approx_throughput=None, lower_bound=50_000)
+    assert _high_rate_from_saturation(saturation, "high") == 50_000
+
+
+def test_high_rate_from_saturation_falls_back_to_legacy_rate_on_generator_bottleneck():
+    saturation = _fake_saturation(approx_throughput=None, lower_bound=None, loadgen_bottleneck=True)
+    assert _high_rate_from_saturation(saturation, "high") == LEGACY_HIGH_RATE_FALLBACK
 
 
 def test_build_remote_battery_command_includes_rate_and_tier():

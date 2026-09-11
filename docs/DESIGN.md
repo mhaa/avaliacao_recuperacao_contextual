@@ -154,7 +154,13 @@ Resposta: lista ordenada de k itens, cada um com `item_id`, `score`, `rank`.
 
 ## Protocolo de medição
 
-- Carga: 100, 1.000 e 10.000 req/s.
+- Carga: 100 e 1.000 req/s fixos, mais um terceiro nível "alto" que, na
+  confirmação, deixou de ser um valor fixo (era 10.000 req/s) — passa a ser a
+  vazão de saturação aproximada medida pela própria rampa de confirmação
+  daquela seletividade (uma por seletividade, ver "Rampa de confirmação"
+  abaixo). Motivo: 10.000 req/s já estava bem além do ponto de saturação real
+  das células medidas, testando só a região de falha profunda (violação de
+  SLO praticamente garantida) em vez de um ponto que discrimine células.
 - SLO: p99 > 200 ms ou taxa de erro > 1%.
 - Seletividade do predicado: ~2%, ~20%, ~60% dos candidatos sobrevivem.
 - Distribuição de acesso: Zipf com expoente 1,0 (não uniforme), **sobre a base
@@ -227,12 +233,17 @@ custo. Daí o protocolo abaixo.
   (`analysis/pareto.py`).
 
 **Rampa de confirmação** — só nas células não dominadas (fronteira):
+- Roda **antes** da bateria de carga fixa (100/1.000/"alto") — não é só uma
+  questão de ordem: o resultado dela alimenta diretamente o nível "alto"
+  dessa bateria (ver "Protocolo de medição" acima), então a dependência é de
+  dados, não só de sequência.
 - 5 repetições por patamar, em ordem aleatorizada.
 - Patamares finos: incrementos de 10% na vizinhança do valor aproximado
   obtido na triagem (ou do `saturation_lower_bound`, se a célula ficou
   censurada).
 - 2 min de aquecimento descartado + 3 min de medição por patamar.
-- Roda nos três patamares de seletividade.
+- Roda nos três patamares de seletividade, uma rampa por seletividade —
+  produz uma vazão de saturação por seletividade, não uma única para as três.
 - Saída com distribuição completa (não só o ponto de violação) e intervalo
   de confiança por bootstrap.
 
@@ -266,8 +277,9 @@ Reportar também a magnitude do efeito.
    a vazão de saturação internalizada no custo (`analysis/pareto.py`). A
    fronteira é calculada uma vez — não depende de uma demanda externa — e
    segue inteira para a confirmação.
-2. **Confirmação** — só as células da fronteira, com varredura completa de
-   seletividade e carga e as 5 repetições, mais a rampa de confirmação.
+2. **Confirmação** — só as células da fronteira: primeiro a rampa de
+   confirmação (uma por seletividade, determina o nível de carga "alto"),
+   depois a varredura completa de seletividade e carga com as 5 repetições.
 
 ### Regra de tolerância na dominância (propagação da incerteza de S)
 
