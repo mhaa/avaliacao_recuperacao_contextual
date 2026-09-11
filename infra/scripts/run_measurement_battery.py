@@ -726,18 +726,27 @@ def make_probe_fn(
     results_bucket: str | None = None,
     *,
     user_count: int,
+    run_timestamp: str,
 ) -> Callable[[int], ProbeResult]:
     """Fecha sobre o contexto de rede/infra de uma célula e devolve um
     probe_fn(rate) -> ProbeResult para load.saturation.run_saturation_search
     — cada chamada roda a sondagem remota via SSH e lê o veredito inteiro
     (SLO + p99/error_rate + CPU do gerador) de uma única linha PROBE_RESULT
     impressa por analysis/probe_report.py dentro do container (CPU vem de
-    /proc/stat lido na própria VM, não do Cloud Monitoring)."""
+    /proc/stat lido na própria VM, não do Cloud Monitoring).
+
+    run_timestamp entra no path _saturation/ porque probe_id (label+contador+
+    rate) é determinístico entre execuções — um retry após falha no meio da
+    rampa gera o MESMO probe_id da tentativa anterior. Sem o timestamp, o
+    upload do retry colide com o k6-raw.json já enviado pela tentativa
+    falha (upload_one_file.py usa if_generation_match=0, então rejeita com
+    412 em vez de sobrescrever silenciosamente) — confirmado ao vivo no
+    retry de e3-valkey."""
     counter = itertools.count()
 
     def probe_fn(rate: int) -> ProbeResult:
         probe_id = f"{label}-{next(counter)}-{rate}"
-        remote_subdir = f"_saturation/{cell_id}/{probe_id}"
+        remote_subdir = f"_saturation/{cell_id}/{run_timestamp}/{probe_id}"
 
         remote_cmd = build_remote_probe_command(
             cell_id,
@@ -1144,6 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
                     repetitions=CONFIRMATION_REPETITIONS,
                     results_bucket=args.results_bucket,
                     user_count=args.user_count,
+                    run_timestamp=timestamp,
                 )
                 saturation = run_saturation_search(
                     probe_fn, start_rate=int(args.saturation_start), step_mode="fine"
@@ -1207,6 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
                 repetitions=1,
                 results_bucket=args.results_bucket,
                 user_count=args.user_count,
+                run_timestamp=timestamp,
             )
             saturation = run_saturation_search(
                 probe_fn,
