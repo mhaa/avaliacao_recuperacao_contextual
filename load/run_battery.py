@@ -345,6 +345,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-url")
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument(
+        "--repetition-index",
+        type=int,
+        default=None,
+        help="roda só esta repetição específica (ignora --repetitions) em vez de 0..N-1 — "
+        "usado por infra/scripts/run_measurement_battery.py para invocar uma repetição por "
+        "vez, cada uma na sua própria sessão SSH (uma queda de conexão no meio de uma "
+        "combinação inteira, encadeando N repetições numa sessão só, perdia todas as já "
+        "rodadas nela — confirmado ao vivo 2x contra e3-valkey).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--phase", default="triagem", choices=["triagem", "confirmacao", "smoke"]
@@ -406,7 +416,12 @@ def main(argv: list[str] | None = None) -> int:
     targets = json.loads(args.targets.read_text()) if args.targets else None
     timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    for cell_id, repetition in build_run_plan(order, args.repetitions):
+    run_plan = (
+        [(cell_id, args.repetition_index) for cell_id in order]
+        if args.repetition_index is not None
+        else build_run_plan(order, args.repetitions)
+    )
+    for cell_id, repetition in run_plan:
         url = target_url_for(cell_id, args.target_url, targets)
         out_dir = combo_out_dir(RESULTS_DIR, cell_id, args.phase, timestamp, args.rate, args.selectivity_tier, repetition)
         run_k6(

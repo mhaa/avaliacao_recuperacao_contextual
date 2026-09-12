@@ -78,6 +78,7 @@ from infra.scripts.cloud_smoke_test import (
     build_storage_env_flags,
     fetch_terraform_access_token,
     gcloud_ssh,
+    gcloud_ssh_with_retry,
     resource_snapshot,
     restart_container,
     storage_for_cell,
@@ -334,7 +335,7 @@ def build_remote_battery_command(
     phase: str,
     rate: int,
     tier: str,
-    repetitions: int,
+    repetition_index: int,
     tools_image: str,
     results_mount: str,
     fixtures_mount: str,
@@ -354,7 +355,13 @@ def build_remote_battery_command(
     gerou, sem reexportar em toda combinação de carga/seletividade.
     `--timestamp` fixo faz todas as combinações desta execução caírem no
     mesmo results/<cell>/<phase>/<timestamp>/, no mesmo diretório onde
-    _write_saturation_json também escreve saturation.json."""
+    _write_saturation_json também escreve saturation.json.
+
+    `--repetitions 1 --repetition-index N`, não `--repetitions N`: cada
+    chamada roda EXATAMENTE uma repetição — o chamador (main()) faz uma
+    sessão SSH por repetição via gcloud_ssh_with_retry, em vez de encadear
+    todas numa sessão só (uma queda de conexão no meio perdia a combinação
+    inteira, confirmado ao vivo 2x contra e3-valkey)."""
     battery_argv = [
         "load/run_battery.py",
         "--cells",
@@ -364,7 +371,9 @@ def build_remote_battery_command(
         "--phase",
         phase,
         "--repetitions",
-        str(repetitions),
+        "1",
+        "--repetition-index",
+        str(repetition_index),
         "--rate",
         str(rate),
         "--selectivity-tier",
@@ -405,7 +414,11 @@ def build_remote_battery_command(
     return shlex.join(docker_argv)
 
 
-def build_remote_probe_command(
+def _probe_stat_path(remote_subdir: str, when: str) -> str:
+    return f"/app/results/{remote_subdir}/{when}_stat.txt"
+
+
+def build_remote_probe_rep_command(
     cell_id: str,
     target_url: str,
     tier: str,
@@ -416,71 +429,115 @@ def build_remote_probe_command(
     results_mount: str,
     fixtures_mount: str,
     remote_subdir: str,
-    repetitions: int,
+    rep: int,
+    capture_before_stat: bool,
+    capture_after_stat: bool,
     results_bucket: str | None = None,
     *,
     user_count: int,
 ) -> str:
-    """Sondagem de um único patamar da busca de saturação
-    (load/saturation.py) — roda k6 (PROBE_MODE) `repetitions` vezes (1 na
-    rampa curta, 5 na de confirmação) e consolida com
-    analysis/probe_report.py na MESMA invocação de container: evita expor
-    polars ao host (só o resultado de uma linha `PROBE_RESULT ...` volta
-    via stdout do SSH, capturado por _parse_probe_result). As duas leituras
-    de /proc/stat (antes do 1º k6, depois do último) cercam só a geração de
-    carga e são repassadas por variável de ambiente para
-    analysis/probe_report.py, que calcula e imprime a CPU do gerador na
-    MESMA linha PROBE_RESULT — sem consultar o Cloud Monitoring (ver
-    docstring de analysis/probe_report.py:_cpu_percent_from_stat)."""
-    steps: list[str] = ['BEFORE_STAT="$(cat /proc/stat | head -1)"']
-    ndjson_paths: list[str] = []
-    for rep in range(repetitions):
-        rep_dir = f"/app/results/{remote_subdir}/rep{rep}"
-        json_out = f"{rep_dir}/k6-raw.json"
-        # requests.ndjson, não k6-raw.json: analysis/probe_report.py lê o
-        # NDJSON que load/scenarios.js escreve via console.log() por
-        # requisição (build_probe_k6_cmd deriva esse nome do mesmo
-        # json_out) — ver load/run_battery.py:build_probe_k6_cmd.
-        ndjson_paths.append(f"{rep_dir}/requests.ndjson")
-        # k6 não cria o diretório de --out sozinho (diferente de
-        # load/run_battery.py:run_k6, que faz out_dir.mkdir(parents=True)
-        # em Python antes de chamar o k6) — confirmado ao vivo: "open
-        # .../k6-raw.json: no such file or directory" na 1ª sondagem de
-        # saturação real, um caminho _saturation/<cell>/<probe>/rep<N>/
-        # nunca criado antes.
-        steps.append(shlex.join(["mkdir", "-p", rep_dir]))
-        k6_argv = build_probe_k6_cmd(
-            json_out, cell_id, target_url, rate, tier, warmup, measure, user_count=user_count
+    """Uma repetição de uma sondagem da busca de saturação
+    (load/saturation.py) — antes, TODAS as repetições de uma sondagem
+    rodavam encadeadas numa única sessão SSH (`&&` num só `docker run`); uma
+    queda de conexão no meio perdia a sondagem inteira, confirmado ao vivo
+    2x contra e3-valkey. Agora cada repetição é sua própria sessão
+    (chamador: make_probe_fn, via gcloud_ssh_with_retry) — perder uma
+    tentativa custa só ela, não as repetições anteriores (já persistidas em
+    /app/results, que sobrevive entre invocações `docker run --rm`).
+
+    capture_before_stat/capture_after_stat: só a 1ª e a última repetição leem
+    /proc/stat, gravando num arquivo (não variável de ambiente — não
+    sobrevive entre sessões SSH separadas) para
+    build_remote_probe_aggregate_command ler depois e calcular a CPU do
+    gerador ao longo da sondagem inteira."""
+    rep_dir = f"/app/results/{remote_subdir}/rep{rep}"
+    json_out = f"{rep_dir}/k6-raw.json"
+    steps: list[str] = []
+    if capture_before_stat:
+        steps.append(f"cat /proc/stat | head -1 > {_probe_stat_path(remote_subdir, 'before')}")
+    # k6 não cria o diretório de --out sozinho (diferente de
+    # load/run_battery.py:run_k6, que faz out_dir.mkdir(parents=True) em
+    # Python antes de chamar o k6) — confirmado ao vivo: "open
+    # .../k6-raw.json: no such file or directory" na 1ª sondagem de
+    # saturação real, um caminho _saturation/<cell>/<probe>/rep<N>/ nunca
+    # criado antes.
+    steps.append(shlex.join(["mkdir", "-p", rep_dir]))
+    k6_argv = build_probe_k6_cmd(
+        json_out, cell_id, target_url, rate, tier, warmup, measure, user_count=user_count
+    )
+    steps.append(shlex.join(str(a) for a in k6_argv))
+    if results_bucket:
+        # Sobe k6-raw.json e apaga a cópia local logo em seguida — sem isto
+        # o disco da loadgen acumula um k6-raw.json por repetição de CADA
+        # sondagem até o fim da busca inteira. Confirmado ao vivo: ~5GB por
+        # repetição em patamares de carga alta encheu o disco de 100GB e
+        # derrubou e3-postgres com "no space left on device" na rampa fina
+        # de confirmação.
+        blob_name = f"{remote_subdir}/rep{rep}/k6-raw.json"
+        steps.append(
+            shlex.join(["python", "load/upload_one_file.py", json_out, results_bucket, blob_name])
         )
-        steps.append(shlex.join(str(a) for a in k6_argv))
-        if results_bucket:
-            # Sobe k6-raw.json e apaga a cópia local logo após ESTA
-            # repetição — a busca de saturação encadeia todas as
-            # repetições de todas as sondagens numa única invocação de
-            # container (steps unidos por &&), então sem isto o disco da
-            # loadgen acumula um k6-raw.json por repetição de CADA
-            # sondagem até o fim da busca inteira. Confirmado ao vivo:
-            # ~5GB por repetição em patamares de carga alta encheu o disco
-            # de 100GB e derrubou e3-postgres com "no space left on
-            # device" na rampa fina de confirmação.
-            blob_name = f"{remote_subdir}/rep{rep}/k6-raw.json"
-            steps.append(
-                shlex.join(["python", "load/upload_one_file.py", json_out, results_bucket, blob_name])
-            )
-            steps.append(shlex.join(["rm", "-f", json_out]))
-    steps.append('AFTER_STAT="$(cat /proc/stat | head -1)"')
+        steps.append(shlex.join(["rm", "-f", json_out]))
+    if capture_after_stat:
+        steps.append(f"cat /proc/stat | head -1 > {_probe_stat_path(remote_subdir, 'after')}")
+    inner = " && ".join(steps)
+
+    docker_argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        "-v",
+        f"{results_mount}:/app/results",
+        "-v",
+        f"{fixtures_mount}:/app/load/fixtures:ro",
+        "--entrypoint",
+        "bash",
+        tools_image,
+        "-c",
+        inner,
+    ]
+    return shlex.join(docker_argv)
+
+
+def build_remote_probe_aggregate_command(
+    remote_subdir: str,
+    repetitions: int,
+    rate: int,
+    measure: str,
+    tools_image: str,
+    results_mount: str,
+    fixtures_mount: str,
+) -> str:
+    """Consolida as `repetitions` já rodadas por build_remote_probe_rep_command
+    com analysis/probe_report.py, na sessão SSH final e separada da
+    sondagem — evita expor polars ao host (só o resultado de uma linha
+    `PROBE_RESULT ...` volta via stdout do SSH, capturado por
+    _parse_probe_result). Lê as duas leituras de /proc/stat que as
+    repetições extremas gravaram em arquivo (build_remote_probe_rep_command:
+    capture_before_stat/capture_after_stat) — variável de ambiente não
+    sobrevive entre sessões SSH separadas, arquivo em /app/results sim."""
+    ndjson_paths = [
+        f"/app/results/{remote_subdir}/rep{rep}/requests.ndjson" for rep in range(repetitions)
+    ]
     # taxa × janela de medição × repetições: o que o constant-arrival-rate
     # DEVERIA ter emitido nos cenários 'probe' (o warmup fica de fora — a
     # coleta filtra por scenario='probe'). Um déficit além do limiar de
     # analysis/collect.py:MIN_OFFERED_RATIO vira violated_slo=True no
     # veredito (docs/DESIGN.md, "Vazão ofertada verificada, não presumida").
     expected_requests = rate * _duration_seconds(measure) * repetitions
-    steps.append(
+    # BEFORE_STAT/AFTER_STAT como atribuições próprias (separadas por &&, não
+    # no mesmo prefixo de comando do python): mesmo padrão já usado antes de
+    # dividir esta função — evita depender de expansão sequencial dentro de
+    # uma única lista de atribuições-prefixo, que não é garantida.
+    inner = (
+        f'BEFORE_STAT="$(cat {_probe_stat_path(remote_subdir, "before")})" && '
+        f'AFTER_STAT="$(cat {_probe_stat_path(remote_subdir, "after")})" && '
         'GENERATOR_CPU_STAT_BEFORE="$BEFORE_STAT" GENERATOR_CPU_STAT_AFTER="$AFTER_STAT" '
         "python analysis/probe_report.py "
         f"--expected-requests {expected_requests} " + shlex.join(ndjson_paths)
     )
-    inner = " && ".join(steps)
 
     docker_argv = [
         "docker",
@@ -748,22 +805,36 @@ def make_probe_fn(
         probe_id = f"{label}-{next(counter)}-{rate}"
         remote_subdir = f"_saturation/{cell_id}/{run_timestamp}/{probe_id}"
 
-        remote_cmd = build_remote_probe_command(
-            cell_id,
-            target_url,
-            tier,
+        for rep in range(repetitions):
+            rep_cmd = build_remote_probe_rep_command(
+                cell_id,
+                target_url,
+                tier,
+                rate,
+                warmup,
+                measure,
+                tools_image,
+                results_mount,
+                fixtures_mount,
+                remote_subdir,
+                rep,
+                capture_before_stat=(rep == 0),
+                capture_after_stat=(rep == repetitions - 1),
+                results_bucket=results_bucket,
+                user_count=user_count,
+            )
+            gcloud_ssh_with_retry(loadgen_instance, zone, project_id, rep_cmd)
+
+        aggregate_cmd = build_remote_probe_aggregate_command(
+            remote_subdir,
+            repetitions,
             rate,
-            warmup,
             measure,
             tools_image,
             results_mount,
             fixtures_mount,
-            remote_subdir,
-            repetitions,
-            results_bucket=results_bucket,
-            user_count=user_count,
         )
-        result = gcloud_ssh(loadgen_instance, zone, project_id, remote_cmd)
+        result = gcloud_ssh_with_retry(loadgen_instance, zone, project_id, aggregate_cmd)
         verdict = _parse_probe_result(result.stdout)
 
         return ProbeResult(
@@ -1174,30 +1245,37 @@ def main(argv: list[str] | None = None) -> int:
             )
         for i, (rate, tier) in enumerate([] if args.only_saturation else sweep, start=1):
             print(f"\n--- combinação {i}/{len(sweep)}: rate={rate} tier={tier} ---")
-            remote_cmd = build_remote_battery_command(
-                args.cell,
-                target_url,
-                args.phase,
-                rate,
-                tier,
-                args.repetitions,
-                tools_image,
-                RESULTS_MOUNT,
-                FIXTURES_MOUNT,
-                timestamp,
-                region=args.region,
-                zone=args.zone,
-                results_bucket=args.results_bucket,
-                user_count=args.user_count,
-            )
-            # print(result.stdout): sem isso, o resultado desta combinação
-            # fica completamente mudo no log — confirmado ao vivo: um crash
-            # posterior (na sondagem de saturação) levou o destroy a rodar
-            # sem nunca ter sincronizado os resultados desta combinação, e
-            # não havia NENHUM indício no log de como as 5 repetições
-            # tinham se saído antes de perdê-las com a VM.
-            result = gcloud_ssh(loadgen_instance, args.zone, args.project_id, remote_cmd)
-            print(result.stdout)
+            # 1 sessão SSH por repetição, não todas encadeadas numa só — uma
+            # queda de conexão no meio perdia a combinação inteira
+            # (confirmado ao vivo 2x contra e3-valkey); agora custa, no pior
+            # caso, a repetição atual (gcloud_ssh_with_retry já tenta de
+            # novo antes de desistir).
+            for rep in range(args.repetitions):
+                print(f"  repetição {rep + 1}/{args.repetitions}")
+                remote_cmd = build_remote_battery_command(
+                    args.cell,
+                    target_url,
+                    args.phase,
+                    rate,
+                    tier,
+                    rep,
+                    tools_image,
+                    RESULTS_MOUNT,
+                    FIXTURES_MOUNT,
+                    timestamp,
+                    region=args.region,
+                    zone=args.zone,
+                    results_bucket=args.results_bucket,
+                    user_count=args.user_count,
+                )
+                # print(result.stdout): sem isso, o resultado desta repetição
+                # fica completamente mudo no log — confirmado ao vivo: um
+                # crash posterior (na sondagem de saturação) levou o destroy
+                # a rodar sem nunca ter sincronizado os resultados desta
+                # combinação, e não havia NENHUM indício no log de como as
+                # repetições tinham se saído antes de perdê-las com a VM.
+                result = gcloud_ssh_with_retry(loadgen_instance, args.zone, args.project_id, remote_cmd)
+                print(result.stdout)
 
         if args.phase == "triagem":
             print("\n--- rampa curta de saturação (exploratória, docs/DESIGN.md) ---")

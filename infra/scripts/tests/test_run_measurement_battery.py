@@ -21,7 +21,8 @@ from infra.scripts.run_measurement_battery import (
     _parse_probe_result,
     _write_saturation_json,
     build_remote_battery_command,
-    build_remote_probe_command,
+    build_remote_probe_aggregate_command,
+    build_remote_probe_rep_command,
     build_remote_setup_command,
     build_remote_upload_command,
     build_sweep,
@@ -105,14 +106,27 @@ def test_high_rate_from_saturation_falls_back_to_legacy_rate_on_generator_bottle
 def test_build_remote_battery_command_includes_rate_and_tier():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
-        1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        1000, "medium", 3, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
         "20260101T000000Z", user_count=200_948,
     )
     assert "--rate 1000" in cmd
     assert "--selectivity-tier medium" in cmd
     assert "--phase triagem" in cmd
-    assert "--repetitions 5" in cmd
     assert "--timestamp 20260101T000000Z" in cmd
+
+
+def test_build_remote_battery_command_runs_exactly_one_repetition_at_the_given_index():
+    # Bug real evitado: --repetitions N encadeava as N repetições numa só
+    # sessão SSH — uma queda de conexão no meio perdia todas. Agora cada
+    # chamada roda 1 repetição específica (o chamador, main(), faz N
+    # chamadas separadas via gcloud_ssh_with_retry).
+    cmd = build_remote_battery_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
+        1000, "medium", 3, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "20260101T000000Z", user_count=200_948,
+    )
+    assert "--repetitions 1" in cmd
+    assert "--repetition-index 3" in cmd
 
 
 def test_build_remote_battery_command_passes_user_count_to_run_battery():
@@ -122,7 +136,7 @@ def test_build_remote_battery_command_passes_user_count_to_run_battery():
     # que invalidou a primeira triagem).
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
-        1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        1000, "medium", 0, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
         "20260101T000000Z", user_count=200_948,
     )
     assert "--user-count 200948" in cmd
@@ -135,7 +149,7 @@ def test_build_remote_battery_command_passes_results_bucket_to_run_battery():
     # e3-postgres.
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
-        1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        1000, "medium", 0, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
         "20260101T000000Z", results_bucket="my-results-bucket", user_count=200_948,
     )
     assert "--results-bucket my-results-bucket" in cmd
@@ -144,7 +158,7 @@ def test_build_remote_battery_command_passes_results_bucket_to_run_battery():
 def test_build_remote_battery_command_omits_results_bucket_flag_when_absent():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
-        1000, "medium", 5, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        1000, "medium", 0, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
         "20260101T000000Z", user_count=200_948,
     )
     assert "--results-bucket" not in cmd
@@ -153,7 +167,7 @@ def test_build_remote_battery_command_omits_results_bucket_flag_when_absent():
 def test_build_remote_battery_command_mounts_results_dir():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
-        100, "medium", 1, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        100, "medium", 0, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
         "20260101T000000Z", user_count=200_948,
     )
     assert "-v /home/tcc/results:/app/results" in cmd
@@ -162,7 +176,7 @@ def test_build_remote_battery_command_mounts_results_dir():
 def test_build_remote_battery_command_mounts_fixtures_dir_readonly():
     cmd = build_remote_battery_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "triagem",
-        100, "medium", 1, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        100, "medium", 0, "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
         "20260101T000000Z", user_count=200_948,
     )
     assert "-v /home/tcc/load-fixtures:/app/load/fixtures:ro" in cmd
@@ -241,89 +255,142 @@ def test_duration_seconds_parses_the_k6_durations_this_orchestrator_uses():
     assert _duration_seconds("3m") == 180
 
 
-def test_build_remote_probe_command_uses_probe_mode_and_rate():
-    cmd = build_remote_probe_command(
+def test_build_remote_probe_rep_command_uses_probe_mode_and_rate():
+    cmd = build_remote_probe_rep_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "medium", 4000, "0s", "1m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/short-0-4000", 1, user_count=200_948,
+        "_saturation/e1-postgres/short-0-4000", 0,
+        capture_before_stat=True, capture_after_stat=True, user_count=200_948,
     )
     assert "PROBE_MODE=true" in cmd
     assert "PROBE_RATE=4000" in cmd
-    assert "analysis/probe_report.py" in cmd
+    # A agregação (analysis/probe_report.py) roda numa sessão SSH separada
+    # (build_remote_probe_aggregate_command) — nunca nesta.
+    assert "analysis/probe_report.py" not in cmd
 
 
-def test_build_remote_probe_command_injects_user_count_and_expected_requests():
-    # USER_COUNT: mesma razão da bateria de carga fixa (Zipf sobre a base
-    # inteira). --expected-requests: taxa × medição × repetições — é o que
-    # permite ao veredito da sondagem detectar o k6 descartando chegadas
-    # (docs/DESIGN.md, "Vazão ofertada verificada, não presumida").
-    cmd = build_remote_probe_command(
+def test_build_remote_probe_rep_command_injects_user_count():
+    # Mesma razão da bateria de carga fixa: o Zipf do k6 amostra a base
+    # inteira carregada.
+    cmd = build_remote_probe_rep_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/confirm-low-0-1000", 5, user_count=200_948,
+        "_saturation/e1-postgres/confirm-low-0-1000", 0,
+        capture_before_stat=True, capture_after_stat=False, user_count=200_948,
     )
     assert "USER_COUNT=200948" in cmd
-    assert f"--expected-requests {1000 * 180 * 5}" in cmd
 
 
-def test_build_remote_probe_command_repeats_k6_for_each_repetition():
-    cmd = build_remote_probe_command(
-        "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
-        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/confirm-low-0-1000", 5, user_count=200_948,
-    )
-    assert cmd.count("PROBE_MODE=true") == 5
+def test_build_remote_probe_rep_command_targets_its_own_rep_dir():
+    # Bug real evitado: antes, todas as repetições de uma sondagem rodavam
+    # encadeadas numa sessão SSH só — uma queda de conexão no meio perdia a
+    # sondagem inteira. Agora cada repetição é uma chamada isolada.
     for rep in range(5):
+        cmd = build_remote_probe_rep_command(
+            "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
+            "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+            "_saturation/e1-postgres/confirm-low-0-1000", rep,
+            capture_before_stat=(rep == 0), capture_after_stat=(rep == 4), user_count=200_948,
+        )
+        assert cmd.count("PROBE_MODE=true") == 1
         assert f"rep{rep}/k6-raw.json" in cmd
+        for other in range(5):
+            if other != rep:
+                assert f"rep{other}/k6-raw.json" not in cmd
 
 
-def test_build_remote_probe_command_uploads_and_deletes_k6_raw_json_per_rep():
+def test_build_remote_probe_rep_command_uploads_and_deletes_k6_raw_json():
     # Bug real: sem isto, cada sondagem da rampa fina de confirmação
     # (5 repetições, várias sondagens até convergir) deixa um k6-raw.json
     # de vários GB no disco da loadgen sem nunca limpar — encheu o disco
     # de 100GB e derrubou e3-postgres com "no space left on device".
-    cmd = build_remote_probe_command(
+    cmd = build_remote_probe_rep_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/confirm-low-0-1000", 2,
+        "_saturation/e1-postgres/confirm-low-0-1000", 1,
+        capture_before_stat=False, capture_after_stat=False,
         results_bucket="my-results-bucket", user_count=200_948,
     )
-    assert "load/upload_one_file.py" in cmd
-    for rep in range(2):
-        rep_dir = f"/app/results/_saturation/e1-postgres/confirm-low-0-1000/rep{rep}"
-        assert (
-            f"load/upload_one_file.py {rep_dir}/k6-raw.json my-results-bucket "
-            f"_saturation/e1-postgres/confirm-low-0-1000/rep{rep}/k6-raw.json" in cmd
-        )
-        assert f"rm -f {rep_dir}/k6-raw.json" in cmd
+    rep_dir = "/app/results/_saturation/e1-postgres/confirm-low-0-1000/rep1"
+    assert (
+        f"load/upload_one_file.py {rep_dir}/k6-raw.json my-results-bucket "
+        "_saturation/e1-postgres/confirm-low-0-1000/rep1/k6-raw.json" in cmd
+    )
+    assert f"rm -f {rep_dir}/k6-raw.json" in cmd
 
 
-def test_build_remote_probe_command_omits_upload_step_without_results_bucket():
-    cmd = build_remote_probe_command(
+def test_build_remote_probe_rep_command_omits_upload_step_without_results_bucket():
+    cmd = build_remote_probe_rep_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "low", 1000, "2m", "3m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/confirm-low-0-1000", 1, user_count=200_948,
+        "_saturation/e1-postgres/confirm-low-0-1000", 0,
+        capture_before_stat=True, capture_after_stat=True, user_count=200_948,
     )
     assert "load/upload_one_file.py" not in cmd
     assert "rm -f" not in cmd
 
 
-def test_build_remote_probe_command_captures_proc_stat_before_and_after():
+def test_build_remote_probe_rep_command_captures_proc_stat_only_when_asked():
     # A CPU do gerador vem de /proc/stat lido na própria VM (não do Cloud
-    # Monitoring) — as duas leituras precisam cercar a geração de carga e
-    # ser repassadas para analysis/probe_report.py por variável de ambiente.
-    cmd = build_remote_probe_command(
+    # Monitoring) — só a repetição marcada precisa gravar a leitura (em
+    # arquivo, não variável de ambiente: sessões SSH separadas não
+    # compartilham variáveis de shell entre si).
+    cmd_first = build_remote_probe_rep_command(
         "e1-postgres", "http://svc:8000/v1/recommendations", "medium", 4000, "0s", "1m",
         "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
-        "_saturation/e1-postgres/short-0-4000", 1, user_count=200_948,
+        "_saturation/e1-postgres/short-0-4000", 0,
+        capture_before_stat=True, capture_after_stat=False, user_count=200_948,
     )
-    assert "cat /proc/stat" in cmd
+    assert "cat /proc/stat" in cmd_first
+    assert "before_stat.txt" in cmd_first
+    assert "after_stat.txt" not in cmd_first
+
+    cmd_middle = build_remote_probe_rep_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "medium", 4000, "0s", "1m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "_saturation/e1-postgres/short-0-4000", 1,
+        capture_before_stat=False, capture_after_stat=False, user_count=200_948,
+    )
+    assert "cat /proc/stat" not in cmd_middle
+
+
+def test_build_remote_probe_aggregate_command_reads_both_stat_files_before_probe_report():
+    cmd = build_remote_probe_aggregate_command(
+        "_saturation/e1-postgres/confirm-low-0-1000", 5, 1000, "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+    )
+    assert "analysis/probe_report.py" in cmd
     assert "GENERATOR_CPU_STAT_BEFORE=" in cmd
     assert "GENERATOR_CPU_STAT_AFTER=" in cmd
+    assert "before_stat.txt" in cmd
+    assert "after_stat.txt" in cmd
     before_idx = cmd.index("BEFORE_STAT=")
     probe_report_idx = cmd.index("analysis/probe_report.py")
     after_idx = cmd.index("AFTER_STAT=", before_idx + 1)
     assert before_idx < after_idx < probe_report_idx
+
+
+def test_build_remote_probe_aggregate_command_lists_every_repetitions_ndjson():
+    cmd = build_remote_probe_aggregate_command(
+        "_saturation/e1-postgres/confirm-low-0-1000", 3, 1000, "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+    )
+    for rep in range(3):
+        assert (
+            f"/app/results/_saturation/e1-postgres/confirm-low-0-1000/rep{rep}/requests.ndjson"
+            in cmd
+        )
+
+
+def test_build_remote_probe_aggregate_command_injects_expected_requests():
+    # taxa × medição × repetições — é o que permite ao veredito da sondagem
+    # detectar o k6 descartando chegadas (docs/DESIGN.md, "Vazão ofertada
+    # verificada, não presumida").
+    cmd = build_remote_probe_aggregate_command(
+        "_saturation/e1-postgres/confirm-low-0-1000", 5, 1000, "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+    )
+    assert f"--expected-requests {1000 * 180 * 5}" in cmd
 
 
 def test_parse_probe_result_reads_violated_slo_true():

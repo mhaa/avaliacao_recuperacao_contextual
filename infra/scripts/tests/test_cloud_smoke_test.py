@@ -4,10 +4,14 @@ infra/scripts/tests/test_run_measurement_battery.py."""
 
 from __future__ import annotations
 
+import subprocess
+
+import infra.scripts.cloud_smoke_test as cloud_smoke_test
 from infra.scripts.cloud_smoke_test import (
     _confirm_billable,
     build_remote_schema_fixture_script,
     build_remote_verification_script,
+    gcloud_ssh_with_retry,
 )
 
 _ARGS = ("e1-postgres", "postgres", "10.0.0.2", "10.0.0.3", "gcr.io/x/tools:1", "hunter2")
@@ -63,3 +67,36 @@ def test_confirm_billable_default_still_prompts(monkeypatch):
     monkeypatch.setattr("builtins.input", _record)
     _confirm_billable("mensagem de teste")
     assert len(calls) == 1
+
+
+def test_gcloud_ssh_with_retry_succeeds_after_transient_failures(monkeypatch):
+    # A queda real ("Remote side unexpectedly closed network connection")
+    # é transiente — a 2ª ou 3ª tentativa do MESMO comando costuma passar.
+    attempts = []
+
+    def _fake_gcloud_ssh(instance, zone, project_id, remote_command):
+        attempts.append(remote_command)
+        if len(attempts) < 3:
+            raise subprocess.CalledProcessError(1, ["gcloud"])
+        return subprocess.CompletedProcess(["gcloud"], 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(cloud_smoke_test, "gcloud_ssh", _fake_gcloud_ssh)
+    result = gcloud_ssh_with_retry(
+        "loadgen", "us-east4-c", "proj", "echo oi", max_attempts=3, backoff_seconds=0
+    )
+    assert result.stdout == "ok"
+    assert len(attempts) == 3
+
+
+def test_gcloud_ssh_with_retry_reraises_after_exhausting_attempts(monkeypatch):
+    def _always_fails(instance, zone, project_id, remote_command):
+        raise subprocess.CalledProcessError(1, ["gcloud"])
+
+    monkeypatch.setattr(cloud_smoke_test, "gcloud_ssh", _always_fails)
+    try:
+        gcloud_ssh_with_retry(
+            "loadgen", "us-east4-c", "proj", "echo oi", max_attempts=2, backoff_seconds=0
+        )
+        assert False, "deveria ter relançado CalledProcessError"
+    except subprocess.CalledProcessError:
+        pass

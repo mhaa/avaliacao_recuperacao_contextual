@@ -231,6 +231,40 @@ def gcloud_ssh(
     return _run(cmd, capture_output=True, text=True, input="y\n")
 
 
+def gcloud_ssh_with_retry(
+    instance: str,
+    zone: str,
+    project_id: str,
+    remote_command: str,
+    max_attempts: int = 3,
+    backoff_seconds: int = 30,
+) -> subprocess.CompletedProcess:
+    """Reexecuta gcloud_ssh do zero em caso de queda transiente da sessão —
+    "Remote side unexpectedly closed network connection" já apareceu 2x
+    nesta sessão (memória: retry de e3-valkey), no meio de um comando remoto
+    longo, sem relação com o hang do prompt de host key que `input="y\\n"`
+    acima já cobre (aquele nunca chega a produzir NENHUMA saída real antes
+    de morrer; este acontece depois de repetições inteiras já terem
+    funcionado). Só vale a pena existir porque os chamadores agora fazem UMA
+    chamada por repetição (run_measurement_battery.py) em vez de encadear
+    várias numa sessão só — perder uma tentativa aqui custa, no máximo, a
+    repetição atual, não a sondagem/combinação inteira."""
+    last_exc: subprocess.CalledProcessError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return gcloud_ssh(instance, zone, project_id, remote_command)
+        except subprocess.CalledProcessError as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                print(
+                    f"AVISO: gcloud_ssh falhou (tentativa {attempt}/{max_attempts}) — "
+                    f"retentando em {backoff_seconds}s..."
+                )
+                time.sleep(backoff_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
 def wait_for_service_ready(
     instance: str, zone: str, project_id: str, service_ip: str, timeout_s: int = 600
 ) -> None:
