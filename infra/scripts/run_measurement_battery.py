@@ -453,6 +453,14 @@ def build_remote_probe_rep_command(
     rep_dir = f"/app/results/{remote_subdir}/rep{rep}"
     json_out = f"{rep_dir}/k6-raw.json"
     steps: list[str] = []
+    # mkdir -p vem antes de tudo, inclusive da captura de before_stat: ele
+    # também cria remote_subdir (pai de rep_dir), e o arquivo de before_stat
+    # mora em remote_subdir — sem isto a repetição 0 falha com "No such file
+    # or directory" ao gravar before_stat.txt num diretório que ainda não
+    # existe. Confirmado ao vivo contra e3-valkey (4ª tentativa): as 3
+    # tentativas de gcloud_ssh_with_retry falharam de forma idêntica e
+    # determinística, não por queda de conexão.
+    steps.append(shlex.join(["mkdir", "-p", rep_dir]))
     if capture_before_stat:
         steps.append(f"cat /proc/stat | head -1 > {_probe_stat_path(remote_subdir, 'before')}")
     # k6 não cria o diretório de --out sozinho (diferente de
@@ -461,7 +469,6 @@ def build_remote_probe_rep_command(
     # .../k6-raw.json: no such file or directory" na 1ª sondagem de
     # saturação real, um caminho _saturation/<cell>/<probe>/rep<N>/ nunca
     # criado antes.
-    steps.append(shlex.join(["mkdir", "-p", rep_dir]))
     k6_argv = build_probe_k6_cmd(
         json_out, cell_id, target_url, rate, tier, warmup, measure, user_count=user_count
     )

@@ -354,6 +354,23 @@ def test_build_remote_probe_rep_command_captures_proc_stat_only_when_asked():
     assert "cat /proc/stat" not in cmd_middle
 
 
+def test_build_remote_probe_rep_command_creates_probe_dir_before_writing_before_stat():
+    # Bug real ao vivo contra e3-valkey (4ª tentativa): before_stat.txt mora
+    # em remote_subdir (pai de rep_dir), então se o mkdir -p rodar DEPOIS da
+    # captura, a repetição 0 falha sempre com "No such file or directory" —
+    # determinístico, não uma queda de conexão (as 3 tentativas do retry
+    # falhavam de forma idêntica).
+    cmd = build_remote_probe_rep_command(
+        "e1-postgres", "http://svc:8000/v1/recommendations", "high", 4261, "2m", "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        "_saturation/e1-postgres/confirm-high-0-4261", 0,
+        capture_before_stat=True, capture_after_stat=False, user_count=200_948,
+    )
+    mkdir_idx = cmd.index("mkdir -p")
+    before_stat_idx = cmd.index("before_stat.txt")
+    assert mkdir_idx < before_stat_idx
+
+
 def test_build_remote_probe_aggregate_command_reads_both_stat_files_before_probe_report():
     cmd = build_remote_probe_aggregate_command(
         "_saturation/e1-postgres/confirm-low-0-1000", 5, 1000, "3m",
