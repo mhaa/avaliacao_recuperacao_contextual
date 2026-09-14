@@ -44,6 +44,7 @@ from analysis.stats import (
     effect_size_epsilon_squared,
     kruskal_wallis,
     tost_equivalence,
+    vargha_delaney_a,
 )
 
 
@@ -227,10 +228,30 @@ def discover_rep_dirs(results_root: Path, phase: str) -> list[Path]:
     # — load/run_battery.py:combo_out_dir, docs/ARCHITECTURE.md) para as 9
     # combinações não caírem nos mesmos 5 diretórios. "**" casa as duas
     # profundidades sem este código precisar saber qual é qual.
-    return sorted(
+    all_rep_dirs = sorted(
         p.parent
         for p in results_root.glob(f"*/{phase}/**/rep*/requests.ndjson")
     )
+    # Só o timestamp mais recente por célula — mesma disciplina de
+    # load_cell_saturation (ver docstring lá). Sem isto, tentativas antigas
+    # (retries, execuções interrompidas, reexecuções pós-fix de arquitetura)
+    # ficam acumuladas em results/<cell>/<phase>/<timestamp>/ e suas
+    # latências se misturam silenciosamente com a execução válida mais
+    # recente — confirmado ao vivo: as 4 células da campanha de confirmação
+    # têm de 2 a 4 timestamps cada uma no bucket de resultados.
+    cell_and_timestamp = {
+        rep_dir: (rep_dir.relative_to(results_root).parts[0], rep_dir.relative_to(results_root).parts[2])
+        for rep_dir in all_rep_dirs
+    }
+    newest_timestamp_by_cell: dict[str, str] = {}
+    for cell_id, timestamp in cell_and_timestamp.values():
+        if timestamp > newest_timestamp_by_cell.get(cell_id, ""):
+            newest_timestamp_by_cell[cell_id] = timestamp
+    return [
+        rep_dir
+        for rep_dir, (cell_id, timestamp) in cell_and_timestamp.items()
+        if timestamp == newest_timestamp_by_cell[cell_id]
+    ]
 
 
 def ensure_collected(rep_dirs: list[Path]) -> None:
@@ -289,17 +310,70 @@ def percentiles_of(latencies: list[float]) -> dict[str, float]:
     }
 
 
+def load_cell_returned_counts(rep_dirs: list[Path]) -> dict[str, list[tuple[int, int]]]:
+    """Agrupa (returned_count, k) por "<cell_id>|<selectivity_tier>", um par
+    por requisição — mesma disciplina de load_cell_latencies (cell_id do
+    manifest.json, não da profundidade do caminho); k e selectivity_tier
+    vêm do mesmo manifest.json de cada repetição, nunca presumidos
+    constantes entre repetições.
+
+    returned_count já está em latencies.parquet (analysis/collect.py escreve
+    a coluna; core/contract.py: "a contagem real de itens elegíveis quando
+    menor que k" — a resposta pode legitimamente vir parcial quando poucos
+    candidatos sobrevivem ao predicado). Pareado com k aqui para
+    returned_count_stats poder calcular a fração de respostas parciais."""
+    by_key: dict[str, list[tuple[int, int]]] = {}
+    for rep_dir in rep_dirs:
+        manifest = json.loads((rep_dir / "manifest.json").read_text())
+        key = f"{manifest['cell_id']}|{manifest['selectivity_tier']}"
+        k = manifest["k"]
+        df = pl.read_parquet(rep_dir / "latencies.parquet")
+        by_key.setdefault(key, []).extend((rc, k) for rc in df["returned_count"].to_list())
+    return by_key
+
+
+def returned_count_stats(pairs: list[tuple[int, int]]) -> dict:
+    """Média de itens por resposta e fração de respostas parciais
+    (returned_count < k) para um grupo de (returned_count, k) — tipicamente
+    uma célula num patamar de seletividade (load_cell_returned_counts).
+    `n=0` (grupo vazio) devolve Nones em vez de dividir por zero."""
+    if not pairs:
+        return {"mean_returned_count": None, "partial_response_rate": None, "n": 0}
+    counts = [rc for rc, _ in pairs]
+    partial = sum(1 for rc, k in pairs if rc < k)
+    return {
+        "mean_returned_count": sum(counts) / len(counts),
+        "partial_response_rate": partial / len(pairs),
+        "n": len(pairs),
+    }
+
+
 def build_report(
     groups: dict[str, list[float]],
     saturation_by_cell: dict[str, dict] | None = None,
     storage_root: Path = _DEFAULT_STORAGE_ROOT,
+    returned_counts_by_key: dict[str, list[tuple[int, int]]] | None = None,
 ) -> dict:
     saturation_by_cell = saturation_by_cell or {}
+    returned_counts_by_key = returned_counts_by_key or {}
     labels = list(groups)
     kruskal = kruskal_wallis([groups[label] for label in labels])
     dunn = dunn_posthoc(groups) if kruskal.reject_h0 else {}
     n_total = sum(len(v) for v in groups.values())
     epsilon_squared = effect_size_epsilon_squared(kruskal.h_statistic, n_total, len(labels))
+    # A de Vargha-Delaney por par — ao contrário de dunn_posthoc, não fica
+    # atrás do gate reject_h0: não é um teste de hipótese (sem taxa de
+    # falso-positivo a proteger), é a magnitude por par que falta quando
+    # Dunn sozinho satura em "diferente" pra todo par (amostras de centenas
+    # de milhares de requisições por célula — ver analysis/stats.py:
+    # vargha_delaney_a). Roda pra todos os pares independente do resultado
+    # do Kruskal-Wallis.
+    vargha_delaney = {
+        (a, b): vargha_delaney_a(groups[a], groups[b])
+        for a in labels
+        for b in labels
+        if a != b
+    }
 
     cells = []
     bootstrap_ci_p99 = {}
@@ -402,8 +476,16 @@ def build_report(
             "reject_h0": kruskal.reject_h0,
         },
         "dunn_posthoc": {f"{a}|{b}": p for (a, b), p in dunn.items()},
+        "vargha_delaney_a": {f"{a}|{b}": v for (a, b), v in vargha_delaney.items()},
         "effect_size_epsilon_squared": epsilon_squared,
         "bootstrap_ci_p99": bootstrap_ci_p99,
+        # Média de itens por resposta e fração de respostas parciais
+        # (returned_count < k), por "<cell_id>|<selectivity_tier>" — na
+        # triagem colapsa num só patamar por célula; na confirmação, um por
+        # seletividade testada (load_cell_returned_counts).
+        "returned_count_by_cell_tier": {
+            key: returned_count_stats(pairs) for key, pairs in returned_counts_by_key.items()
+        },
         "cells": cells,
         "cells_without_cost": without_cost,
         "pareto_frontier": sorted(c["cell_id"] for c in frontier),
@@ -416,7 +498,11 @@ def build_report(
 def build_confirmation_extras(groups: dict[str, list[float]]) -> dict:
     """TOST par-a-par entre as células da fronteira — 'não rejeitou H0' não
     é o mesmo que 'equivalente na prática' (docs/DESIGN.md, "Delineamento em
-    duas etapas")."""
+    duas etapas"). `vargha_delaney_a` acompanha cada par: mesmo quando o TOST
+    aponta "não equivalente" pra uma margem escolhida, A12 dá a magnitude e a
+    direção da diferença (0,5 = sem diferença; ~0,71 = grande, Vargha &
+    Delaney 2000), útil pra saber SE vale a pena apertar a margem ou se a
+    diferença é grande demais pra ser só um efeito de amostra."""
     labels = list(groups)
     tost_by_pair = {}
     for i, a in enumerate(labels):
@@ -428,6 +514,7 @@ def build_confirmation_extras(groups: dict[str, list[float]]) -> dict:
                 "equivalent": result.equivalent,
                 "p_greater": result.p_greater,
                 "p_less": result.p_less,
+                "vargha_delaney_a": vargha_delaney_a(groups[a], groups[b]),
             }
     return {"equivalence_margin_ms": EQUIVALENCE_MARGIN_MS, "tost_by_pair": tost_by_pair}
 
@@ -464,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     # timestamp novo sem rep*/ — ver load_cell_saturation.
     saturation_by_cell = load_cell_saturation(args.results_root, args.phase)
     groups = load_cell_latencies(rep_dirs)
+    returned_counts_by_key = load_cell_returned_counts(rep_dirs)
 
     # loadgen_bottleneck invalida só a VAZÃO medida (o gerador saturou antes
     # da célula) — nunca a latência/custo já coletados sob carga fixa, que
@@ -493,7 +581,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Trate como não validada nessa dimensão."
             )
 
-    report = build_report(groups, saturation_by_cell)
+    report = build_report(
+        groups, saturation_by_cell, returned_counts_by_key=returned_counts_by_key
+    )
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "report.json").write_text(json.dumps(report, indent=2))
 

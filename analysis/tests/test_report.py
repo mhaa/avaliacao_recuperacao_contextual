@@ -17,13 +17,17 @@ from analysis.report import (
     discover_rep_dirs,
     ensure_collected,
     load_cell_latencies,
+    load_cell_returned_counts,
     load_cell_saturation,
+    returned_count_stats,
     storage_medium_for_cell,
     unit_storage_cost_usd_month,
 )
 
 
-def _request_line(scenario: str, time: str, latency_ms: float, status: int, request_id: str) -> str:
+def _request_line(
+    scenario: str, time: str, latency_ms: float, status: int, request_id: str, returned_count: int = 20
+) -> str:
     return json.dumps(
         {
             "request_id": request_id,
@@ -31,22 +35,38 @@ def _request_line(scenario: str, time: str, latency_ms: float, status: int, requ
             "timestamp": time,
             "latency_ms": latency_ms,
             "status": status,
-            "returned_count": 20,
+            "returned_count": returned_count,
         }
     )
 
 
-def _write_fake_run(rep_dir, latencies: list[float], cell_id: str) -> None:
+def _write_fake_run(
+    rep_dir,
+    latencies: list[float],
+    cell_id: str,
+    returned_counts: list[int] | None = None,
+    k: int = 20,
+    selectivity_tier: str = "medium",
+) -> None:
     rep_dir.mkdir(parents=True, exist_ok=True)
+    # Default preserva o comportamento antigo (returned_count=20 fixo, sem
+    # respostas parciais) — testes que já chamam esta fixture sem os novos
+    # parâmetros continuam exercitando exatamente o mesmo cenário.
+    returned_counts = returned_counts or [20] * len(latencies)
     lines = []
-    for i, latency in enumerate(latencies):
+    for i, (latency, returned_count) in enumerate(zip(latencies, returned_counts)):
         request_id = f"{i}-0"
         time = f"2026-01-01T00:02:{i % 60:02d}.000Z"
-        lines.append(_request_line("measurement", time, latency, 200, request_id))
+        lines.append(
+            _request_line("measurement", time, latency, 200, request_id, returned_count)
+        )
     (rep_dir / "requests.ndjson").write_text("\n".join(lines) + "\n")
-    # load_cell_latencies lê cell_id daqui, não da profundidade do caminho
-    # (analysis/report.py) — precisa existir mesmo em fixture sintética.
-    (rep_dir / "manifest.json").write_text(json.dumps({"cell_id": cell_id}))
+    # load_cell_latencies/load_cell_returned_counts leem tudo daqui, não da
+    # profundidade do caminho (analysis/report.py) — precisa existir mesmo em
+    # fixture sintética.
+    (rep_dir / "manifest.json").write_text(
+        json.dumps({"cell_id": cell_id, "k": k, "selectivity_tier": selectivity_tier})
+    )
 
 
 def _write_fake_storage_sizes(storage_root):
@@ -154,20 +174,104 @@ def test_confirmacao_combos_do_not_collide_on_the_same_rep_numbers(tmp_path):
     assert sorted(groups["e3-postgres"]) == [5.0] * 10 + [50.0] * 10
 
 
+def test_discover_rep_dirs_ignores_older_timestamps_for_the_same_cell(tmp_path):
+    # Bug real: confirmacao_progress.log e o bucket de resultados acumulam
+    # timestamps de tentativas antigas (retries, quedas de SSH, reexecuções
+    # pós-fix de arquitetura) — confirmado ao vivo, as 4 células da campanha
+    # de confirmação têm de 2 a 4 timestamps cada uma. Sem filtrar pelo mais
+    # recente, load_cell_latencies misturaria a execução velha (aqui,
+    # latência 999.0 — bem distante de tudo mais) com a válida.
+    _write_fake_run(
+        tmp_path / "e3-postgres" / "confirmacao" / "20260101T000000Z" / "1000-low" / "rep0",
+        [999.0] * 5, "e3-postgres",
+    )
+    _write_fake_run(
+        tmp_path / "e3-postgres" / "confirmacao" / "20260102T000000Z" / "1000-low" / "rep0",
+        [10.0] * 5, "e3-postgres",
+    )
+
+    rep_dirs = discover_rep_dirs(tmp_path, "confirmacao")
+
+    assert len(rep_dirs) == 1
+    assert "20260102T000000Z" in str(rep_dirs[0])
+
+    ensure_collected(rep_dirs)
+    groups = load_cell_latencies(rep_dirs)
+    assert groups["e3-postgres"] == [10.0] * 5
+
+
+def test_returned_count_stats_flags_partial_responses_by_selectivity_tier():
+    # Metade das respostas vêm completas (k=20), metade parciais (5 itens) —
+    # cenário de seletividade baixa filtrando demais os N candidatos.
+    pairs = [(20, 20)] * 5 + [(5, 20)] * 5
+
+    stats = returned_count_stats(pairs)
+
+    assert stats["mean_returned_count"] == pytest.approx(12.5)
+    assert stats["partial_response_rate"] == pytest.approx(0.5)
+    assert stats["n"] == 10
+
+
+def test_returned_count_stats_handles_an_empty_group_without_dividing_by_zero():
+    stats = returned_count_stats([])
+
+    assert stats == {"mean_returned_count": None, "partial_response_rate": None, "n": 0}
+
+
+def test_load_cell_returned_counts_groups_by_cell_and_selectivity_tier(tmp_path):
+    low_dir = tmp_path / "e1-postgres" / "confirmacao" / "20260101T000000Z" / "1000-low" / "rep0"
+    high_dir = tmp_path / "e1-postgres" / "confirmacao" / "20260101T000000Z" / "1000-high" / "rep0"
+    _write_fake_run(
+        low_dir, [10.0] * 10, "e1-postgres",
+        returned_counts=[20] * 5 + [5] * 5, k=20, selectivity_tier="low",
+    )
+    _write_fake_run(
+        high_dir, [10.0] * 10, "e1-postgres",
+        returned_counts=[20] * 10, k=20, selectivity_tier="high",
+    )
+    rep_dirs = discover_rep_dirs(tmp_path, "confirmacao")
+    ensure_collected(rep_dirs)
+
+    by_key = load_cell_returned_counts(rep_dirs)
+
+    assert set(by_key) == {"e1-postgres|low", "e1-postgres|high"}
+    low_stats = returned_count_stats(by_key["e1-postgres|low"])
+    high_stats = returned_count_stats(by_key["e1-postgres|high"])
+    assert low_stats["partial_response_rate"] == pytest.approx(0.5)
+    assert high_stats["partial_response_rate"] == 0.0
+
+
 def test_build_report_rejects_h0_and_dunn_points_at_the_shifted_cell(tmp_path):
     results_root, cells = _build_fake_results(tmp_path)
     rep_dirs = discover_rep_dirs(results_root, "triagem")
     ensure_collected(rep_dirs)
     groups = load_cell_latencies(rep_dirs)
+    returned_counts = load_cell_returned_counts(rep_dirs)
     storage_root = tmp_path / "storage"
     _write_fake_storage_sizes(storage_root)
 
-    report = build_report(groups, storage_root=storage_root)
+    report = build_report(
+        groups, storage_root=storage_root, returned_counts_by_key=returned_counts
+    )
+
+    # _build_fake_results grava returned_count=20/k=20 (default), sem
+    # respostas parciais, na seletividade "medium" (default de _write_fake_run).
+    assert report["returned_count_by_cell_tier"]["e1-postgres|medium"] == {
+        "mean_returned_count": 20.0,
+        "partial_response_rate": 0.0,
+        "n": 100,
+    }
 
     assert report["kruskal_wallis"]["reject_h0"] is True
     assert report["dunn_posthoc"]["e1-postgres|e1-valkey"] < 0.05
     assert report["dunn_posthoc"]["e2-postgres|e1-valkey"] < 0.05
     assert report["dunn_posthoc"]["e1-postgres|e2-postgres"] > 0.05
+    # e1-valkey foi deslocada bem acima das outras duas (_build_fake_results):
+    # A12 alto (perto de 1) diz "quase toda observação de e1-valkey excede
+    # e1-postgres", não só "os dois diferem" — a magnitude que falta ao Dunn.
+    assert report["vargha_delaney_a"]["e1-valkey|e1-postgres"] > 0.9
+    assert report["vargha_delaney_a"]["e1-postgres|e1-valkey"] < 0.1
+    assert abs(report["vargha_delaney_a"]["e1-postgres|e2-postgres"] - 0.5) < 0.1
     cell_ids = {c["cell_id"] for c in report["cells"]}
     assert cell_ids == set(cells)
 
