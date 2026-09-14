@@ -100,6 +100,28 @@ def effect_size_epsilon_squared(h_statistic: float, n_total: int, n_groups: int)
     return (h_statistic - n_groups + 1) / (n_total - n_groups)
 
 
+def vargha_delaney_a(a: list[float], b: list[float]) -> float:
+    """A de Vargha-Delaney (A12, Vargha & Delaney 2000) — probabilidade de uma
+    observação aleatória de `a` ser maior que uma de `b` (empate conta meio).
+    Complementa Dunn: Dunn só diz "esse par difere?" (e, em amostras grandes
+    como as deste projeto — centenas de milhares de requisições por célula —
+    quase sempre "sim", tornando o p-valor pouco informativo sozinho); A12 diz
+    o QUANTO, numa escala 0-1 com limiares convencionados (Vargha & Delaney,
+    2000): ~0,56 pequeno, ~0,64 médio, ~0,71 grande (e o espelho abaixo de 0,5
+    para a direção oposta — A12(a,b) = 1 - A12(b,a)). Ao contrário de Dunn,
+    não é um teste de hipótese com taxa de falso-positivo a proteger, então
+    não fica atrás do gate `reject_h0` do Kruskal-Wallis.
+
+    Calculado via U de Mann-Whitney (mesma base de postos do Dunn, sem exigir
+    normalidade): A12 = U_a / (n_a * n_b), onde U_a conta pares (a_i, b_j) com
+    a_i > b_j (empate soma 0,5) — a fórmula por contagem direta é O(n_a*n_b),
+    inviável nos tamanhos de amostra reais do projeto."""
+    a_arr = np.asarray(a, dtype=float)
+    b_arr = np.asarray(b, dtype=float)
+    u_a = scipy_stats.mannwhitneyu(a_arr, b_arr, alternative="two-sided").statistic
+    return float(u_a / (len(a_arr) * len(b_arr)))
+
+
 @dataclass(frozen=True)
 class TostResult:
     equivalent: bool

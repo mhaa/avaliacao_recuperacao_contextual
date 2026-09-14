@@ -5,6 +5,7 @@ implementacao-md-com-base-nos-staged-snowflake.md)."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from analysis.stats import (
     bootstrap_percentile_ci,
@@ -12,6 +13,7 @@ from analysis.stats import (
     effect_size_epsilon_squared,
     kruskal_wallis,
     tost_equivalence,
+    vargha_delaney_a,
 )
 
 
@@ -93,3 +95,26 @@ def test_tost_does_not_conclude_equivalence_for_samples_separated_beyond_the_mar
     b = rng.normal(130, 5, 300).tolist()  # diferença de 30, muito além da margem de ±5
     result = tost_equivalence(a, b, low_bound=-5, high_bound=5)
     assert result.equivalent is False
+
+
+def test_vargha_delaney_a_is_near_half_for_identical_distributions():
+    rng = np.random.default_rng(8)
+    a = rng.normal(10, 1, 300).tolist()
+    b = rng.normal(10, 1, 300).tolist()
+    assert abs(vargha_delaney_a(a, b) - 0.5) < 0.05
+
+
+def test_vargha_delaney_a_is_large_when_a_is_clearly_shifted_above_b():
+    rng = np.random.default_rng(9)
+    a = rng.normal(30, 1, 300).tolist()
+    b = rng.normal(10, 1, 300).tolist()
+    assert vargha_delaney_a(a, b) > 0.71  # limiar "grande" de Vargha & Delaney (2000)
+
+
+def test_vargha_delaney_a_mirrors_below_half_when_arguments_swap():
+    rng = np.random.default_rng(10)
+    a = rng.normal(30, 1, 300).tolist()
+    b = rng.normal(10, 1, 300).tolist()
+    # A12(a, b) = 1 - A12(b, a) — mesma base de postos do Mann-Whitney U,
+    # só espelhada pela troca de qual grupo é "referência".
+    assert vargha_delaney_a(a, b) == pytest.approx(1 - vargha_delaney_a(b, a))
