@@ -1076,7 +1076,8 @@ def main(argv: list[str] | None = None) -> int:
                 "-reconfigure",
                 f"-backend-config=bucket={args.terraform_state_bucket}",
                 f"-backend-config=prefix=cells/{args.cell}",
-            ]
+            ],
+            cell=args.cell,
         )
         apply_vars = [
             "apply",
@@ -1091,9 +1092,9 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if snapshot_found:
             apply_vars.append(f"-var=data_disk_snapshot={snapshot_name}")
-        terraform(apply_vars)
+        terraform(apply_vars, cell=args.cell)
 
-        outputs = terraform_output_json()
+        outputs = terraform_output_json(cell=args.cell)
         database_ip = outputs["database_internal_ip"]
         service_ip = outputs["service_internal_ip"]
         database_instance = f"tcc-{args.cell}-database"
@@ -1418,7 +1419,7 @@ def main(argv: list[str] | None = None) -> int:
             ]
             if snapshot_found:
                 destroy_vars.append(f"-var=data_disk_snapshot={snapshot_name}")
-            terraform(destroy_vars)
+            terraform(destroy_vars, cell=args.cell)
 
     return 0
 

@@ -9,9 +9,11 @@ import subprocess
 import infra.scripts.cloud_smoke_test as cloud_smoke_test
 from infra.scripts.cloud_smoke_test import (
     _confirm_billable,
+    _tf_data_dir_env,
     build_remote_schema_fixture_script,
     build_remote_verification_script,
     gcloud_ssh_with_retry,
+    terraform,
 )
 
 _ARGS = ("e1-postgres", "postgres", "10.0.0.2", "10.0.0.3", "gcr.io/x/tools:1", "hunter2")
@@ -100,3 +102,40 @@ def test_gcloud_ssh_with_retry_reraises_after_exhausting_attempts(monkeypatch):
         assert False, "deveria ter relançado CalledProcessError"
     except subprocess.CalledProcessError:
         pass
+
+
+def test_tf_data_dir_env_is_isolated_per_cell():
+    # Bug real: docker-compose.yml monta ./infra:/app/infra (read-write) em
+    # TODA invocação do container tools — sem TF_DATA_DIR isolado por
+    # célula, o .terraform/ local é compartilhado entre QUALQUER chamada
+    # Terraform concorrente, de qualquer célula. Confirmado ao vivo: um
+    # `terraform init -reconfigure` manual contra e3-postgres, rodado
+    # enquanto e4-valkey ainda media, reapontou esse ponteiro compartilhado
+    # — o destroy final de e4-valkey rodou contra o backend errado (já
+    # vazio) e reportou "0 destroyed" com as VMs reais ainda de pé.
+    env_a = _tf_data_dir_env("e3-postgres")
+    env_b = _tf_data_dir_env("e4-valkey")
+    assert env_a["TF_DATA_DIR"] == ".terraform-e3-postgres"
+    assert env_b["TF_DATA_DIR"] == ".terraform-e4-valkey"
+    assert env_a["TF_DATA_DIR"] != env_b["TF_DATA_DIR"]
+
+
+def test_tf_data_dir_env_does_not_mutate_global_os_environ(monkeypatch):
+    monkeypatch.delenv("TF_DATA_DIR", raising=False)
+    _tf_data_dir_env("e3-postgres")
+    import os
+
+    assert "TF_DATA_DIR" not in os.environ
+
+
+def test_terraform_passes_the_cell_scoped_tf_data_dir_to_the_subprocess(monkeypatch):
+    captured_kwargs = {}
+
+    def _fake_run(cmd, **kwargs):
+        captured_kwargs.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(cloud_smoke_test, "_run", _fake_run)
+    terraform(["init"], cell="e3-postgres")
+
+    assert captured_kwargs["env"]["TF_DATA_DIR"] == ".terraform-e3-postgres"

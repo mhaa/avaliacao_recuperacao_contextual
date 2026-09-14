@@ -138,7 +138,28 @@ def fetch_terraform_access_token(project_id: str) -> str:
     return result.stdout.strip()
 
 
-def terraform(args: list[str], tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR) -> None:
+def _tf_data_dir_env(cell: str) -> dict[str, str]:
+    """TF_DATA_DIR isolado por célula, passado via env= do subprocess (nunca
+    mutando os.environ global — cada chamada leva só o dela).
+
+    Bug real: docker-compose.yml monta `./infra:/app/infra` (read-write) em
+    TODA invocação do container tools, incluindo o `.terraform/` que
+    `terraform init` cria ali dentro — sem isto, esse diretório é
+    compartilhado entre QUALQUER chamada Terraform concorrente, de qualquer
+    célula, mesmo rodando em containers `--rm` diferentes. Um `terraform
+    init -reconfigure -backend-config=prefix=cells/e3-postgres` rodado
+    manualmente enquanto a confirmação de e4-valkey ainda estava ativa
+    reapontou esse ponteiro local compartilhado — o `terraform destroy`
+    final de e4-valkey (que não reinicializa antes de destruir, só reusa o
+    que já tinha sido inicializado no começo do próprio run) rodou contra o
+    backend errado (cells/e3-postgres, já vazio) e reportou "0 destroyed"
+    com as 3 VMs de e4-valkey ainda de pé e cobrando de verdade. Confirmado
+    ao vivo: `terraform state list` contra o backend correto
+    (cells/e4-valkey) ainda listava os 22 recursos intactos."""
+    return {**os.environ, "TF_DATA_DIR": f".terraform-{cell}"}
+
+
+def terraform(args: list[str], tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR, *, cell: str) -> None:
     cmd = [
         "docker",
         "compose",
@@ -154,10 +175,10 @@ def terraform(args: list[str], tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR) -> None:
         f"-chdir={tf_dir}",
         *args,
     ]
-    _run(cmd)
+    _run(cmd, env=_tf_data_dir_env(cell))
 
 
-def terraform_output_json(tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR) -> dict:
+def terraform_output_json(tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR, *, cell: str) -> dict:
     cmd = [
         "docker",
         "compose",
@@ -182,6 +203,7 @@ def terraform_output_json(tf_dir: str = REPO_ROOT_RELATIVE_TF_DIR) -> dict:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=_tf_data_dir_env(cell),
     )
     parsed = json.loads(result.stdout)
     return {k: v["value"] for k, v in parsed.items()}
@@ -599,7 +621,8 @@ def main(argv: list[str] | None = None) -> int:
                 "-reconfigure",
                 f"-backend-config=bucket={args.terraform_state_bucket}",
                 f"-backend-config=prefix=cells/{args.cell}",
-            ]
+            ],
+            cell=args.cell,
         )
         _phase("terraform apply")
         terraform(
@@ -613,11 +636,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"-var=storage={storage}",
                 f"-var=dataset_bucket={args.dataset_bucket}",
                 f"-var=results_bucket={args.results_bucket}",
-            ]
+            ],
+            cell=args.cell,
         )
 
         _phase("ler outputs")
-        outputs = terraform_output_json()
+        outputs = terraform_output_json(cell=args.cell)
         database_ip = outputs["database_internal_ip"]
         service_ip = outputs["service_internal_ip"]
         database_instance = f"tcc-{args.cell}-database"
@@ -715,7 +739,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"-var=storage={storage}",
                     f"-var=dataset_bucket={args.dataset_bucket}",
                     f"-var=results_bucket={args.results_bucket}",
-                ]
+                ],
+                cell=args.cell,
             )
 
     return 0

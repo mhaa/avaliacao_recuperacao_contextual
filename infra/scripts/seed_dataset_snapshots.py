@@ -223,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"-backend-config=prefix=seed/{args.storage}",
             ],
             tf_dir=TF_DIR,
+            cell=seed_cell,
         )
         terraform(
             [
@@ -237,9 +238,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"-var=results_bucket={args.results_bucket}",
             ],
             tf_dir=TF_DIR,
+            cell=seed_cell,
         )
 
-        outputs = terraform_output_json(tf_dir=TF_DIR)
+        outputs = terraform_output_json(tf_dir=TF_DIR, cell=seed_cell)
         database_ip = outputs["database_internal_ip"]
         data_disk_name = outputs["data_disk_name"]
         database_instance = f"tcc-{seed_cell}-database"
@@ -349,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"-var=results_bucket={args.results_bucket}",
                 ],
                 tf_dir=TF_DIR,
+                cell=seed_cell,
             )
 
     return 0

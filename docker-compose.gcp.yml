@@ -20,3 +20,10 @@ services:
   tools:
     environment:
       - GOOGLE_OAUTH_ACCESS_TOKEN
+      # TF_DATA_DIR isola o .terraform/ local por célula
+      # (infra/scripts/cloud_smoke_test.py:_tf_data_dir_env) — sem isto,
+      # todo `docker compose run --entrypoint terraform` compartilha o
+      # MESMO .terraform/ via bind mount (./infra:/app/infra), e uma
+      # chamada manual/concorrente contra outra célula reaponta o backend
+      # que uma execução já em andamento ainda vai usar no destroy final.
+      - TF_DATA_DIR
