@@ -324,6 +324,35 @@ def test_load_cell_saturation_finds_a_ramp_only_run_that_has_no_repetitions(tmp_
     assert result["e1-postgres"]["approx_throughput"] == 1750.0
 
 
+def test_load_cell_saturation_reads_the_per_tier_files_confirmacao_writes(tmp_path):
+    # Bug real: a rampa de confirmação grava saturation_<tier>.json (uma por
+    # seletividade — rampa adaptativa, docs/DESIGN.md "Rampa de
+    # confirmação"), não um saturation.json único. Sem tratar isso, este
+    # dict voltava vazio pras 4 células de confirmação e o custo/Pareto do
+    # relatório final saía ausente pra elas, silenciosamente.
+    run_dir = tmp_path / "e3-postgres" / "confirmacao" / "20260101T000000Z"
+    run_dir.mkdir(parents=True)
+    (run_dir / "saturation_high.json").write_text(
+        json.dumps({"approx_throughput": 4587.0, "censored": False, "lower_bound": None})
+    )
+    (run_dir / "saturation_medium.json").write_text(
+        json.dumps({"approx_throughput": 3672.0, "censored": False, "lower_bound": None})
+    )
+    (run_dir / "saturation_low.json").write_text(
+        json.dumps({"approx_throughput": 3317.0, "censored": False, "lower_bound": None})
+    )
+
+    result = load_cell_saturation(tmp_path, "confirmacao")
+
+    # "high" representa a célula no nível de topo (usado por build_report
+    # para custo/Pareto) — nenhuma seletividade se perde, todas ficam em
+    # by_tier.
+    assert result["e3-postgres"]["approx_throughput"] == 4587.0
+    assert result["e3-postgres"]["by_tier"]["high"]["approx_throughput"] == 4587.0
+    assert result["e3-postgres"]["by_tier"]["medium"]["approx_throughput"] == 3672.0
+    assert result["e3-postgres"]["by_tier"]["low"]["approx_throughput"] == 3317.0
+
+
 def test_build_report_computes_cost_per_million_requests_and_the_frontier(tmp_path):
     results_root, cells = _build_fake_results(tmp_path)
     rep_dirs = discover_rep_dirs(results_root, "triagem")

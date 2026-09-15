@@ -273,7 +273,20 @@ def load_cell_saturation(results_root: Path, phase: str) -> dict[str, dict]:
     diretório de timestamp novo contendo APENAS saturation.json, sem `rep*/`
     — e `discover_rep_dirs` não o enxerga. O relatório continuaria lendo o
     saturation.json ANTIGO sem emitir aviso nenhum, e todo o custo sairia
-    calculado com o S velho."""
+    calculado com o S velho.
+
+    Confirmação grava saturation_<tier>.json (um por seletividade — rampa
+    adaptativa por seletividade, docs/DESIGN.md "Rampa de confirmação",
+    commit efcc1ff) em vez de um saturation.json único. Sem tratar isso à
+    parte, este dict voltava vazio para as 4 células de confirmação e o
+    custo/Pareto do relatório final saía ausente pra elas, silenciosamente.
+    Os 3 valores ficam preservados em by_tier (nada se perde); a
+    seletividade "high" (a menos restritiva — mais perto do acesso
+    irrestrito ao catálogo, portanto a leitura mais próxima do teto de
+    capacidade da célula) também é exposta no nível de topo do dict, como
+    representante único para o cálculo de custo em build_report — escolha
+    documentada aqui, não escondida atrás de uma média ou heurística
+    opaca."""
     saturation_by_cell: dict[str, dict] = {}
     newest_timestamp_by_cell: dict[str, str] = {}
     for path in results_root.glob(f"*/{phase}/*/saturation.json"):
@@ -282,6 +295,23 @@ def load_cell_saturation(results_root: Path, phase: str) -> dict[str, dict]:
         if timestamp > newest_timestamp_by_cell.get(cell_id, ""):
             newest_timestamp_by_cell[cell_id] = timestamp
             saturation_by_cell[cell_id] = json.loads(path.read_text())
+
+    by_tier_per_cell_and_timestamp: dict[tuple[str, str], dict[str, dict]] = {}
+    for path in results_root.glob(f"*/{phase}/*/saturation_*.json"):
+        cell_id = path.parents[2].name
+        timestamp = path.parent.name
+        tier = path.stem.removeprefix("saturation_")
+        by_tier_per_cell_and_timestamp.setdefault((cell_id, timestamp), {})[tier] = json.loads(
+            path.read_text()
+        )
+    newest_tiered_timestamp_by_cell: dict[str, str] = {}
+    for (cell_id, timestamp), by_tier in by_tier_per_cell_and_timestamp.items():
+        if timestamp > newest_tiered_timestamp_by_cell.get(cell_id, ""):
+            newest_tiered_timestamp_by_cell[cell_id] = timestamp
+            entry = dict(by_tier.get("high", {}))
+            entry["by_tier"] = by_tier
+            saturation_by_cell[cell_id] = entry
+
     return saturation_by_cell
 
 
