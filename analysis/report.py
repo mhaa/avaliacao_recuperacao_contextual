@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -378,6 +381,56 @@ def returned_count_stats(pairs: list[tuple[int, int]]) -> dict:
     }
 
 
+def _compute_cell_report_entry(
+    cell_id: str,
+    latencies: np.ndarray,
+    saturation: dict,
+    storage_root: Path,
+) -> tuple[dict, dict]:
+    """Trabalho pesado de UMA célula (percentil + IC bootstrap do p99) —
+    função de módulo (não um closure) de propósito: ProcessPoolExecutor
+    precisa dar pickle na função e nos argumentos para mandar a outro
+    processo. Roda num processo separado por célula (build_report) porque
+    bootstrap_percentile_ci é single-threaded (np.percentile/sort não
+    paraleliza via BLAS) — confirmado ao vivo numa VM de 8 núcleos rodando
+    só 1 (load average 1.00, ~103% de CPU), enquanto a confirmação pool
+    20-30M+ linhas por célula em vez das ~1.5M da triagem, elevando o tempo
+    de minutos para horas num único núcleo."""
+    started = time.monotonic()
+    n = len(latencies)
+    print(f"[{cell_id}] iniciando (N={n} requisições)...", flush=True)
+    p99 = percentiles_of(latencies)["p99"]
+    storage_bytes = storage_bytes_for_cell(cell_id, storage_root)
+    medium = storage_medium_for_cell(cell_id)
+    compute_month = unit_compute_cost_usd_month(cell_id)
+    storage_month = unit_storage_cost_usd_month(cell_id, storage_root)
+    ci = bootstrap_percentile_ci(latencies, percentile=0.99)
+    elapsed = time.monotonic() - started
+    print(f"[{cell_id}] concluído em {elapsed:.1f}s (p99={p99:.2f}ms)", flush=True)
+    entry = {
+        "cell_id": cell_id,
+        "latency_p99_ms": p99,
+        "storage_bytes": storage_bytes,
+        "storage_medium": medium,
+        # memory_bytes só para tecnologias residentes em memória: é o
+        # que alimenta ⌈V_mem/M⌉ em analysis/pareto.py. Para as de
+        # disco fica 0, deixando o termo de capacidade inerte.
+        "memory_bytes": storage_bytes if medium == "memory" else 0,
+        "memory_per_unit_bytes": MEMORY_PER_UNIT_BYTES,
+        "unit_compute_usd_month": compute_month,
+        "unit_storage_usd_month": storage_month,
+        "unit_cost_usd_month": compute_month + storage_month,
+        "saturation_throughput_approx": saturation.get("approx_throughput"),
+        "saturation_censored": saturation.get("censored", False),
+        "saturation_lower_bound": saturation.get("lower_bound"),
+        # .get com default: saturation.json arquivado ANTES desta
+        # chave existir continua legível (naqueles, 0.0 é ambíguo
+        # entre "ocioso" e "não medido" — ver README, Fase 5).
+        "saturation_generator_cpu_unmeasured": saturation.get("generator_cpu_unmeasured", False),
+    }
+    return entry, {"low": ci.low, "high": ci.high}
+
+
 def build_report(
     groups: dict[str, list[float]],
     saturation_by_cell: dict[str, dict] | None = None,
@@ -405,42 +458,40 @@ def build_report(
         if a != b
     }
 
-    cells = []
-    bootstrap_ci_p99 = {}
-    for cell_id, latencies in groups.items():
-        p99 = percentiles_of(latencies)["p99"]
-        saturation = saturation_by_cell.get(cell_id, {})
-        storage_bytes = storage_bytes_for_cell(cell_id, storage_root)
-        medium = storage_medium_for_cell(cell_id)
-        compute_month = unit_compute_cost_usd_month(cell_id)
-        storage_month = unit_storage_cost_usd_month(cell_id, storage_root)
-        cells.append(
-            {
-                "cell_id": cell_id,
-                "latency_p99_ms": p99,
-                "storage_bytes": storage_bytes,
-                "storage_medium": medium,
-                # memory_bytes só para tecnologias residentes em memória: é o
-                # que alimenta ⌈V_mem/M⌉ em analysis/pareto.py. Para as de
-                # disco fica 0, deixando o termo de capacidade inerte.
-                "memory_bytes": storage_bytes if medium == "memory" else 0,
-                "memory_per_unit_bytes": MEMORY_PER_UNIT_BYTES,
-                "unit_compute_usd_month": compute_month,
-                "unit_storage_usd_month": storage_month,
-                "unit_cost_usd_month": compute_month + storage_month,
-                "saturation_throughput_approx": saturation.get("approx_throughput"),
-                "saturation_censored": saturation.get("censored", False),
-                "saturation_lower_bound": saturation.get("lower_bound"),
-                # .get com default: saturation.json arquivado ANTES desta
-                # chave existir continua legível (naqueles, 0.0 é ambíguo
-                # entre "ocioso" e "não medido" — ver README, Fase 5).
-                "saturation_generator_cpu_unmeasured": saturation.get(
-                    "generator_cpu_unmeasured", False
-                ),
-            }
-        )
-        ci = bootstrap_percentile_ci(latencies, percentile=0.99)
-        bootstrap_ci_p99[cell_id] = {"low": ci.low, "high": ci.high}
+    # Um processo por célula: percentiles_of + bootstrap_percentile_ci são o
+    # gargalo real (bootstrap é single-threaded, np.percentile/sort não
+    # paraleliza via BLAS — confirmado ao vivo numa VM de 8 núcleos rodando
+    # só 1). max_workers limitado a os.cpu_count() (nunca mais que o nº de
+    # células, ProcessPoolExecutor não reaproveita workers ociosos além do
+    # necessário) — cada worker aloca seu próprio lote do bootstrap
+    # (analysis/stats.py:_BOOTSTRAP_BATCH_TARGET_BYTES), então o teto de
+    # memória agregado escala com max_workers, não com o nº de células.
+    max_workers = max(1, min(len(labels), os.cpu_count() or 1))
+    print(
+        f"Calculando estatísticas por célula ({len(labels)} células, até "
+        f"{max_workers} em paralelo)...",
+        flush=True,
+    )
+    results_by_cell: dict[str, tuple[dict, dict]] = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _compute_cell_report_entry,
+                cell_id,
+                np.asarray(latencies, dtype=float),
+                saturation_by_cell.get(cell_id, {}),
+                storage_root,
+            ): cell_id
+            for cell_id, latencies in groups.items()
+        }
+        for future in as_completed(futures):
+            cell_id = futures[future]
+            results_by_cell[cell_id] = future.result()
+
+    # Ordem determinística (sorted por cell_id), não a ordem de conclusão do
+    # ProcessPoolExecutor — mesma disciplina de discover_rep_dirs.
+    cells = [results_by_cell[cell_id][0] for cell_id in sorted(results_by_cell)]
+    bootstrap_ci_p99 = {cell_id: ci for cell_id, (_, ci) in results_by_cell.items()}
 
     cost_model_warnings = []
 
