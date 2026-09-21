@@ -26,7 +26,7 @@ e em nenhum outro.
 ```
 .
 ├── README.md                    # ponto de entrada
-├── docs/                        # este arquivo, DESIGN.md, DECISIONS.md, BENCHMARKS.md
+├── docs/                        # este arquivo, DESIGN.md, DECISIONS.md, BENCHMARKS.md, ARMAZENAMENTO.md
 ├── pyproject.toml
 ├── Makefile                     # atalhos; ver seção "Interface"
 ├── docker-compose.yml           # ambiente local (Postgres/Valkey/Scylla/OpenSearch)
