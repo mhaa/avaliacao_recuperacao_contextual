@@ -226,12 +226,29 @@ class GCPMonitoringCollector:
         samples: list[ResourceSample] = []
         for component, instance_name in self._instance_by_component.items():
             cpu_percent = self._cpu_utilization_percent(client, project_name, instance_name, interval)
-            received_bytes = self._mean_value(
-                client, project_name, self._NETWORK_RECEIVED_METRIC, instance_name, interval
-            )
-            sent_bytes = self._mean_value(
-                client, project_name, self._NETWORK_SENT_METRIC, instance_name, interval
-            )
+            # Best-effort, igual a memory_available_bytes abaixo: rede é a
+            # única métrica aqui que vem nativa do Compute Engine, sem
+            # nenhum agente (docstring da classe) — na prática ela tem uma
+            # cadência de emissão bem mais esparsa e menos previsível que as
+            # exportadas pelo OTel Collector (~1 ponto a cada ~100s,
+            # confirmado ao vivo em e3-postgres/2026-09-21), então uma
+            # janela de RESOURCE_QUERY_WINDOW_SECONDS sem nenhum ponto de
+            # rede é comum, não excepcional. Antes disto, essa falta
+            # derrubava a amostra INTEIRA (CPU e memória incluídos, que já
+            # tinham chegado certos) — visto ao vivo repetindo "AVISO: falha
+            # ao amostrar recursos" dezenas de vezes seguidas na mesma
+            # medição enquanto CPU/memória continuavam disponíveis o tempo
+            # todo.
+            try:
+                received_bytes = self._mean_value(
+                    client, project_name, self._NETWORK_RECEIVED_METRIC, instance_name, interval
+                )
+                sent_bytes = self._mean_value(
+                    client, project_name, self._NETWORK_SENT_METRIC, instance_name, interval
+                )
+                network_mbps = (received_bytes + sent_bytes) * 8 / 1_000_000 / window_seconds
+            except ValueError:
+                network_mbps = None
             memory_bytes = self._mean_value(
                 client,
                 project_name,
@@ -242,7 +259,7 @@ class GCPMonitoringCollector:
             )
             # Best-effort: MemAvailable é recém-habilitada (ver docstring da
             # classe) — uma janela sem série ainda não deve derrubar CPU/
-            # rede/memória-used, que já funcionam e nada aqui depende dela.
+            # memória-used, que já funcionam e nada aqui depende dela.
             try:
                 memory_available_bytes = self._mean_value(
                     client, project_name, self._MEMORY_AVAILABLE_METRIC, instance_name, interval
@@ -255,7 +272,7 @@ class GCPMonitoringCollector:
                     component=component,
                     cpu_percent=cpu_percent,
                     memory_mb=memory_bytes / (1024**2),
-                    network_mbps=(received_bytes + sent_bytes) * 8 / 1_000_000 / window_seconds,
+                    network_mbps=network_mbps,
                     timestamp=self._end_time,
                     memory_available_mb=memory_available_mb,
                 )

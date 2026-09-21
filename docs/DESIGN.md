@@ -334,6 +334,20 @@ main.tf`), então uma janela mais estreita que esse piso de ~60s nunca contém
 execuções da confirmação rodaram inteiras sem gravar uma única amostra por
 essa causa — `analysis/resources.py`, docstring de `_CPU_METRIC`).
 
+Rede (`compute.googleapis.com/instance/network/*`) é a única métrica aqui
+nativa do Compute Engine, sem nenhum agente — mas, na prática, tem cadência
+de emissão bem mais esparsa e menos previsível que as exportadas pelo OTel
+Collector (achado ao vivo re-medindo e3-postgres/seletividade média,
+2026-09-21: ~1 ponto a cada ~100s contra os ~5 pontos por janela de CPU/
+memória). `GCPMonitoringCollector.collect()` tratava QUALQUER métrica
+faltando como erro fatal da amostra inteira — então uma janela de 150s sem
+nenhum ponto de rede descartava CPU e memória daquele instante junto,
+mesmo as duas tendo chegado certas (visto ao vivo: dezenas de "AVISO: falha
+ao amostrar recursos" seguidos, com CPU/memória disponíveis o tempo todo
+via consulta direta). Corrigido: rede agora é best-effort, mesmo padrão já
+usado para `memory_available_mb` — uma janela sem ponto de rede vira
+`network_mbps=None` nessa amostra, sem derrubar CPU/memória.
+
 ### Métricas
 
 p50, p95, p99, p99,9 da latência · vazão atendida · vazão de saturação
