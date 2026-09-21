@@ -5,6 +5,7 @@ disciplina de storage/tests/fakes.py."""
 from __future__ import annotations
 
 from load.saturation import (
+    BACKWARD_WALK_MAX_STEPS,
     GENERATOR_CPU_THRESHOLD,
     ProbeResult,
     doubling_sequence,
@@ -174,6 +175,69 @@ def test_run_saturation_search_min_step_still_respects_the_iteration_ceiling():
     # 1000,2000,4000,8000 (ok),16000 (viola) = 5 sondagens da rampa + no
     # máximo 3 da busca binária (teto de iterations) = no máximo 8.
     assert len(calls) <= 8
+
+
+def test_run_saturation_search_steps_backward_before_binary_search_when_the_first_probe_already_violates():
+    # Ponto de partida (ex.: vindo de uma triagem otimista, método pooled
+    # antigo) já viola o SLO na própria primeira sondagem. Sem recuar,
+    # last_valid fica no sentinela 0 e a busca binária receberia [0, 4000]
+    # inteiro — sondaria rate=2000 (bem abaixo do limiar real) só para
+    # descobrir o óbvio. Com o recuo em passos de 10%, nenhuma sondagem
+    # deveria cair muito abaixo do limiar real (3600).
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=rate > 3_600, generator_cpu_percent=10.0)
+
+    result = run_saturation_search(
+        probe_fn,
+        start_rate=4_000,
+        step_mode="fine",
+        binary_search_min_step=50,
+        binary_search_iterations=20,
+    )
+    assert abs(result.approx_throughput - 3_600) <= 50
+    assert min(calls) > 3_000
+
+
+def test_run_saturation_search_does_not_step_backward_without_min_step():
+    # Sem min_step, o número de iterações da busca binária já é fixo
+    # (binary_search_iterations) independente da largura do bracket —
+    # recuar não economizaria nada, só somaria sondagens extras. O
+    # comportamento antigo (bracket [0, start] inteiro) continua valendo.
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=rate > 3_600, generator_cpu_percent=10.0)
+
+    run_saturation_search(probe_fn, start_rate=4_000, step_mode="fine")
+    # bracket [0, 4000]: o primeiro ponto médio da busca binária é 2000.
+    assert 2_000 in calls
+
+
+def test_run_saturation_search_backward_walk_gives_up_after_max_steps_for_a_pathological_cell():
+    # Célula que viola até perto de zero (cenário raro/degenerado) — o
+    # recuo não pode rodar pra sempre; desiste após BACKWARD_WALK_MAX_STEPS
+    # e cai no bracket [0, high] como antes de existir o recuo.
+    calls: list[int] = []
+
+    def always_violates(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=True, generator_cpu_percent=10.0)
+
+    run_saturation_search(
+        always_violates,
+        start_rate=4_000,
+        step_mode="fine",
+        binary_search_min_step=50,
+        binary_search_iterations=5,
+    )
+    # 1 sondagem da rampa + no máximo BACKWARD_WALK_MAX_STEPS de recuo +
+    # no máximo binary_search_iterations da busca binária = teto pequeno,
+    # nunca explode mesmo numa célula degenerada.
+    assert len(calls) <= 1 + BACKWARD_WALK_MAX_STEPS + 5
 
 
 def test_run_saturation_search_without_min_step_keeps_the_old_fixed_iteration_behavior():

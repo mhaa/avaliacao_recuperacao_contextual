@@ -283,7 +283,19 @@ continuam vindo do método antigo, "pooled"):
   intervalo (req/s), não por um número fixo de iterações
   (`load/saturation.py:_binary_search`) — para quando se quer um `S` com
   precisão-alvo em vez de uma resolução implícita pelo número de
-  iterações.
+  iterações. Com essa mudança, a largura do bracket inicial passa a
+  determinar o custo da busca — o que expôs outro problema: se a
+  PRIMEIRA sondagem da rampa (`--saturation-start`, vindo da triagem
+  antiga, método `pooled`, possivelmente otimista) já violar o SLO, o
+  bracket entregue à busca binária seria `[0, start]` inteiro, não
+  `[0.9×start, start]`. Corrigido com `_backward_walk_to_bracket`
+  (`load/saturation.py`): nesse caso específico, a busca recua na mesma
+  grade geométrica de 10% antes de entrar na busca binária, até achar um
+  patamar que não viola — um teto de `BACKWARD_WALK_MAX_STEPS=10` recuos
+  evita rodar indefinidamente numa célula degenerada. Só ativa quando
+  `binary_search_min_step` está definido: no modo de iterações fixas
+  (triagem, ou confirmação sem essa flag) a largura do bracket não muda o
+  custo da busca, então recuar só somaria sondagens sem ganho.
 - A rampa de confirmação passou a repetir o patamar final aprovado
   (`confirm_repetitions=CONFIRMATION_REPETITIONS`, mecanismo que já
   existia só para a rampa curta da triagem) — o `S` reportado ganha

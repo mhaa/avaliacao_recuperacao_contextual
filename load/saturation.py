@@ -38,6 +38,7 @@ GENERATOR_CPU_THRESHOLD = 60.0  # docs/DESIGN.md: "válido só se CPU do gerador
 CEILING_RPS = 50_000  # teto da busca — decisão do usuário para este protocolo
 DEFAULT_START_RATE = 1_000  # nível intermediário, mesmo da carga fixa da triagem
 BINARY_SEARCH_ITERATIONS = 5
+BACKWARD_WALK_MAX_STEPS = 10
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,17 @@ def _any_cpu_unmeasured(probes: list[ProbeResult]) -> bool:
     return any(p.generator_cpu_percent is None for p in probes)
 
 
+def _bottleneck_result(probes: list[ProbeResult]) -> SaturationSearchResult:
+    return SaturationSearchResult(
+        approx_throughput=None,
+        censored=False,
+        lower_bound=None,
+        loadgen_bottleneck=True,
+        generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
+        probes=probes,
+    )
+
+
 def doubling_sequence(start: int, ceiling: int = CEILING_RPS) -> Iterator[int]:
     """1000, 2000, 4000, ... dobrando; o último patamar antes do teto é
     truncado para o teto exato em vez de ultrapassá-lo (rampa curta,
@@ -176,6 +188,43 @@ def _binary_search(
     return low
 
 
+def _backward_walk_to_bracket(
+    probe_fn: Callable[[int], ProbeResult],
+    start_high: int,
+    step: float,
+    probes: list[ProbeResult],
+    max_steps: int = BACKWARD_WALK_MAX_STEPS,
+) -> tuple[int, int]:
+    """Quando a PRIMEIRA sondagem da rampa já viola o SLO, `last_valid`
+    continua no sentinela 0 e a busca binária receberia o bracket inteiro
+    [0, start] — caro com `binary_search_min_step`, cujo número de
+    iterações escala com a largura do bracket (docs/DESIGN.md: achado ao
+    vivo re-medindo seletividade média, ponto de partida vindo da triagem
+    antiga — pooled, possivelmente otimista — que pode já vir violando sob
+    `median-per-repetition`).
+
+    Anda para trás na MESMA grade geométrica de `fine_sequence` (÷ (1+step)
+    a cada passo) até achar um patamar que não viola, devolvendo um
+    bracket estreito (~`step` de largura) para a busca binária, em vez de
+    um bracket [0, start] largo. Teto de `max_steps`: rede de segurança
+    contra uma célula que satura mesmo perto de zero — nesse caso desiste
+    e devolve low=0 (equivalente ao comportamento anterior a esta função),
+    com `high` ainda tão apertado quanto o recuo conseguiu chegar."""
+    high = start_high
+    for _ in range(max_steps):
+        low = round(high / (1 + step))
+        if low <= 0:
+            return 0, high
+        result = probe_fn(low)
+        probes.append(result)
+        if _generator_saturated(result):
+            return low, high
+        if not result.violated_slo:
+            return low, high
+        high = low
+    return 0, high
+
+
 def _confirm_final_level(
     probe_fn: Callable[[int], ProbeResult],
     rate: int,
@@ -227,7 +276,12 @@ def run_saturation_search(
     se quer um `S` com precisão-alvo em req/s, não um número fixo de
     sondagens); `binary_search_iterations` continua valendo como teto de
     segurança nesse modo, então o chamador deve passar um valor generoso o
-    bastante para a largura pedida caber (ver docs/DESIGN.md)."""
+    bastante para a largura pedida caber (ver docs/DESIGN.md). Nesse mesmo
+    modo, se a PRIMEIRA sondagem da rampa já violar o SLO (`start_rate`
+    otimista, ex. vindo de uma triagem medida pelo método `pooled`
+    antigo), a busca recua em passos de `step` (`_backward_walk_to_bracket`)
+    antes de entrar na busca binária — sem isso o bracket ficaria [0,
+    start_rate] inteiro, custando iterações binárias demais."""
     sequence = (
         doubling_sequence(start_rate, ceiling)
         if step_mode == "doubling"
@@ -241,33 +295,31 @@ def run_saturation_search(
         probes.append(result)
 
         if _generator_saturated(result):
-            return SaturationSearchResult(
-                approx_throughput=None,
-                censored=False,
-                lower_bound=None,
-                loadgen_bottleneck=True,
-                generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
-                probes=probes,
-            )
+            return _bottleneck_result(probes)
 
         if result.violated_slo:
+            search_low, search_high = last_valid, rate
+            # Primeira sondagem da rampa já violando (last_valid ainda no
+            # sentinela 0): sem isso a busca binária receberia [0, rate]
+            # inteiro. Só compensa recuar quando min_step está ativo — no
+            # modo de iterações fixas (triagem, ou confirmação sem
+            # --saturation-min-step) a largura do bracket não muda o custo
+            # da busca binária, então recuar só somaria sondagens extras
+            # sem nenhum ganho.
+            if last_valid == 0 and binary_search_min_step is not None:
+                search_low, search_high = _backward_walk_to_bracket(probe_fn, rate, step, probes)
+                if _generator_saturated(probes[-1]):
+                    return _bottleneck_result(probes)
             approx = _binary_search(
                 probe_fn,
-                last_valid,
-                rate,
+                search_low,
+                search_high,
                 binary_search_iterations,
                 probes,
                 min_step=binary_search_min_step,
             )
             if _generator_saturated(probes[-1]):
-                return SaturationSearchResult(
-                    approx_throughput=None,
-                    censored=False,
-                    lower_bound=None,
-                    loadgen_bottleneck=True,
-                    generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
-                    probes=probes,
-                )
+                return _bottleneck_result(probes)
             # Confirmação só do patamar aprovado, e só quando há um: uma
             # célula censurada não tem patamar de violação para repetir (e o
             # custo dela nem usa S como valor pontual — ⌈D/S⌉ = 1 sai da
