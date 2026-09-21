@@ -21,10 +21,12 @@ from infra.scripts.run_measurement_battery import (
     _high_rate_from_saturation,
     _parse_probe_result,
     _write_saturation_json,
+    build_final_level_confirmation_commands,
     build_remote_battery_command,
     build_remote_probe_aggregate_command,
     build_remote_probe_rep_command,
     build_remote_setup_command,
+    build_remote_stat_capture_command,
     build_remote_upload_command,
     build_saturation_upload_cmd,
     build_sweep,
@@ -227,6 +229,47 @@ def test_build_saturation_upload_cmd_copies_the_host_local_file_to_the_matching_
         str(Path("results") / "e3-postgres" / "confirmacao" / "20260101T000000Z" / "saturation_medium.json"),
         "gs://my-results-bucket/e3-postgres/confirmacao/20260101T000000Z/saturation_medium.json",
     ]
+
+
+def test_build_remote_stat_capture_command_writes_proc_stat_to_the_matching_before_after_path():
+    cmd = build_remote_stat_capture_command(
+        "e3-postgres/confirmacao/20260101T000000Z/3980-medium", "before",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+    )
+    assert "mkdir -p /app/results/e3-postgres/confirmacao/20260101T000000Z/3980-medium" in cmd
+    assert (
+        "cat /proc/stat | head -1 > "
+        "/app/results/e3-postgres/confirmacao/20260101T000000Z/3980-medium/before_stat.txt"
+    ) in cmd
+
+
+def test_build_final_level_confirmation_commands_archives_reps_under_the_rate_tier_combo_dir():
+    # O ponto central da otimização: as repetições do patamar aprovado
+    # precisam cair no MESMO layout <cell>/<phase>/<timestamp>/<rate>-<tier>/
+    # repN/ que a bateria de carga fixa usaria — é isso que permite pular a
+    # combinação "alta" da bateria (--only-saturation) sem perder o dado.
+    prep_commands, aggregate_command = build_final_level_confirmation_commands(
+        "e3-postgres", "http://svc:8000/v1/recommendations", "confirmacao",
+        3980, "medium", "20260101T000000Z", "gcr.io/x/tools:1",
+        "/home/tcc/results", "/home/tcc/load-fixtures", "3m", "median-per-repetition", 5,
+        region="us-east4", zone="us-east4-a", results_bucket="my-results-bucket",
+        user_count=200_948,
+    )
+    assert len(prep_commands) == 7  # before-stat + 5 reps + after-stat
+    assert "before_stat.txt" in prep_commands[0]
+    assert "after_stat.txt" in prep_commands[-1]
+    for rep, cmd in enumerate(prep_commands[1:6]):
+        assert "load/run_battery.py" in cmd
+        assert f"--repetition-index {rep}" in cmd
+        assert "--rate 3980" in cmd
+        assert "--selectivity-tier medium" in cmd
+    assert "analysis/probe_report.py" in aggregate_command
+    assert "--decision-statistic median-per-repetition" in aggregate_command
+    for rep in range(5):
+        assert (
+            f"/app/results/e3-postgres/confirmacao/20260101T000000Z/3980-medium/rep{rep}/requests.ndjson"
+            in aggregate_command
+        )
 
 
 def test_build_remote_upload_command_passes_local_dir_bucket_and_prefix_as_argv():

@@ -65,7 +65,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -608,6 +608,117 @@ def build_remote_probe_aggregate_command(
         inner,
     ]
     return shlex.join(docker_argv)
+
+
+def build_remote_stat_capture_command(
+    remote_subdir: str, when: str, tools_image: str, results_mount: str, fixtures_mount: str
+) -> str:
+    """Captura /proc/stat isolada, para quando o gerador de CPU precisa ser
+    lido ANTES/DEPOIS de um bloco de repetições que não é uma sondagem
+    própria (build_remote_probe_rep_command já faz isso, mas só dentro do
+    fluxo de sondagem) — usada por build_final_level_confirmation_commands
+    para bracketar as repetições arquivadas do patamar final com o mesmo
+    par before/after_stat.txt que build_remote_probe_aggregate_command
+    espera. `mkdir -p` primeiro: pode rodar antes de qualquer repetição
+    real ter criado remote_subdir."""
+    inner = (
+        shlex.join(["mkdir", "-p", f"/app/results/{remote_subdir}"])
+        + f" && cat /proc/stat | head -1 > {_probe_stat_path(remote_subdir, when)}"
+    )
+    docker_argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        "-v",
+        f"{results_mount}:/app/results",
+        "-v",
+        f"{fixtures_mount}:/app/load/fixtures:ro",
+        "--entrypoint",
+        "bash",
+        tools_image,
+        "-c",
+        inner,
+    ]
+    return shlex.join(docker_argv)
+
+
+def build_final_level_confirmation_commands(
+    cell_id: str,
+    target_url: str,
+    phase: str,
+    rate: int,
+    tier: str,
+    timestamp: str,
+    tools_image: str,
+    results_mount: str,
+    fixtures_mount: str,
+    measure: str,
+    decision_statistic: str,
+    repetitions: int,
+    region: str | None = None,
+    zone: str | None = None,
+    results_bucket: str | None = None,
+    *,
+    user_count: int,
+) -> tuple[list[str], str]:
+    """Confirma o patamar aprovado pela busca de saturação RODANDO-O como se
+    fosse a combinação "alta" da bateria de carga fixa (build_remote_battery_command,
+    mesmo formato arquivado — com manifest.json — que analysis/report.py lê),
+    em vez da sondagem leve de load/saturation.py:_confirm_final_level (que
+    grava só em _saturation/, sem manifest.json, nunca visto pelo
+    relatório). Elimina a duplicação de medir o patamar final duas vezes —
+    uma pela confirmação (auditoria descartável) e outra pela bateria fixa
+    (dado arquivado) — usando as MESMAS `repetitions` sondagens para as duas
+    coisas: dado arquivado (as respostas de build_remote_battery_command) e
+    trilha de dispersão (per_rep_p99_ms/per_rep_violated_slo do agregado via
+    --decision-statistic median-per-repetition). Combinado com
+    --only-saturation (que já pula a bateria de carga fixa inteira) e o
+    reaproveitamento dos níveis 100/1000 já medidos na campanha original,
+    fica só 1 conjunto de repetições no patamar alto, não 3.
+
+    Devolve (comandos_preparatórios, comando_agregado): o chamador roda os
+    primeiros em sequência (captura de CPU antes, as `repetitions`
+    repetições arquivadas, captura de CPU depois) e por último o agregado,
+    lendo o veredito da última linha PROBE_RESULT do stdout."""
+    remote_subdir = f"{cell_id}/{phase}/{timestamp}/{rate}-{tier}"
+    prep_commands = [
+        build_remote_stat_capture_command(remote_subdir, "before", tools_image, results_mount, fixtures_mount)
+    ]
+    for rep in range(repetitions):
+        prep_commands.append(
+            build_remote_battery_command(
+                cell_id,
+                target_url,
+                phase,
+                rate,
+                tier,
+                rep,
+                tools_image,
+                results_mount,
+                fixtures_mount,
+                timestamp,
+                region=region,
+                zone=zone,
+                results_bucket=results_bucket,
+                user_count=user_count,
+            )
+        )
+    prep_commands.append(
+        build_remote_stat_capture_command(remote_subdir, "after", tools_image, results_mount, fixtures_mount)
+    )
+    aggregate_command = build_remote_probe_aggregate_command(
+        remote_subdir,
+        repetitions,
+        rate,
+        measure,
+        tools_image,
+        results_mount,
+        fixtures_mount,
+        decision_statistic=decision_statistic,
+    )
+    return prep_commands, aggregate_command
 
 
 def build_remote_upload_command(
@@ -1393,12 +1504,15 @@ def main(argv: list[str] | None = None) -> int:
                     probe_fn,
                     start_rate=int(args.saturation_start),
                     step_mode="fine",
-                    # "Repetir o patamar encontrado para confirmar" — reusa
-                    # _confirm_final_level (load/saturation.py), até agora só
-                    # ligado na rampa curta da triagem. Nunca recalcula
-                    # approx_throughput; só popula final_level_probes para a
-                    # dispersão do S ficar visível, não um ensaio único.
-                    confirm_repetitions=CONFIRMATION_REPETITIONS,
+                    # confirm_repetitions=0: a confirmação leve de
+                    # load/saturation.py:_confirm_final_level (grava só em
+                    # _saturation/, sem manifest.json) foi substituída pelo
+                    # bloco abaixo, que roda o patamar aprovado no formato
+                    # arquivado da bateria de carga fixa — as mesmas
+                    # repetições servem de dado real (para o relatório) E de
+                    # trilha de dispersão, em vez de medir o patamar alto
+                    # duas vezes.
+                    confirm_repetitions=0,
                     binary_search_min_step=args.saturation_min_step,
                     binary_search_iterations=(
                         SATURATION_MIN_STEP_ITERATION_CEILING
@@ -1407,6 +1521,51 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 )
                 _report_saturation(saturation, label=tier)
+                if (
+                    not saturation.censored
+                    and not saturation.loadgen_bottleneck
+                    and saturation.approx_throughput is not None
+                ):
+                    approved_rate = round(saturation.approx_throughput)
+                    print(
+                        f"\n--- confirmando patamar aprovado ({approved_rate} req/s, {tier}) "
+                        "com dado arquivado (serve de bateria de carga 'alta' também) ---"
+                    )
+                    prep_commands, aggregate_command = build_final_level_confirmation_commands(
+                        args.cell,
+                        target_url,
+                        args.phase,
+                        approved_rate,
+                        tier,
+                        timestamp,
+                        tools_image,
+                        RESULTS_MOUNT,
+                        FIXTURES_MOUNT,
+                        CONFIRMATION_MEASURE,
+                        args.decision_statistic,
+                        CONFIRMATION_REPETITIONS,
+                        region=args.region,
+                        zone=args.zone,
+                        results_bucket=args.results_bucket,
+                        user_count=args.user_count,
+                    )
+                    for cmd in prep_commands:
+                        gcloud_ssh_with_retry(loadgen_instance, args.zone, args.project_id, cmd)
+                    agg_result = gcloud_ssh_with_retry(
+                        loadgen_instance, args.zone, args.project_id, aggregate_command
+                    )
+                    verdict = _parse_probe_result(agg_result.stdout)
+                    final_probe = ProbeResult(
+                        rate=approved_rate,
+                        violated_slo=verdict.violated_slo,
+                        generator_cpu_percent=verdict.generator_cpu_percent,
+                        p99_ms=verdict.p99_ms,
+                        error_rate=verdict.error_rate,
+                        offered_ratio=verdict.offered_ratio,
+                        per_rep_p99_ms=verdict.per_rep_p99_ms,
+                        per_rep_violated_slo=verdict.per_rep_violated_slo,
+                    )
+                    saturation = replace(saturation, final_level_probes=[final_probe])
                 saturation_filename = f"saturation_{tier}.json"
                 _write_saturation_json(
                     saturation, args.cell, args.phase, timestamp, filename=saturation_filename

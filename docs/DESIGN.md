@@ -296,11 +296,29 @@ continuam vindo do método antigo, "pooled"):
   `binary_search_min_step` está definido: no modo de iterações fixas
   (triagem, ou confirmação sem essa flag) a largura do bracket não muda o
   custo da busca, então recuar só somaria sondagens sem ganho.
-- A rampa de confirmação passou a repetir o patamar final aprovado
-  (`confirm_repetitions=CONFIRMATION_REPETITIONS`, mecanismo que já
-  existia só para a rampa curta da triagem) — o `S` reportado ganha
-  dispersão visível (`final_level_probes`) em vez de vir de sondagens
-  isoladas dentro da própria busca.
+- A rampa de confirmação confirma o patamar aprovado rodando-o no MESMO
+  formato arquivado da combinação "alta" da bateria de carga fixa
+  (`build_final_level_confirmation_commands`, reusa
+  `build_remote_battery_command` — grava `manifest.json`, visível para
+  `analysis/report.py`), em vez do mecanismo leve `confirm_repetitions`
+  de `load/saturation.py:_confirm_final_level` (que grava só em
+  `_saturation/`, nunca lido pelo relatório — esse mecanismo continua
+  ativo só na rampa curta da triagem, com `confirm_repetitions=
+  CONFIRMATION_REPETITIONS`; a confirmação passa `confirm_repetitions=0`
+  agora). Achado ao vivo medindo e3-postgres: antes, o patamar final era
+  medido DUAS vezes — uma pela confirmação leve (descartável) e outra pela
+  bateria de carga fixa (arquivada) — 25 repetições reais no total (5 da
+  confirmação, cada uma internamente 5 reps de `--decision-statistic
+  median-per-repetition`). Agora são as MESMAS 5 repetições arquivadas que
+  servem de dado real (para o relatório) e de trilha de dispersão
+  (`final_level_probes` passa a ter 1 `ProbeResult` só, cujo próprio
+  `per_rep_p99_ms`/`per_rep_violated_slo` já contém os 5 valores — não
+  mais 5 `ProbeResult`s separados). Combinado com `--only-saturation`
+  (pula a bateria de carga fixa inteira) e o reaproveitamento dos níveis
+  100/1.000 já medidos na campanha original (inalterados pelo problema do
+  `pooled`, que só afetava a decisão da BUSCA de saturação), a re-medição
+  de uma célula passa a rodar só as sondagens da busca + 5 repetições no
+  patamar alto — nenhuma repetição redundante.
 - `saturation.json`/`saturation_<tier>.json` passam a registrar, por
   sondagem, `per_rep_p99_ms`/`per_rep_violated_slo` (trilha de auditoria de
   `--decision-statistic median-per-repetition`) — `None` no modo `pooled`
@@ -319,6 +337,11 @@ continuam vindo do método antigo, "pooled"):
 Status desta campanha: só a seletividade média, nas 4 células
 (e2-scylla, e3-postgres, e3-valkey, e4-valkey), foi re-medida com o método
 novo. Seletividade baixa e alta continuam valendo pela execução original.
+e3-postgres/média (2026-09-21, S≈3980 req/s) rodou ANTES da otimização de
+confirmação arquivada acima — sem `--only-saturation`, mediu 100/1.000/alto
+de novo (dado válido, só redundante com o já existente). e2-scylla,
+e3-valkey e e4-valkey usam `--only-saturation` com a confirmação já
+arquivada, sem essa redundância.
 
 **Atribuição de gargalo** — durante a rampa de confirmação, `resources.csv`
 registra CPU/memória/rede das 3 VMs (banco, serviço, gerador), para
