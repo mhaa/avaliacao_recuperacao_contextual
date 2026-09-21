@@ -88,7 +88,12 @@ from infra.scripts.cloud_smoke_test import (
     wait_for_service_ready,
 )
 from load.run_battery import build_probe_k6_cmd
-from load.saturation import GENERATOR_CPU_THRESHOLD, ProbeResult, run_saturation_search
+from load.saturation import (
+    BINARY_SEARCH_ITERATIONS,
+    GENERATOR_CPU_THRESHOLD,
+    ProbeResult,
+    run_saturation_search,
+)
 
 # docs/DESIGN.md, "Protocolo de medição". Só os dois primeiros níveis são
 # fixos — o 3º nível ("alto") da confirmação não é mais um valor fixo (era
@@ -146,6 +151,16 @@ SHORT_RAMP_STEP = 0.25
 # usam 5); com 3, um IC por bootstrap não se sustentaria.
 SHORT_RAMP_CONFIRM_REPETITIONS = 5
 
+# Teto de segurança de iterações da busca binária quando --saturation-min-step
+# está ativo (load/saturation.py:_binary_search) — nesse modo a busca para
+# por LARGURA de intervalo, não por contagem fixa, então o teto de
+# iterações vira só uma rede de segurança contra um veredito
+# instável/oscilante que nunca convirja. Generoso o bastante para os
+# intervalos típicos da rampa fina (passo de 10% a partir de ~1.000-5.000
+# req/s): log2(largura_inicial / min_step) raramente passa de ~10-12 para
+# esses valores.
+SATURATION_MIN_STEP_ITERATION_CEILING = 20
+
 # docs/ARCHITECTURE.md, "Topologia": memória nominal dos tipos de máquina
 # padrão — só para converter a fração que o coletor OpenTelemetry reporta
 # em MB (analysis/resources.py:GCPMonitoringCollector), sem uma chamada
@@ -157,14 +172,38 @@ DEFAULT_MEMORY_MB_BY_COMPONENT = {
     "loadgen": 32768.0,  # n2-standard-8
 }
 
-# Janela de amostragem periódica de recursos durante a rampa de
-# confirmação (docs/DESIGN.md: "amostrar a cada 5 segundos nas três VMs").
-RESOURCE_SAMPLE_INTERVAL_SECONDS = 5
+# Amostragem periódica de recursos durante a rampa de confirmação
+# (docs/DESIGN.md, "Atribuição de gargalo"). Bug real, achado ao vivo
+# 2026-09-16: as 5 execuções da confirmação rodaram inteiras sem escrever
+# `resources.csv` porque RESOURCE_SAMPLE_INTERVAL_SECONDS também definia a
+# LARGURA da janela consultada (5s) — o Cloud Monitoring recusa mais de 1
+# ponto por minuto para métricas customizadas (`workload.googleapis.com/*`,
+# ver infra/modules/database/main.tf), então uma janela de 5s nunca continha
+# os 2 pontos necessários para calcular uma taxa de CPU
+# (analysis/resources.py:_cpu_utilization_from_deltas). Tick e janela agora
+# são desacoplados: RESOURCE_SAMPLE_INTERVAL_SECONDS só controla o intervalo
+# de verificação (não precisa ser fino — o dado em si só muda a cada ~60s);
+# RESOURCE_QUERY_WINDOW_SECONDS é a largura real pedida ao Cloud Monitoring
+# (2,5x o piso de 60s, folga para 2+ pontos mesmo com jitter de ingestão);
+# RESOURCE_INGESTION_DELAY_SECONDS afasta o fim da janela de "agora" (o
+# ponto mais recente de uma métrica customizada normalmente ainda não foi
+# ingerido no instante exato em que é gerado).
+RESOURCE_SAMPLE_INTERVAL_SECONDS = 30
+RESOURCE_QUERY_WINDOW_SECONDS = 150
+RESOURCE_INGESTION_DELAY_SECONDS = 30
 
 
 def build_sweep(
-    phase: str, high_rate_by_tier: dict[str, int] | None = None
+    phase: str,
+    high_rate_by_tier: dict[str, int] | None = None,
+    tiers: list[str] | None = None,
 ) -> list[tuple[int, str]]:
+    """`tiers`: escopo de seletividades da bateria de carga fixa (default
+    None = SELECTIVITY_TIERS, as 3) — usado por --tier para restringir uma
+    re-medição a uma seletividade só (docs/DESIGN.md, re-medição de
+    seletividade média). Chamadas existentes sem `tiers` continuam com a
+    cross-product completa de sempre."""
+    tiers = tiers if tiers is not None else SELECTIVITY_TIERS
     if phase == "triagem":
         return [(TRIAGEM_RATE, TRIAGEM_TIER)]
     if phase == "confirmacao":
@@ -173,8 +212,8 @@ def build_sweep(
                 "build_sweep('confirmacao') exige high_rate_by_tier — o nível de carga "
                 "'alto' vem da rampa de confirmação de cada seletividade, rodada antes."
             )
-        return [(rate, tier) for rate in FIXED_LOAD_LEVELS for tier in SELECTIVITY_TIERS] + [
-            (high_rate_by_tier[tier], tier) for tier in SELECTIVITY_TIERS
+        return [(rate, tier) for rate in FIXED_LOAD_LEVELS for tier in tiers] + [
+            (high_rate_by_tier[tier], tier) for tier in tiers
         ]
     raise ValueError(f"fase desconhecida: {phase!r}")
 
@@ -516,6 +555,7 @@ def build_remote_probe_aggregate_command(
     tools_image: str,
     results_mount: str,
     fixtures_mount: str,
+    decision_statistic: str = "pooled",
 ) -> str:
     """Consolida as `repetitions` já rodadas por build_remote_probe_rep_command
     com analysis/probe_report.py, na sessão SSH final e separada da
@@ -538,12 +578,17 @@ def build_remote_probe_aggregate_command(
     # no mesmo prefixo de comando do python): mesmo padrão já usado antes de
     # dividir esta função — evita depender de expansão sequencial dentro de
     # uma única lista de atribuições-prefixo, que não é garantida.
+    # --decision-statistic sempre explícito (nunca depende do default do
+    # lado do container) — o comando remoto fica autodocumentado no log da
+    # sessão SSH, sem precisar cruzar com a versão do container pra saber
+    # qual estatística decidiu o veredito.
     inner = (
         f'BEFORE_STAT="$(cat {_probe_stat_path(remote_subdir, "before")})" && '
         f'AFTER_STAT="$(cat {_probe_stat_path(remote_subdir, "after")})" && '
         'GENERATOR_CPU_STAT_BEFORE="$BEFORE_STAT" GENERATOR_CPU_STAT_AFTER="$AFTER_STAT" '
         "python analysis/probe_report.py "
-        f"--expected-requests {expected_requests} " + shlex.join(ndjson_paths)
+        f"--expected-requests {expected_requests} "
+        f"--decision-statistic {decision_statistic} " + shlex.join(ndjson_paths)
     )
 
     docker_argv = [
@@ -608,6 +653,22 @@ def _parse_optional_float(token: str | None) -> float | None:
     return float(token)
 
 
+def _parse_optional_float_list(token: str | None) -> list[float] | None:
+    """analysis/probe_report.py só imprime per_rep_p99_ms=.../per_rep_violated=
+    no modo --decision-statistic median-per-repetition — None quando o
+    token está ausente (modo pooled, ou saída de probe_report.py anterior
+    a este par de campos)."""
+    if token is None:
+        return None
+    return [float(v) for v in token.split(",")]
+
+
+def _parse_optional_bool_list(token: str | None) -> list[bool] | None:
+    if token is None:
+        return None
+    return [v == "True" for v in token.split(",")]
+
+
 @dataclass(frozen=True)
 class _ProbeVerdict:
     violated_slo: bool
@@ -617,6 +678,10 @@ class _ProbeVerdict:
     # None em saídas de probe_report.py anteriores a --expected-requests
     # (o token offered_ratio= não existia na linha PROBE_RESULT).
     offered_ratio: float | None = None
+    # Trilha de auditoria de --decision-statistic median-per-repetition —
+    # None no modo pooled (default) ou em saídas antigas sem esses tokens.
+    per_rep_p99_ms: list[float] | None = None
+    per_rep_violated_slo: list[bool] | None = None
 
 
 def _parse_probe_result(stdout: str) -> _ProbeVerdict:
@@ -636,6 +701,8 @@ def _parse_probe_result(stdout: str) -> _ProbeVerdict:
                 error_rate=_parse_optional_float(tokens.get("error_rate")),
                 generator_cpu_percent=float(tokens["generator_cpu_percent"]),
                 offered_ratio=_parse_optional_float(tokens.get("offered_ratio")),
+                per_rep_p99_ms=_parse_optional_float_list(tokens.get("per_rep_p99_ms")),
+                per_rep_violated_slo=_parse_optional_bool_list(tokens.get("per_rep_violated")),
             )
     raise RuntimeError(
         f"analysis/probe_report.py não imprimiu PROBE_RESULT na saída remota:\n{stdout}"
@@ -732,19 +799,27 @@ def verify_otel_pipeline(
 def make_resource_collect_fn(
     project_id: str,
     instance_by_component: dict[str, str],
-    interval_seconds: int = RESOURCE_SAMPLE_INTERVAL_SECONDS,
+    window_seconds: int = RESOURCE_QUERY_WINDOW_SECONDS,
+    ingestion_delay_seconds: int = RESOURCE_INGESTION_DELAY_SECONDS,
 ) -> Callable[[], list]:
     """Fecha sobre o contexto de uma célula e devolve uma função sem
-    argumentos que consulta uma janela curta e recente do Cloud Monitoring
-    — usada por sample_resources_periodically. Consultar uma janela curta
-    a cada tick (em vez de pedir a série histórica inteira de uma vez ao
-    final) evita depender da granularidade exata que o Cloud Monitoring
-    retém para cada métrica."""
+    argumentos que consulta uma janela recente do Cloud Monitoring — usada
+    por sample_resources_periodically. A janela termina `ingestion_delay_seconds`
+    ANTES de "agora" (o ponto mais recente de uma métrica customizada
+    normalmente ainda não foi ingerido no instante em que é gerado) e tem
+    `window_seconds` de largura — bem maior que o intervalo de tick
+    (RESOURCE_SAMPLE_INTERVAL_SECONDS), de propósito: `system.cpu.time` só
+    ganha um ponto novo a cada ~60s (piso do Cloud Monitoring para métricas
+    customizadas), então uma janela mais estreita que isso nunca contém os
+    2 pontos necessários para calcular uma taxa de CPU — bug real
+    encontrado ao vivo quando a janela era amarrada ao próprio intervalo de
+    tick (5s), fazendo as 5 execuções da confirmação rodarem inteiras sem
+    escrever uma amostra sequer."""
     from analysis.resources import GCPMonitoringCollector
 
     def collect_fn() -> list:
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(seconds=interval_seconds)
+        end_time = datetime.now(timezone.utc) - timedelta(seconds=ingestion_delay_seconds)
+        start_time = end_time - timedelta(seconds=window_seconds)
         collector = GCPMonitoringCollector(project_id, instance_by_component, start_time, end_time)
         return collector.collect()
 
@@ -758,13 +833,14 @@ def sample_resources_periodically(
     interval_seconds: int = RESOURCE_SAMPLE_INTERVAL_SECONDS,
 ) -> None:
     """Chama collect_fn() a cada interval_seconds até stop_event ser
-    sinalizado, acumulando em samples_out — roda numa thread separada,
-    em paralelo ao sweep/rampa de confirmação (docs/DESIGN.md: "amostrar a
-    cada 5 segundos nas três VMs"). collect_fn isolado por injeção de
-    dependência (make_resource_collect_fn) para este loop ser testável com
-    um fake, sem precisar de Cloud Monitoring de verdade — uma falha
-    isolada de coleta (rede, métrica ainda não disponível) não derruba o
-    loop nem a medição em andamento."""
+    sinalizado, acumulando em samples_out — roda numa thread separada, em
+    paralelo ao sweep/rampa de confirmação (docs/DESIGN.md, "Atribuição de
+    gargalo"). interval_seconds é só o intervalo de VERIFICAÇÃO — a janela
+    de dado em si é decidida por collect_fn (ver make_resource_collect_fn),
+    não por este parâmetro. collect_fn isolado por injeção de dependência
+    para este loop ser testável com um fake, sem precisar de Cloud
+    Monitoring de verdade — uma falha isolada de coleta (rede, métrica
+    ainda não disponível) não derruba o loop nem a medição em andamento."""
     while not stop_event.is_set():
         try:
             samples_out.extend(collect_fn())
@@ -788,6 +864,7 @@ def make_probe_fn(
     label: str,
     repetitions: int = 1,
     results_bucket: str | None = None,
+    decision_statistic: str = "pooled",
     *,
     user_count: int,
     run_timestamp: str,
@@ -840,6 +917,7 @@ def make_probe_fn(
             tools_image,
             results_mount,
             fixtures_mount,
+            decision_statistic=decision_statistic,
         )
         result = gcloud_ssh_with_retry(loadgen_instance, zone, project_id, aggregate_cmd)
         verdict = _parse_probe_result(result.stdout)
@@ -851,6 +929,8 @@ def make_probe_fn(
             p99_ms=verdict.p99_ms,
             error_rate=verdict.error_rate,
             offered_ratio=verdict.offered_ratio,
+            per_rep_p99_ms=verdict.per_rep_p99_ms,
+            per_rep_violated_slo=verdict.per_rep_violated_slo,
         )
 
     return probe_fn
@@ -908,6 +988,10 @@ def _write_saturation_json(
                 # Auditoria: distingue "violou o SLO" de "o k6 nem conseguiu
                 # ofertar o patamar" (docs/DESIGN.md, vazão ofertada).
                 "offered_ratio": p.offered_ratio,
+                # Auditoria de --decision-statistic median-per-repetition:
+                # None no modo pooled (default) ou em sondagens antigas.
+                "per_rep_p99_ms": p.per_rep_p99_ms,
+                "per_rep_violated_slo": p.per_rep_violated_slo,
             }
             for p in saturation.probes
         ],
@@ -923,11 +1007,38 @@ def _write_saturation_json(
                 "p99_ms": p.p99_ms,
                 "error_rate": p.error_rate,
                 "offered_ratio": p.offered_ratio,
+                "per_rep_p99_ms": p.per_rep_p99_ms,
+                "per_rep_violated_slo": p.per_rep_violated_slo,
             }
             for p in saturation.final_level_probes
         ],
     }
     (out_dir / filename).write_text(json.dumps(payload, indent=2))
+
+
+def build_saturation_upload_cmd(
+    cell_id: str, phase: str, timestamp: str, filename: str, results_bucket: str
+) -> list[str]:
+    local_path = Path("results") / cell_id / phase / timestamp / filename
+    return [
+        "gcloud",
+        "storage",
+        "cp",
+        str(local_path),
+        f"gs://{results_bucket}/{cell_id}/{phase}/{timestamp}/{filename}",
+    ]
+
+
+def _upload_saturation_json(
+    cell_id: str, phase: str, timestamp: str, filename: str, results_bucket: str
+) -> None:
+    # _write_saturation_json escreve só no host orquestrador (nunca passa
+    # pela VM loadgen, então results_upload_cmd/saturation_upload_cmd mais
+    # abaixo não o alcançam) — mesma classe de lacuna que resources.csv tinha
+    # antes do `gcloud storage cp` explícito já usado para ele. Sem isto, a
+    # trilha de auditoria por repetição (per_rep_p99_ms/per_rep_violated_slo)
+    # só sobrevive na máquina que rodou a medição.
+    _run(build_saturation_upload_cmd(cell_id, phase, timestamp, filename, results_bucket))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -993,6 +1104,33 @@ def main(argv: list[str] | None = None) -> int:
         "rep*/; analysis/report.py o encontra varrendo a árvore, não derivando dos rep_dirs.",
     )
     parser.add_argument(
+        "--tier",
+        choices=SELECTIVITY_TIERS,
+        default=None,
+        help="restringe a rampa de confirmação e a bateria de carga fixa a UMA seletividade "
+        "(default: as 3, comportamento atual) — para re-medir só uma delas sem gastar tempo/$ "
+        "refazendo as outras duas. Só faz sentido com --phase confirmacao: a triagem já é fixa "
+        "em seletividade 'medium' (TRIAGEM_TIER).",
+    )
+    parser.add_argument(
+        "--decision-statistic",
+        choices=("pooled", "median-per-repetition"),  # analysis/probe_report.py:DECISION_STATISTICS
+        default="pooled",
+        help="estatística de decisão do SLO em cada sondagem da busca de saturação (default "
+        "'pooled', preserva o comportamento histórico — repassado a analysis/probe_report.py, "
+        "ver lá para a explicação completa de 'median-per-repetition').",
+    )
+    parser.add_argument(
+        "--saturation-min-step",
+        type=int,
+        default=None,
+        help="faz a busca binária da rampa de confirmação parar por LARGURA de intervalo (req/s) "
+        "em vez de por um número fixo de iterações — útil quando se quer um S com precisão-alvo. "
+        "Default None preserva o comportamento antigo (BINARY_SEARCH_ITERATIONS iterações, "
+        "load/saturation.py). Quando informado, o teto de iterações sobe para "
+        "SATURATION_MIN_STEP_ITERATION_CEILING (rede de segurança, não o critério de parada).",
+    )
+    parser.add_argument(
         "--keep-infra",
         action="store_true",
         help="não roda terraform destroy no final (para investigar uma falha)",
@@ -1015,6 +1153,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    if args.tier is not None and args.phase == "triagem":
+        print(
+            "ERRO: --tier não se aplica a --phase triagem — a triagem já roda fixa em "
+            f"seletividade {TRIAGEM_TIER!r} (TRIAGEM_TIER), não há 3 seletividades para "
+            "restringir.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Escopo de seletividades desta execução — default None = --tier não
+    # informado = as 3 (comportamento atual). Usado tanto no laço da rampa
+    # de confirmação quanto em build_sweep, pra --tier restringir as duas
+    # coisas junto (docs/DESIGN.md, re-medição de seletividade média).
+    tiers_to_run = [args.tier] if args.tier is not None else SELECTIVITY_TIERS
+
     storage = storage_for_cell(args.cell)
     if args.phase == "triagem":
         sweep = shuffled_sweep(build_sweep(args.phase), args.seed)
@@ -1022,10 +1175,10 @@ def main(argv: list[str] | None = None) -> int:
         billable_combo_count = len(sweep)
     else:
         # Confirmação: o sweep depende do nível "alto" de cada seletividade,
-        # só conhecido depois das 3 rampas de saturação (mais abaixo, antes
+        # só conhecido depois das rampas de saturação (mais abaixo, antes
         # do laço da bateria) — a contagem em si (não os valores) já é fixa.
         sweep = None
-        billable_combo_count = len(SELECTIVITY_TIERS) * (len(FIXED_LOAD_LEVELS) + 1)
+        billable_combo_count = len(tiers_to_run) * (len(FIXED_LOAD_LEVELS) + 1)
 
     # Reuso de snapshot de disco (infra/scripts/seed_dataset_snapshots.py) —
     # a carga completa é idêntica entre todas as células de uma mesma
@@ -1210,11 +1363,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             sampling_thread.start()
 
-            # As 3 rampas de saturação rodam ANTES da bateria de carga fixa —
-            # o nível "alto" dela (build_sweep) vem diretamente daqui, uma
-            # vazão por seletividade (docs/DESIGN.md, "Rampa de confirmação").
+            # As rampas de saturação (uma por seletividade em tiers_to_run,
+            # as 3 por default ou só 1 com --tier) rodam ANTES da bateria de
+            # carga fixa — o nível "alto" dela (build_sweep) vem diretamente
+            # daqui (docs/DESIGN.md, "Rampa de confirmação").
             high_rate_by_tier: dict[str, int] = {}
-            for tier in SELECTIVITY_TIERS:
+            for tier in tiers_to_run:
                 print(f"\n--- rampa de confirmação de saturação — seletividade {tier} ---")
                 probe_fn = make_probe_fn(
                     args.cell,
@@ -1231,19 +1385,40 @@ def main(argv: list[str] | None = None) -> int:
                     label=f"confirm-{tier}",
                     repetitions=CONFIRMATION_REPETITIONS,
                     results_bucket=args.results_bucket,
+                    decision_statistic=args.decision_statistic,
                     user_count=args.user_count,
                     run_timestamp=timestamp,
                 )
                 saturation = run_saturation_search(
-                    probe_fn, start_rate=int(args.saturation_start), step_mode="fine"
+                    probe_fn,
+                    start_rate=int(args.saturation_start),
+                    step_mode="fine",
+                    # "Repetir o patamar encontrado para confirmar" — reusa
+                    # _confirm_final_level (load/saturation.py), até agora só
+                    # ligado na rampa curta da triagem. Nunca recalcula
+                    # approx_throughput; só popula final_level_probes para a
+                    # dispersão do S ficar visível, não um ensaio único.
+                    confirm_repetitions=CONFIRMATION_REPETITIONS,
+                    binary_search_min_step=args.saturation_min_step,
+                    binary_search_iterations=(
+                        SATURATION_MIN_STEP_ITERATION_CEILING
+                        if args.saturation_min_step is not None
+                        else BINARY_SEARCH_ITERATIONS
+                    ),
                 )
                 _report_saturation(saturation, label=tier)
+                saturation_filename = f"saturation_{tier}.json"
                 _write_saturation_json(
-                    saturation, args.cell, args.phase, timestamp, filename=f"saturation_{tier}.json"
+                    saturation, args.cell, args.phase, timestamp, filename=saturation_filename
+                )
+                _upload_saturation_json(
+                    args.cell, args.phase, timestamp, saturation_filename, args.results_bucket
                 )
                 high_rate_by_tier[tier] = _high_rate_from_saturation(saturation, tier)
 
-            sweep = shuffled_sweep(build_sweep(args.phase, high_rate_by_tier), args.seed)
+            sweep = shuffled_sweep(
+                build_sweep(args.phase, high_rate_by_tier, tiers=tiers_to_run), args.seed
+            )
             print(f"sweep embaralhado (seed={args.seed}, fase={args.phase}): {sweep}")
 
         if args.only_saturation:
@@ -1302,6 +1477,12 @@ def main(argv: list[str] | None = None) -> int:
                 label="short",
                 repetitions=1,
                 results_bucket=args.results_bucket,
+                # repetitions=1 torna "median-per-repetition" e "pooled"
+                # numericamente idênticos (mediana/min de 1 valor = o
+                # próprio valor) — seguro repassar uniformemente, sem
+                # precisar restringir --decision-statistic a --phase
+                # confirmacao.
+                decision_statistic=args.decision_statistic,
                 user_count=args.user_count,
                 run_timestamp=timestamp,
             )
@@ -1313,6 +1494,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             _report_saturation(saturation)
             _write_saturation_json(saturation, args.cell, args.phase, timestamp)
+            _upload_saturation_json(
+                args.cell, args.phase, timestamp, "saturation.json", args.results_bucket
+            )
 
         if sampling_thread is not None:
             stop_sampling.set()

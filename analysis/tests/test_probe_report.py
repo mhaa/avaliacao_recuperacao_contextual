@@ -11,6 +11,8 @@ from analysis.probe_report import (
     _cpu_percent_from_stat,
     _parse_proc_stat_cpu_fields,
     main,
+    median_decision_summary,
+    min_offered_ratio,
     violated_slo,
 )
 
@@ -159,3 +161,125 @@ def test_main_without_expected_requests_reports_offered_ratio_none(tmp_path, mon
     out = capsys.readouterr().out
     assert "violated_slo=False" in out
     assert "offered_ratio=None" in out
+
+
+def test_median_decision_summary_takes_the_median_p99_and_error_rate_across_reps():
+    summaries = [
+        {"latency_ms_p99": 100.0, "error_rate": 0.0},
+        {"latency_ms_p99": 419.0, "error_rate": 0.02},
+        {"latency_ms_p99": 200.0, "error_rate": 0.0},
+        {"latency_ms_p99": 232.0, "error_rate": 0.0},
+        {"latency_ms_p99": 50.0, "error_rate": 0.0},
+    ]
+    assert median_decision_summary(summaries) == {"latency_ms_p99": 200.0, "error_rate": 0.0}
+
+
+def test_median_decision_summary_treats_an_empty_repetition_as_worst_case():
+    # Repetição sem nenhuma requisição parseada (latency_ms_p99/error_rate
+    # None, analysis/collect.py:build_summary) entra como pior caso na
+    # mediana, nunca é descartada — mesma regra de violated_slo.
+    summaries = [
+        {"latency_ms_p99": 50.0, "error_rate": 0.0},
+        {"latency_ms_p99": 60.0, "error_rate": 0.0},
+        {"latency_ms_p99": None, "error_rate": None},
+    ]
+    result = median_decision_summary(summaries)
+    assert result["latency_ms_p99"] == 60.0  # mediana de [50, 60, inf]
+    assert result["error_rate"] == 0.0  # mediana de [0.0, 0.0, 1.0]
+
+
+def test_min_offered_ratio_uses_the_worst_repetition_not_the_average():
+    # 4 repetições saudáveis (ratio=1.0) + 1 degradada (ratio=0.5) — o
+    # portão de vazão ofertada é de validade, não de desempenho: mediana
+    # deixaria a degradada se esconder atrás das 4 saudáveis.
+    summaries = [{"request_count": n} for n in (100, 100, 100, 100, 50)]
+    assert min_offered_ratio(summaries, expected_requests_per_rep=100) == 0.5
+
+
+def test_min_offered_ratio_is_none_without_expected_requests():
+    assert min_offered_ratio([{"request_count": 100}], expected_requests_per_rep=None) is None
+
+
+def _write_probe_ndjson(path, latencies_ms: list[float]) -> None:
+    path.write_text("\n".join(_probe_request(latency) for latency in latencies_ms) + "\n")
+
+
+def test_main_median_per_repetition_flags_a_violation_pooling_hides(tmp_path, monkeypatch, capsys):
+    # Reconstrução do efeito achado ao vivo (e3-postgres, seletividade alta,
+    # 4365 req/s — p99 individuais das 5 repetições todas > 200ms, mas o p99
+    # do pool concatenado ficava <= 200ms): 3 repetições PEQUENAS e
+    # degradadas (2% de requisições lentas cada, p99 próprio = 250ms, viola)
+    # + 2 repetições GRANDES e saudáveis (só requisições rápidas, p99
+    # próprio = 10ms). Poolizar tudo dilui as poucas requisições lentas das
+    # 3 ruins (6 de 4150, ~0.14%) na massa das 2 boas — o p99 do pool fica
+    # em 10ms (não viola), enquanto a MEDIANA dos 5 p99 individuais é
+    # 250ms (viola).
+    bad_latencies = [10.0] * 48 + [250.0] * 2
+    good_latencies = [10.0] * 2000
+    paths = []
+    for i, latencies in enumerate(
+        [bad_latencies, bad_latencies, bad_latencies, good_latencies, good_latencies]
+    ):
+        path = tmp_path / f"rep{i}.ndjson"
+        _write_probe_ndjson(path, latencies)
+        paths.append(str(path))
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main(["--decision-statistic", "pooled", *paths])
+    assert exit_code == 0
+    assert "violated_slo=False" in capsys.readouterr().out  # comportamento antigo preservado
+
+    exit_code = main(["--decision-statistic", "median-per-repetition", *paths])
+    assert exit_code == 0
+    assert "violated_slo=True" in capsys.readouterr().out
+
+
+def test_main_defaults_to_pooled_decision_statistic_for_backward_compat(tmp_path, monkeypatch, capsys):
+    rep0 = tmp_path / "rep0.ndjson"
+    rep0.write_text(_probe_request(10.0) + "\n")
+    rep1 = tmp_path / "rep1.ndjson"
+    rep1.write_text(_probe_request(300.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    main([str(rep0), str(rep1)])
+    implicit_out = capsys.readouterr().out
+    main(["--decision-statistic", "pooled", str(rep0), str(rep1)])
+    explicit_out = capsys.readouterr().out
+
+    assert implicit_out == explicit_out
+
+
+def test_main_prints_per_rep_diagnostic_tokens_in_median_mode(tmp_path, monkeypatch, capsys):
+    rep0 = tmp_path / "rep0.ndjson"
+    rep0.write_text(_probe_request(10.0) + "\n")
+    rep1 = tmp_path / "rep1.ndjson"
+    rep1.write_text(_probe_request(300.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main(["--decision-statistic", "median-per-repetition", str(rep0), str(rep1)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "per_rep_p99_ms=10.0,300.0" in out
+    assert "per_rep_violated=False,True" in out
+
+
+def test_main_omits_per_rep_diagnostic_tokens_in_pooled_mode(tmp_path, monkeypatch, capsys):
+    ndjson_path = tmp_path / "requests.ndjson"
+    ndjson_path.write_text(_probe_request(10.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main([str(ndjson_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "per_rep_p99_ms" not in out
+    assert "per_rep_violated" not in out

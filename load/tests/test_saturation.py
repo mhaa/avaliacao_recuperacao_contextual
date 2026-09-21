@@ -140,3 +140,48 @@ def test_measured_zero_cpu_is_not_reported_as_unmeasured():
 
     assert result.generator_cpu_unmeasured is False
     assert result.loadgen_bottleneck is False
+
+
+def test_run_saturation_search_with_min_step_converges_more_precisely_than_the_default_iteration_cap():
+    # Limiar real (11234) não cai num ponto médio exato dentro do teto
+    # padrão de 5 iterações — a busca por contagem fixa converge só até
+    # ~250 req/s do limiar real (mesma mecânica do teste acima, threshold
+    # diferente). Com min_step=50 e um teto de iterações generoso o
+    # bastante pra chegar lá, a busca continua até a largura do intervalo
+    # caber no alvo, não até esgotar um número fixo de sondagens.
+    result = run_saturation_search(
+        _healthy_probe(true_threshold=11_234),
+        start_rate=1_000,
+        binary_search_min_step=50,
+        binary_search_iterations=20,
+    )
+    assert result.approx_throughput is not None
+    assert abs(result.approx_throughput - 11_234) <= 50
+
+
+def test_run_saturation_search_min_step_still_respects_the_iteration_ceiling():
+    # min_step pequeno demais pro teto de iterações não trava a busca pra
+    # sempre — o teto de segurança continua valendo mesmo nesse modo.
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=rate > 11_234, generator_cpu_percent=10.0)
+
+    run_saturation_search(
+        probe_fn, start_rate=1_000, binary_search_min_step=1, binary_search_iterations=3
+    )
+    # 1000,2000,4000,8000 (ok),16000 (viola) = 5 sondagens da rampa + no
+    # máximo 3 da busca binária (teto de iterations) = no máximo 8.
+    assert len(calls) <= 8
+
+
+def test_run_saturation_search_without_min_step_keeps_the_old_fixed_iteration_behavior():
+    # min_step=None (default) preserva byte-a-byte o comportamento antigo —
+    # mesmo resultado do teste histórico
+    # test_run_saturation_search_binary_search_converges_to_the_true_threshold,
+    # chamado agora passando min_step explicitamente como None.
+    result = run_saturation_search(
+        _healthy_probe(true_threshold=11_000), start_rate=1_000, binary_search_min_step=None
+    )
+    assert result.approx_throughput == 11_000.0

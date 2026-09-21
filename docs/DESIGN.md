@@ -247,12 +247,80 @@ custo. Daí o protocolo abaixo.
 - Saída com distribuição completa (não só o ponto de violação) e intervalo
   de confiança por bootstrap.
 
+**Re-medição de seletividade média (limitação encontrada e correção)** — a
+decisão de SLO de cada sondagem da rampa fina poolizava as 5 repetições
+(`CONFIRMATION_REPETITIONS`) num só dataframe antes de calcular UM p99
+agregado (`analysis/probe_report.py`, `pl.concat` antes de `build_summary`).
+Isso mascara variância real entre repetições: achado ao vivo em
+e3-postgres/seletividade alta, vazão aprovada 4.365 req/s — p99 individuais
+das 5 repetições = [222, 419, 246, 232, 334] ms (**todas** violam os 200ms
+do SLO), mas o p99 do pool concatenado ficava ≤200ms, porque a proporção de
+cada repetição na amostra combinada (~6,5 milhões de requisições) varia
+pouco entre reamostragens — o mesmo efeito, generalizado, do IC bootstrap
+sobre dados agrupados discutido na seção de intervalos de confiança. Na
+prática, olhando as 12 combinações célula×seletividade já medidas, só 3
+ficaram de fato perto de 200ms; as demais estouraram ou ficaram bem
+conservadoras.
+
+Correção, opt-in e retrocompatível (nunca reinterpreta o que já foi
+publicado — triagem e as seletividades baixa/alta de todas as 4 células
+continuam vindo do método antigo, "pooled"):
+- `analysis/probe_report.py --decision-statistic median-per-repetition`:
+  calcula p99/taxa de erro de CADA repetição separadamente e usa a
+  **mediana** entre elas para decidir `violated_slo` (com N=5, "mediana >
+  200ms" equivale a "maioria das repetições violam individualmente" — a
+  pergunta que interessa, "essa vazão tipicamente quebra o SLO", não "o
+  agregado poolizado quebra"). Portão de vazão ofertada usa o MÍNIMO entre
+  repetições, não a mediana — é um portão de validade, não de desempenho,
+  e mediana deixaria repetições degradadas se esconderem atrás de
+  saudáveis. Default continua `pooled` (comportamento histórico).
+- `infra/scripts/run_measurement_battery.py --tier {low,medium,high}`:
+  restringe a rampa de confirmação e a bateria de carga fixa a UMA
+  seletividade (default: as 3) — permite re-medir só a que precisa, sem
+  gastar tempo/$ refazendo as outras duas. Não se aplica à triagem (já
+  fixa em seletividade "medium").
+- `--saturation-min-step`: a busca binária passa a parar por LARGURA de
+  intervalo (req/s), não por um número fixo de iterações
+  (`load/saturation.py:_binary_search`) — para quando se quer um `S` com
+  precisão-alvo em vez de uma resolução implícita pelo número de
+  iterações.
+- A rampa de confirmação passou a repetir o patamar final aprovado
+  (`confirm_repetitions=CONFIRMATION_REPETITIONS`, mecanismo que já
+  existia só para a rampa curta da triagem) — o `S` reportado ganha
+  dispersão visível (`final_level_probes`) em vez de vir de sondagens
+  isoladas dentro da própria busca.
+- `saturation.json`/`saturation_<tier>.json` passam a registrar, por
+  sondagem, `per_rep_p99_ms`/`per_rep_violated_slo` (trilha de auditoria de
+  `--decision-statistic median-per-repetition`) — `None` no modo `pooled`
+  ou em sondagens antigas, para o motivo de qualquer decisão futura ficar
+  visível direto no artefato, sem precisar de investigação manual.
+- Esses mesmos arquivos `saturation*.json` passam a ser enviados ao
+  `results-bucket` (`gcloud storage cp` host→bucket, mesmo padrão já usado
+  para `resources.csv`, logo após cada `_write_saturation_json`). Antes,
+  ficavam só no host orquestrador — nunca passavam pela VM loadgen (só o
+  `/app/results/<cell>` dela é sincronizado), então uma nova trilha de
+  auditoria por repetição só sobreviveria na máquina que rodou a medição.
+  Achado ao vivo verificando esta mesma campanha: a lacuna já era conhecida
+  para `resources.csv` antes da correção documentada em "Atribuição de
+  gargalo" abaixo, mas persistia sem correção para `saturation*.json`.
+
+Status desta campanha: só a seletividade média, nas 4 células
+(e2-scylla, e3-postgres, e3-valkey, e4-valkey), foi re-medida com o método
+novo. Seletividade baixa e alta continuam valendo pela execução original.
+
 **Atribuição de gargalo** — durante a rampa de confirmação, `resources.csv`
-registra CPU/memória/rede das 3 VMs (banco, serviço, gerador) a cada 5
-segundos, para identificar qual recurso satura primeiro
+registra CPU/memória/rede das 3 VMs (banco, serviço, gerador), para
+identificar qual recurso satura primeiro
 (`analysis/resources.py:classify_bottleneck`). Transforma "a célula satura em
 11.000 req/s" em "satura em 11.000 req/s por CPU do banco" — o que entra na
-discussão de resultados.
+discussão de resultados. Amostrado a cada 30s, com uma janela de consulta de
+150s (não 5s): o Cloud Monitoring recusa mais de 1 ponto por minuto para uma
+métrica customizada (`workload.googleapis.com/*`, a família que o coletor
+OpenTelemetry usa aqui — confirmado ao vivo, ver `infra/modules/database/
+main.tf`), então uma janela mais estreita que esse piso de ~60s nunca contém
+2 pontos para calcular uma taxa de CPU (achado ao vivo 2026-09-16: as 5
+execuções da confirmação rodaram inteiras sem gravar uma única amostra por
+essa causa — `analysis/resources.py`, docstring de `_CPU_METRIC`).
 
 ### Métricas
 

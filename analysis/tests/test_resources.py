@@ -10,6 +10,8 @@ import pytest
 
 from analysis.resources import (
     ResourceSample,
+    _cpu_delta_by_state,
+    _cpu_utilization_from_deltas,
     _parse_mem_usage,
     _parse_percent,
     classify_bottleneck,
@@ -104,3 +106,34 @@ def test_classify_bottleneck_considers_network_when_present():
 def test_classify_bottleneck_raises_without_samples():
     with pytest.raises(ValueError):
         classify_bottleneck([])
+
+
+def test_cpu_delta_by_state_sums_deltas_across_cores_sharing_a_state():
+    raw_series = [
+        ("idle", [100.0, 130.0]),  # cpu0, delta 30
+        ("idle", [50.0, 65.0]),  # cpu1, delta 15
+        ("user", [10.0, 40.0]),  # cpu0, delta 30
+        ("user", [5.0, 10.0]),  # cpu1, delta 5
+    ]
+    assert _cpu_delta_by_state(raw_series) == {"idle": 45.0, "user": 35.0}
+
+
+def test_cpu_delta_by_state_ignores_series_with_fewer_than_2_points():
+    raw_series = [("idle", [100.0]), ("user", [10.0, 20.0])]
+    assert _cpu_delta_by_state(raw_series) == {"user": 10.0}
+
+
+def test_cpu_utilization_from_deltas_is_1_minus_idle_fraction():
+    # 45s ociosos + 35s ocupados = 80s totais -> 35/80 = 43.75% de uso
+    result = _cpu_utilization_from_deltas({"idle": 45.0, "user": 35.0})
+    assert result == pytest.approx(43.75)
+
+
+def test_cpu_utilization_from_deltas_treats_missing_idle_as_fully_busy():
+    result = _cpu_utilization_from_deltas({"user": 10.0, "system": 5.0})
+    assert result == pytest.approx(100.0)
+
+
+def test_cpu_utilization_from_deltas_raises_when_total_delta_is_zero():
+    with pytest.raises(ValueError):
+        _cpu_utilization_from_deltas({})

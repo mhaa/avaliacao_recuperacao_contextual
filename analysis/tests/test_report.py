@@ -200,6 +200,38 @@ def test_discover_rep_dirs_ignores_older_timestamps_for_the_same_cell(tmp_path):
     assert groups["e3-postgres"] == [10.0] * 5
 
 
+def test_discover_rep_dirs_keeps_older_tiers_rep_dirs_when_a_newer_timestamp_only_has_one_tier(
+    tmp_path,
+):
+    # Regressão de uma re-medição escopada (--tier medium,
+    # infra/scripts/run_measurement_battery.py): o timestamp novo só tem
+    # combos de seletividade média. "Mais recente por célula" (o
+    # comportamento antigo) apagaria high/low do timestamp velho do
+    # relatório — precisa ser "mais recente por (célula, combo)".
+    old_dir = tmp_path / "e3-postgres" / "confirmacao" / "20260101T000000Z"
+    _write_fake_run(old_dir / "100-high" / "rep0", [1.0] * 5, "e3-postgres", selectivity_tier="high")
+    _write_fake_run(old_dir / "100-medium" / "rep0", [2.0] * 5, "e3-postgres", selectivity_tier="medium")
+    _write_fake_run(old_dir / "100-low" / "rep0", [3.0] * 5, "e3-postgres", selectivity_tier="low")
+
+    new_dir = tmp_path / "e3-postgres" / "confirmacao" / "20260102T000000Z"
+    _write_fake_run(
+        new_dir / "100-medium" / "rep0", [99.0] * 5, "e3-postgres", selectivity_tier="medium"
+    )
+
+    rep_dirs = discover_rep_dirs(tmp_path, "confirmacao")
+    combo_names = {p.parent.name for p in rep_dirs}
+
+    assert combo_names == {"100-high", "100-medium", "100-low"}
+    # A combinação de "medium" vem do timestamp NOVO, não do velho.
+    medium_dir = next(p for p in rep_dirs if p.parent.name == "100-medium")
+    assert "20260102T000000Z" in str(medium_dir)
+    # high/low continuam vindo do timestamp antigo — nunca desaparecem.
+    high_dir = next(p for p in rep_dirs if p.parent.name == "100-high")
+    low_dir = next(p for p in rep_dirs if p.parent.name == "100-low")
+    assert "20260101T000000Z" in str(high_dir)
+    assert "20260101T000000Z" in str(low_dir)
+
+
 def test_returned_count_stats_flags_partial_responses_by_selectivity_tier():
     # Metade das respostas vêm completas (k=20), metade parciais (5 itens) —
     # cenário de seletividade baixa filtrando demais os N candidatos.
@@ -351,6 +383,44 @@ def test_load_cell_saturation_reads_the_per_tier_files_confirmacao_writes(tmp_pa
     assert result["e3-postgres"]["by_tier"]["high"]["approx_throughput"] == 4587.0
     assert result["e3-postgres"]["by_tier"]["medium"]["approx_throughput"] == 3672.0
     assert result["e3-postgres"]["by_tier"]["low"]["approx_throughput"] == 3317.0
+
+
+def test_load_cell_saturation_merges_by_tier_across_timestamps_independently(tmp_path):
+    # Regressão de uma re-medição escopada (--tier medium): o timestamp novo
+    # só grava saturation_medium.json. "Mais recente por célula" (o
+    # comportamento antigo) faria esse timestamp "vencer" sozinho e apagar
+    # high/low do relatório — inclusive o representante de topo (hardcoded
+    # em by_tier.get("high", {})), que ficaria vazio (custo/Pareto
+    # desaparecendo da célula inteira). Cada tier precisa vir do timestamp
+    # mais novo QUE O CONTÉM, independentemente dos outros.
+    old_dir = tmp_path / "e3-postgres" / "confirmacao" / "20260101T000000Z"
+    old_dir.mkdir(parents=True)
+    (old_dir / "saturation_high.json").write_text(
+        json.dumps({"approx_throughput": 4587.0, "censored": False, "lower_bound": None})
+    )
+    (old_dir / "saturation_medium.json").write_text(
+        json.dumps({"approx_throughput": 3672.0, "censored": False, "lower_bound": None})
+    )
+    (old_dir / "saturation_low.json").write_text(
+        json.dumps({"approx_throughput": 3317.0, "censored": False, "lower_bound": None})
+    )
+
+    new_dir = tmp_path / "e3-postgres" / "confirmacao" / "20260102T000000Z"
+    new_dir.mkdir(parents=True)
+    (new_dir / "saturation_medium.json").write_text(
+        json.dumps({"approx_throughput": 3900.0, "censored": False, "lower_bound": None})
+    )
+
+    result = load_cell_saturation(tmp_path, "confirmacao")
+
+    # medium vem do timestamp novo (re-medido); high/low continuam vindo do
+    # antigo — nenhum dos dois desaparece.
+    assert result["e3-postgres"]["by_tier"]["medium"]["approx_throughput"] == 3900.0
+    assert result["e3-postgres"]["by_tier"]["high"]["approx_throughput"] == 4587.0
+    assert result["e3-postgres"]["by_tier"]["low"]["approx_throughput"] == 3317.0
+    # Representante de topo (usado por build_report para custo/Pareto)
+    # continua populado — nunca fica vazio.
+    assert result["e3-postgres"]["approx_throughput"] == 4587.0
 
 
 def test_build_report_computes_cost_per_million_requests_and_the_frontier(tmp_path):

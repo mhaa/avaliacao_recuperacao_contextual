@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +26,7 @@ from infra.scripts.run_measurement_battery import (
     build_remote_probe_rep_command,
     build_remote_setup_command,
     build_remote_upload_command,
+    build_saturation_upload_cmd,
     build_sweep,
     sample_resources_periodically,
     shuffled_sweep,
@@ -60,6 +62,23 @@ def test_build_sweep_confirmacao_uses_the_per_tier_high_rate_not_a_fixed_value()
 def test_build_sweep_confirmacao_requires_high_rate_by_tier():
     with pytest.raises(ValueError):
         build_sweep("confirmacao")
+
+
+def test_build_sweep_confirmacao_can_be_scoped_to_a_single_tier():
+    # --tier medium: só as 3 combinações de seletividade média, nunca
+    # high/low (docs/DESIGN.md, re-medição de seletividade média).
+    sweep = build_sweep("confirmacao", _HIGH_RATE_BY_TIER, tiers=["medium"])
+    assert len(sweep) == len(FIXED_LOAD_LEVELS) + 1
+    assert all(tier == "medium" for _, tier in sweep)
+    assert (_HIGH_RATE_BY_TIER["medium"], "medium") in sweep
+
+
+def test_build_sweep_confirmacao_defaults_to_all_tiers_when_tiers_omitted():
+    # Garantia explícita de que o novo parâmetro `tiers` não muda o default
+    # (já coberto implicitamente pelos testes acima, que não passam tiers).
+    with_default = build_sweep("confirmacao", _HIGH_RATE_BY_TIER)
+    explicit_all = build_sweep("confirmacao", _HIGH_RATE_BY_TIER, tiers=SELECTIVITY_TIERS)
+    assert set(with_default) == set(explicit_all)
 
 
 def test_shuffled_sweep_is_deterministic_given_the_same_seed():
@@ -191,6 +210,23 @@ def test_build_remote_upload_command_uses_the_upload_script_with_no_gcloud_cli()
     )
     assert "load/upload_results.py" in cmd
     assert "gcloud" not in cmd
+
+
+def test_build_saturation_upload_cmd_copies_the_host_local_file_to_the_matching_bucket_prefix():
+    # saturation.json/saturation_<tier>.json são escritos só no host
+    # orquestrador (_write_saturation_json) — nunca passam pela VM loadgen,
+    # então build_remote_upload_command (que sobe /app/results/<cell> DA VM)
+    # não os alcança. Regressão para a lacuna "local-only" (memória
+    # saturation_json_never_uploaded_to_gcs).
+    cmd = build_saturation_upload_cmd(
+        "e3-postgres", "confirmacao", "20260101T000000Z", "saturation_medium.json",
+        "my-results-bucket",
+    )
+    assert cmd == [
+        "gcloud", "storage", "cp",
+        str(Path("results") / "e3-postgres" / "confirmacao" / "20260101T000000Z" / "saturation_medium.json"),
+        "gs://my-results-bucket/e3-postgres/confirmacao/20260101T000000Z/saturation_medium.json",
+    ]
 
 
 def test_build_remote_upload_command_passes_local_dir_bucket_and_prefix_as_argv():
@@ -410,6 +446,25 @@ def test_build_remote_probe_aggregate_command_injects_expected_requests():
     assert f"--expected-requests {1000 * 180 * 5}" in cmd
 
 
+def test_build_remote_probe_aggregate_command_defaults_to_pooled_decision_statistic():
+    cmd = build_remote_probe_aggregate_command(
+        "_saturation/e1-postgres/confirm-low-0-1000", 5, 1000, "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+    )
+    assert "--decision-statistic pooled" in cmd
+
+
+def test_build_remote_probe_aggregate_command_includes_requested_decision_statistic():
+    # Sempre explícito no comando remoto (nunca depende do default do lado
+    # do container) — docs/DESIGN.md, re-medição de seletividade média.
+    cmd = build_remote_probe_aggregate_command(
+        "_saturation/e1-postgres/confirm-medium-0-3672", 5, 3672, "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        decision_statistic="median-per-repetition",
+    )
+    assert "--decision-statistic median-per-repetition" in cmd
+
+
 def test_parse_probe_result_reads_violated_slo_true():
     stdout = (
         "algum log irrelevante\nPROBE_RESULT violated_slo=True p99=250.0 error_rate=0.0 "
@@ -463,6 +518,30 @@ def test_parse_probe_result_reads_offered_ratio_and_tolerates_its_absence():
         "request_count=1000 generator_cpu_percent=20.0"
     )
     assert _parse_probe_result(without_ratio).offered_ratio is None
+
+
+def test_parse_probe_result_reads_per_rep_diagnostic_fields_when_present():
+    # Só presentes com --decision-statistic median-per-repetition
+    # (analysis/probe_report.py) — vírgula como separador, sem espaços.
+    stdout = (
+        "PROBE_RESULT violated_slo=True p99=250.0 error_rate=0.0 request_count=250 "
+        "generator_cpu_percent=20.0 per_rep_p99_ms=10.0,300.0 per_rep_violated=False,True"
+    )
+    verdict = _parse_probe_result(stdout)
+    assert verdict.per_rep_p99_ms == [10.0, 300.0]
+    assert verdict.per_rep_violated_slo == [False, True]
+
+
+def test_parse_probe_result_defaults_per_rep_fields_to_none_when_absent():
+    # Modo pooled (default) ou saída de execuções antigas — sem os dois
+    # tokens novos, precisa continuar parseável.
+    stdout = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 "
+        "request_count=1000 generator_cpu_percent=20.0"
+    )
+    verdict = _parse_probe_result(stdout)
+    assert verdict.per_rep_p99_ms is None
+    assert verdict.per_rep_violated_slo is None
 
 
 def test_write_saturation_json_round_trips(tmp_path, monkeypatch):

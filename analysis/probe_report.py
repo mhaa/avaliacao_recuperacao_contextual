@@ -20,12 +20,20 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 import sys
 from pathlib import Path
 
 import polars as pl
 
 from analysis.collect import MIN_OFFERED_RATIO, build_summary, parse_requests_ndjson
+
+# --decision-statistic (ver main()): duplicado como tupla de literais em vez
+# de um Enum importável, porque quem também precisa desses dois valores
+# (infra/scripts/run_measurement_battery.py) roda no HOST, sem polars —
+# não pode importar este módulo. Manter os dois valores em sincronia é
+# responsabilidade de quem editar um dos dois arquivos.
+DECISION_STATISTICS = ("pooled", "median-per-repetition")
 
 PROBE_SCENARIOS = frozenset({"probe"})
 
@@ -86,6 +94,59 @@ def violated_slo(summary: dict, offered_ratio: float | None = None) -> bool:
     return p99 > SLO_P99_MS or error_rate > SLO_ERROR_RATE
 
 
+def _per_repetition_summaries(paths: list[Path]) -> list[dict]:
+    """build_summary() por ARQUIVO (uma repetição), não sobre o pool
+    concatenado de todos — a inversão de uma linha que --decision-statistic
+    median-per-repetition existe para fazer. Ver median_decision_summary."""
+    return [build_summary(parse_requests_ndjson(path, scenarios=PROBE_SCENARIOS)) for path in paths]
+
+
+def _worst_case_if_empty(summary: dict) -> tuple[float, float]:
+    """(p99, error_rate) de UMA repetição, com pior caso quando ela não
+    parseou nenhuma requisição — mesma regra de violated_slo ("sem dado é
+    violação"), aplicada aqui pra essa repetição nunca ser silenciosamente
+    excluída do cálculo da mediana entre repetições."""
+    p99 = summary["latency_ms_p99"]
+    error_rate = summary["error_rate"]
+    if p99 is None or error_rate is None:
+        return float("inf"), 1.0
+    return p99, error_rate
+
+
+def median_decision_summary(per_rep_summaries: list[dict]) -> dict:
+    """Mediana do p99 e da taxa de erro ENTRE repetições — não o p99 do
+    pool concatenado (analysis/collect.py:build_summary sobre todas juntas).
+    Com N ímpar (CONFIRMATION_REPETITIONS=5), "mediana do p99 > 200ms"
+    equivale a "maioria das repetições violam individualmente": responde
+    "essa vazão tipicamente quebra o SLO", não "o agregado poolizado
+    quebra" — o efeito diagnosticado ao vivo (e3-postgres/alta seletividade,
+    4365 req/s: p99 individuais [222,419,246,232,334]ms, todas violam
+    200ms, mas o pool concatenado não). Devolve um dict no formato que
+    violated_slo() espera."""
+    p99s, error_rates = zip(*(_worst_case_if_empty(s) for s in per_rep_summaries))
+    return {
+        "latency_ms_p99": statistics.median(p99s),
+        "error_rate": statistics.median(error_rates),
+    }
+
+
+def min_offered_ratio(
+    per_rep_summaries: list[dict], expected_requests_per_rep: float | None
+) -> float | None:
+    """Pior repetição, não a média/mediana entre elas — vazão ofertada é um
+    PORTÃO DE VALIDADE (docs/DESIGN.md, "Vazão ofertada verificada, não
+    presumida"), não uma métrica de desempenho onde mediana faria sentido.
+    Mediana deixaria 2 de 5 repetições com déficit de oferta se esconderem
+    atrás de 3 saudáveis — o mesmo problema de mascaramento que
+    --decision-statistic median-per-repetition existe para corrigir na
+    métrica de SLO, só que relocado pra cá. None quando o chamador não
+    passou --expected-requests (compatível com invocações antigas, mesma
+    regra do caminho "pooled")."""
+    if expected_requests_per_rep is None:
+        return None
+    return min(s["request_count"] / expected_requests_per_rep for s in per_rep_summaries)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     # nargs="+": a rampa de confirmação roda k6 CONFIRMATION_REPETITIONS
@@ -108,31 +169,77 @@ def main(argv: list[str] | None = None) -> int:
         "Sem o argumento (compatível com invocações antigas), o portão não é avaliado e "
         "offered_ratio sai None.",
     )
+    parser.add_argument(
+        "--decision-statistic",
+        choices=DECISION_STATISTICS,
+        default="pooled",
+        help="'pooled' (default, preserva o comportamento histórico): concatena todas as "
+        "repetições num só dataframe e calcula UM p99/error_rate agregado. "
+        "'median-per-repetition': calcula p99/error_rate de CADA repetição separadamente e usa "
+        "a MEDIANA entre elas para decidir violated_slo — robusto a uma repetição isolada que "
+        "puxa (ou esconde) a violação do agregado poolizado (achado ao vivo, docs/DESIGN.md). "
+        "Só troca a estatística de decisão; violated_slo() em si não muda.",
+    )
     args = parser.parse_args(argv)
 
-    df = pl.concat(
-        [parse_requests_ndjson(path, scenarios=PROBE_SCENARIOS) for path in args.ndjson_path]
-    )
-    summary = build_summary(df)
-    # Contagem contra o esperado, não throughput/span como em
-    # analysis/collect.py:offered_load_fields: aqui o df concatena
-    # repetições separadas por aquecimentos e restarts de k6, então o span
-    # atravessa buracos legítimos e diluiria a razão.
-    offered_ratio = (
-        summary["request_count"] / args.expected_requests if args.expected_requests else None
-    )
-    violated = violated_slo(summary, offered_ratio)
+    per_rep_p99_ms: list[float] | None = None
+    per_rep_violated: list[bool] | None = None
+
+    if args.decision_statistic == "median-per-repetition":
+        # Parseia cada ndjson SEPARADAMENTE (um build_summary por repetição)
+        # — nunca concatena antes de calcular o p99, que é exatamente o
+        # ponto desta estatística de decisão.
+        per_rep_summaries = _per_repetition_summaries(args.ndjson_path)
+        request_count = sum(s["request_count"] for s in per_rep_summaries)
+        decision_summary = median_decision_summary(per_rep_summaries)
+        expected_per_rep = (
+            args.expected_requests / len(args.ndjson_path) if args.expected_requests else None
+        )
+        offered_ratio = min_offered_ratio(per_rep_summaries, expected_per_rep)
+        per_rep_p99_ms = [_worst_case_if_empty(s)[0] for s in per_rep_summaries]
+        per_rep_violated = [violated_slo(s) for s in per_rep_summaries]
+    else:
+        # "pooled" (default): comportamento histórico, intocado — concatena
+        # todos os ndjson num só dataframe e calcula UM p99/error_rate
+        # agregado (não é o mesmo que agregar os p99 por repetição — p99
+        # não é linear em concatenação, por isso os dois modos não
+        # compartilham este parsing).
+        df = pl.concat(
+            [parse_requests_ndjson(path, scenarios=PROBE_SCENARIOS) for path in args.ndjson_path]
+        )
+        decision_summary = build_summary(df)
+        request_count = decision_summary["request_count"]
+        # Contagem contra o esperado, não throughput/span como em
+        # analysis/collect.py:offered_load_fields: aqui o df concatena
+        # repetições separadas por aquecimentos e restarts de k6, então o
+        # span atravessa buracos legítimos e diluiria a razão.
+        offered_ratio = (
+            decision_summary["request_count"] / args.expected_requests
+            if args.expected_requests
+            else None
+        )
+
+    violated = violated_slo(decision_summary, offered_ratio)
 
     before = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_BEFORE"])
     after = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_AFTER"])
     generator_cpu_percent = _cpu_percent_from_stat(before, after)
 
-    print(
-        f"PROBE_RESULT violated_slo={violated} p99={summary['latency_ms_p99']} "
-        f"error_rate={summary['error_rate']} request_count={summary['request_count']} "
+    line = (
+        f"PROBE_RESULT violated_slo={violated} p99={decision_summary['latency_ms_p99']} "
+        f"error_rate={decision_summary['error_rate']} request_count={request_count} "
         f"offered_ratio={offered_ratio} "
         f"generator_cpu_percent={generator_cpu_percent}"
     )
+    if per_rep_p99_ms is not None and per_rep_violated is not None:
+        # Tokens aditivos, só no modo mediana — sem espaços (vírgula como
+        # separador), compatível com o tokenizer `tok.split("=", 1)` de
+        # infra/scripts/run_measurement_battery.py:_parse_probe_result, que
+        # já ignora tokens desconhecidos.
+        per_rep_p99_str = ",".join(str(v) for v in per_rep_p99_ms)
+        per_rep_violated_str = ",".join(str(v) for v in per_rep_violated)
+        line += f" per_rep_p99_ms={per_rep_p99_str} per_rep_violated={per_rep_violated_str}"
+    print(line)
     return 0
 
 

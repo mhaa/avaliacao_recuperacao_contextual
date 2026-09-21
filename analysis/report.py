@@ -235,25 +235,40 @@ def discover_rep_dirs(results_root: Path, phase: str) -> list[Path]:
         p.parent
         for p in results_root.glob(f"*/{phase}/**/rep*/requests.ndjson")
     )
-    # Só o timestamp mais recente por célula — mesma disciplina de
-    # load_cell_saturation (ver docstring lá). Sem isto, tentativas antigas
-    # (retries, execuções interrompidas, reexecuções pós-fix de arquitetura)
-    # ficam acumuladas em results/<cell>/<phase>/<timestamp>/ e suas
-    # latências se misturam silenciosamente com a execução válida mais
-    # recente — confirmado ao vivo: as 4 células da campanha de confirmação
-    # têm de 2 a 4 timestamps cada uma no bucket de resultados.
-    cell_and_timestamp = {
-        rep_dir: (rep_dir.relative_to(results_root).parts[0], rep_dir.relative_to(results_root).parts[2])
-        for rep_dir in all_rep_dirs
-    }
-    newest_timestamp_by_cell: dict[str, str] = {}
-    for cell_id, timestamp in cell_and_timestamp.values():
-        if timestamp > newest_timestamp_by_cell.get(cell_id, ""):
-            newest_timestamp_by_cell[cell_id] = timestamp
+    # Mais recente por (célula, combo) — não por célula inteira. Sem isto,
+    # tentativas antigas (retries, execuções interrompidas, reexecuções
+    # pós-fix de arquitetura) ficam acumuladas em
+    # results/<cell>/<phase>/<timestamp>/ e suas latências se misturam
+    # silenciosamente com a execução válida mais recente — confirmado ao
+    # vivo: as 4 células da campanha de confirmação têm de 2 a 4 timestamps
+    # cada uma no bucket de resultados.
+    #
+    # `combo_key` (não só `cell_id`) é o que faz uma re-medição ESCOPADA
+    # (--tier medium: infra/scripts/run_measurement_battery.py) compor
+    # corretamente com a execução anterior em vez de apagá-la: o timestamp
+    # novo só tem `100-medium/`, `1000-medium/`, `<rate>-medium/` — sem essa
+    # granularidade, ele "vence" como o mais recente da célula inteira e os
+    # combos de alta/baixa seletividade do timestamp antigo desaparecem do
+    # relatório em silêncio, mesmo existindo no disco. Vazio na triagem
+    # (rep<N>/ direto sob <timestamp>/, sem segmento de combo); na
+    # confirmação, o segmento "<rate>-<tier>" (load/run_battery.py:
+    # combo_out_dir).
+    def _cell_and_combo(rep_dir: Path) -> tuple[str, tuple[str, ...]]:
+        parts = rep_dir.relative_to(results_root).parts
+        return parts[0], parts[3:-1]
+
+    newest_timestamp_by_combo: dict[tuple[str, tuple[str, ...]], str] = {}
+    for rep_dir in all_rep_dirs:
+        cell_id, combo_key = _cell_and_combo(rep_dir)
+        timestamp = rep_dir.relative_to(results_root).parts[2]
+        key = (cell_id, combo_key)
+        if timestamp > newest_timestamp_by_combo.get(key, ""):
+            newest_timestamp_by_combo[key] = timestamp
     return [
         rep_dir
-        for rep_dir, (cell_id, timestamp) in cell_and_timestamp.items()
-        if timestamp == newest_timestamp_by_cell[cell_id]
+        for rep_dir in all_rep_dirs
+        if rep_dir.relative_to(results_root).parts[2]
+        == newest_timestamp_by_combo[_cell_and_combo(rep_dir)]
     ]
 
 
@@ -289,7 +304,17 @@ def load_cell_saturation(results_root: Path, phase: str) -> dict[str, dict]:
     capacidade da célula) também é exposta no nível de topo do dict, como
     representante único para o cálculo de custo em build_report — escolha
     documentada aqui, não escondida atrás de uma média ou heurística
-    opaca."""
+    opaca.
+
+    "Mais recente" é decidido por (célula, tier) INDEPENDENTEMENTE, não por
+    célula inteira — mesmo motivo de discover_rep_dirs: uma re-medição
+    escopada a uma seletividade só (--tier medium) grava um timestamp novo
+    que só tem saturation_medium.json. Se "mais recente" fosse por célula,
+    esse timestamp "venceria" sozinho e apagaria silenciosamente high/low
+    do timestamp antigo (inclusive o representante de topo, hardcoded em
+    by_tier.get("high", {}), que ficaria vazio). Tratando por tier, cada
+    seletividade é lida do timestamp mais novo QUE A CONTÉM, podendo vir de
+    execuções diferentes sem problema — velhas coexistindo com a nova."""
     saturation_by_cell: dict[str, dict] = {}
     newest_timestamp_by_cell: dict[str, str] = {}
     for path in results_root.glob(f"*/{phase}/*/saturation.json"):
@@ -299,21 +324,21 @@ def load_cell_saturation(results_root: Path, phase: str) -> dict[str, dict]:
             newest_timestamp_by_cell[cell_id] = timestamp
             saturation_by_cell[cell_id] = json.loads(path.read_text())
 
-    by_tier_per_cell_and_timestamp: dict[tuple[str, str], dict[str, dict]] = {}
+    newest_tiered_timestamp_by_cell_and_tier: dict[tuple[str, str], str] = {}
+    by_tier_by_cell: dict[str, dict[str, dict]] = {}
     for path in results_root.glob(f"*/{phase}/*/saturation_*.json"):
         cell_id = path.parents[2].name
         timestamp = path.parent.name
         tier = path.stem.removeprefix("saturation_")
-        by_tier_per_cell_and_timestamp.setdefault((cell_id, timestamp), {})[tier] = json.loads(
-            path.read_text()
-        )
-    newest_tiered_timestamp_by_cell: dict[str, str] = {}
-    for (cell_id, timestamp), by_tier in by_tier_per_cell_and_timestamp.items():
-        if timestamp > newest_tiered_timestamp_by_cell.get(cell_id, ""):
-            newest_tiered_timestamp_by_cell[cell_id] = timestamp
-            entry = dict(by_tier.get("high", {}))
-            entry["by_tier"] = by_tier
-            saturation_by_cell[cell_id] = entry
+        key = (cell_id, tier)
+        if timestamp > newest_tiered_timestamp_by_cell_and_tier.get(key, ""):
+            newest_tiered_timestamp_by_cell_and_tier[key] = timestamp
+            by_tier_by_cell.setdefault(cell_id, {})[tier] = json.loads(path.read_text())
+
+    for cell_id, by_tier in by_tier_by_cell.items():
+        entry = dict(by_tier.get("high", {}))
+        entry["by_tier"] = by_tier
+        saturation_by_cell[cell_id] = entry
 
     return saturation_by_cell
 

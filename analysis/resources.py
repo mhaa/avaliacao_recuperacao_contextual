@@ -86,13 +86,48 @@ class DockerStatsCollector:
         return samples
 
 
+def _cpu_delta_by_state(raw_series: list[tuple[str, list[float]]]) -> dict[str, float]:
+    """Soma, por estado (idle/user/system/...), o delta (máx-mín) de cada
+    série núcleo×estado de `system.cpu.time` — várias séries podem
+    compartilhar o mesmo estado (uma por núcleo), por isso soma em vez de
+    sobrescrever. Série com menos de 2 pontos não rende delta (não dá pra
+    calcular uma taxa com 1 ponto só) e é ignorada, não vira erro aqui —
+    quem chama (`_cpu_utilization_from_deltas`) decide se o total ficou
+    vazio demais para confiar."""
+    delta_by_state: dict[str, float] = {}
+    for state, values in raw_series:
+        if len(values) < 2:
+            continue
+        delta_by_state[state] = delta_by_state.get(state, 0.0) + (max(values) - min(values))
+    return delta_by_state
+
+
+def _cpu_utilization_from_deltas(delta_by_state: dict[str, float]) -> float:
+    """1 - (fração do tempo total em `idle`) — ver docstring de
+    `_cpu_utilization_percent` para o porquê de não precisar do nº de
+    núcleos. Total zero (nenhuma série com 2+ pontos) é erro, não 0%: uma
+    VM genuinamente ociosa ainda produz delta de `idle` > 0; total zero só
+    acontece quando a janela pedida não continha os 2 pontos necessários
+    (ver a janela mínima de ~60s exigida — docstring de
+    GCPMonitoringCollector._CPU_METRIC)."""
+    total = sum(delta_by_state.values())
+    if total <= 0:
+        raise ValueError(
+            "delta de CPU total é zero — a janela consultada provavelmente não continha 2 "
+            "pontos de nenhuma série de system.cpu.time (piso de ~60s do Cloud Monitoring "
+            "para métricas customizadas)"
+        )
+    idle = delta_by_state.get("idle", 0.0)
+    return (1.0 - idle / total) * 100.0
+
+
 class GCPMonitoringCollector:
     """Nuvem — API do Cloud Monitoring (`google-cloud-monitoring`).
 
-    CPU e rede vêm das métricas padrão do Compute Engine, sem agente
-    nenhum (`compute.googleapis.com/instance/{cpu/utilization,
-    network/{received,sent}_bytes_count}`). Memória exige um coletor nas 3
-    VMs (infra/modules/{database,service,loadgen}/main.tf, startup-script)
+    Rede vem da métrica padrão do Compute Engine, sem agente nenhum
+    (`compute.googleapis.com/instance/network/{received,sent}_bytes_count`).
+    CPU e memória exigem um coletor nas 3 VMs (infra/modules/
+    {database,service,loadgen}/main.tf, startup-script)
     — COS não tem gerenciador de pacotes, então o Ops Agent oficial do
     Google (pensado para instalação via apt/yum) não se aplica; usamos o
     OpenTelemetry Collector Contrib como contêiner (`hostmetrics` receiver
@@ -116,7 +151,31 @@ class GCPMonitoringCollector:
     coleta inteira (CPU/rede/memória-used continuam obrigatórias).
     """
 
-    _CPU_METRIC = "compute.googleapis.com/instance/cpu/utilization"
+    # `compute.googleapis.com/instance/cpu/utilization` (a métrica nativa do
+    # Compute Engine) NÃO é o que este projeto coleta — o coletor OTel
+    # (infra/modules/{database,service,loadgen}/main.tf) nunca alimenta essa
+    # métrica; ela é telemetria própria do hypervisor, sem relação com o
+    # pipeline hostmetrics daqui. Bug real, achado ao vivo 2026-09-16: as 5
+    # execuções da confirmação rodaram inteiras sem escrever `resources.csv`
+    # porque `_mean_value` pedia essa métrica errada e recebia sempre
+    # "nenhuma série temporal" — enquanto `workload.googleapis.com/
+    # system.cpu.time` (a que o hostmetrics `cpu` scraper de fato exporta,
+    # confirmada presente no Cloud Monitoring pelo usuário) nunca chegou a
+    # ser consultada.
+    #
+    # `system.cpu.time` é CUMULATIVO (segundos de CPU por núcleo × estado —
+    # idle/user/system/nice/... — desde que o coletor subiu), não uma fração
+    # 0-1 pronta como a métrica nativa era. `_mean_value` (que faz média de
+    # um valor já normalizado) não serve aqui: é preciso uma TAXA — ver
+    # `_cpu_utilization_percent`/`_cpu_delta_by_state` abaixo. Não dá para
+    # simplesmente amostrar mais rápido para compensar: o Cloud Monitoring
+    # recusa mais de 1 ponto por minuto para métricas customizadas
+    # (`workload.googleapis.com/*` — confirmado ao vivo, motivo documentado
+    # em infra/modules/database/main.tf junto com `collection_interval:
+    # 60s`), então qualquer janela de consulta menor que esse piso nunca vai
+    # conter os 2 pontos necessários para calcular uma taxa — ver a largura
+    # de janela escolhida em run_measurement_battery.py:make_resource_collect_fn.
+    _CPU_METRIC = "workload.googleapis.com/system.cpu.time"
     _NETWORK_RECEIVED_METRIC = "compute.googleapis.com/instance/network/received_bytes_count"
     _NETWORK_SENT_METRIC = "compute.googleapis.com/instance/network/sent_bytes_count"
     # `system.memory.utilization` (fração 0-1) NÃO existe no exporter
@@ -166,9 +225,7 @@ class GCPMonitoringCollector:
 
         samples: list[ResourceSample] = []
         for component, instance_name in self._instance_by_component.items():
-            cpu_fraction = self._mean_value(
-                client, project_name, self._CPU_METRIC, instance_name, interval
-            )
+            cpu_percent = self._cpu_utilization_percent(client, project_name, instance_name, interval)
             received_bytes = self._mean_value(
                 client, project_name, self._NETWORK_RECEIVED_METRIC, instance_name, interval
             )
@@ -196,7 +253,7 @@ class GCPMonitoringCollector:
             samples.append(
                 ResourceSample(
                     component=component,
-                    cpu_percent=cpu_fraction * 100.0,
+                    cpu_percent=cpu_percent,
                     memory_mb=memory_bytes / (1024**2),
                     network_mbps=(received_bytes + sent_bytes) * 8 / 1_000_000 / window_seconds,
                     timestamp=self._end_time,
@@ -253,6 +310,42 @@ class GCPMonitoringCollector:
                 f"nessa VM (infra/modules/*/main.tf).{hint}"
             )
         return sum(points) / len(points)
+
+    def _cpu_utilization_percent(self, client, project_name, instance_name, interval) -> float:
+        """`system.cpu.time` é cumulativo, por núcleo × estado (idle, user,
+        system, nice, ...) — uma série por combinação (ex.: 8 núcleos × 8
+        estados = 64 séries por VM num n2-standard-8). Utilização = 1 menos
+        a fração do tempo total que ficou em `idle`, sem precisar saber o
+        número de núcleos: a soma dos deltas de TODOS os estados, em TODOS
+        os núcleos, já normaliza sozinha (cada núcleo contribui ~1 segundo
+        de tempo cumulativo por segundo de relógio, somado entre estados)."""
+        from google.cloud import monitoring_v3
+
+        filter_str = (
+            f'metric.type = "{self._CPU_METRIC}" AND resource.labels.instance_id = "{instance_name}"'
+        )
+        results = client.list_time_series(
+            request={
+                "name": project_name,
+                "filter": filter_str,
+                "interval": interval,
+                "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+            }
+        )
+        raw_series = [
+            (series.metric.labels.get("state", ""), [self._point_value(p.value) for p in series.points])
+            for series in results
+        ]
+        if not raw_series:
+            hint = self._diagnose_generic_node_collision(
+                client, project_name, self._CPU_METRIC, interval
+            )
+            raise ValueError(
+                f"nenhuma série temporal para {self._CPU_METRIC!r} em {instance_name!r} na janela "
+                f"pedida — confirme que o coletor OTel está rodando nessa VM (infra/modules/*/"
+                f"main.tf).{hint}"
+            )
+        return _cpu_utilization_from_deltas(_cpu_delta_by_state(raw_series))
 
     @staticmethod
     def _diagnose_generic_node_collision(client, project_name, metric_type, interval) -> str:

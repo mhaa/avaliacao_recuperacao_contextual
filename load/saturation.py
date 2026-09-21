@@ -65,6 +65,16 @@ class ProbeResult:
     # saturation.json (por que ESTA sondagem violou: SLO ou déficit de
     # oferta). None em sondagens antigas, sem --expected-requests.
     offered_ratio: float | None = None
+    # Trilha de auditoria de --decision-statistic median-per-repetition
+    # (analysis/probe_report.py): o p99/veredito de CADA repetição
+    # individual, não só o valor agregado (mediana) usado para decidir
+    # violated_slo. None em sondagens no modo "pooled" (default) ou em
+    # sondagens antigas, sem esses campos na saída do probe. Existe porque
+    # o modo "pooled" pode mascarar uma repetição isolada que viola o SLO
+    # dentro de um agregado que não viola — ver docs/DESIGN.md, a
+    # subseção sobre re-medição de seletividade média.
+    per_rep_p99_ms: list[float] | None = None
+    per_rep_violated_slo: list[bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -133,12 +143,25 @@ def _binary_search(
     high: int,
     iterations: int,
     probes: list[ProbeResult],
+    min_step: int | None = None,
 ) -> int:
-    """`low` nunca violou o SLO, `high` violou. Sonda o ponto médio até
-    `iterations` vezes, estreitando o intervalo; retorna o maior rate
-    confirmado sem violação. Para cedo se o gerador saturar em qualquer
-    sondagem — o chamador confere isso olhando `probes[-1]` depois."""
+    """`low` nunca violou o SLO, `high` violou. Sonda o ponto médio,
+    estreitando o intervalo; retorna o maior rate confirmado sem violação.
+    Para cedo se o gerador saturar em qualquer sondagem — o chamador
+    confere isso olhando `probes[-1]` depois.
+
+    Duas condições de parada, mutuamente exclusivas por chamada:
+    - `min_step=None` (default, usado pela triagem): para depois de
+      exatamente `iterations` sondagens, não importa a largura final do
+      intervalo — resolução previsível, custo previsível.
+    - `min_step` informado (rampa de confirmação re-medida com precisão
+      alvo, docs/DESIGN.md): para quando `high - low <= min_step`, não
+      importa quantas sondagens isso levou — `iterations` continua valendo
+      como TETO de segurança (nunca ilimitado: um veredito instável/
+      oscilante não pode travar a busca para sempre)."""
     for _ in range(iterations):
+        if min_step is not None and high - low <= min_step:
+            break
         mid = (low + high) // 2
         if mid <= low or mid >= high:
             break
@@ -186,6 +209,7 @@ def run_saturation_search(
     step_mode: str = "doubling",
     step: float = 0.10,
     confirm_repetitions: int = 0,
+    binary_search_min_step: int | None = None,
 ) -> SaturationSearchResult:
     """Roda a busca completa: sonda `doubling_sequence`/`fine_sequence`
     (conforme `step_mode`) a partir de `start_rate`. Se o gerador saturar em
@@ -196,7 +220,14 @@ def run_saturation_search(
     `lower_bound=ceiling`. O mesmo algoritmo serve para a rampa curta
     (`step_mode="doubling"`) e para a de confirmação
     (`step_mode="fine"`, `start_rate`= aproximado da triagem, ou seu
-    `lower_bound` se censurada)."""
+    `lower_bound` se censurada).
+
+    `binary_search_min_step`: repassado a `_binary_search` — quando
+    informado, a busca binária para por LARGURA de intervalo (útil quando
+    se quer um `S` com precisão-alvo em req/s, não um número fixo de
+    sondagens); `binary_search_iterations` continua valendo como teto de
+    segurança nesse modo, então o chamador deve passar um valor generoso o
+    bastante para a largura pedida caber (ver docs/DESIGN.md)."""
     sequence = (
         doubling_sequence(start_rate, ceiling)
         if step_mode == "doubling"
@@ -220,7 +251,14 @@ def run_saturation_search(
             )
 
         if result.violated_slo:
-            approx = _binary_search(probe_fn, last_valid, rate, binary_search_iterations, probes)
+            approx = _binary_search(
+                probe_fn,
+                last_valid,
+                rate,
+                binary_search_iterations,
+                probes,
+                min_step=binary_search_min_step,
+            )
             if _generator_saturated(probes[-1]):
                 return SaturationSearchResult(
                     approx_throughput=None,
