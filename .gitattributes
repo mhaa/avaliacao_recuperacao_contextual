@@ -1,0 +1,10 @@
+# Every deployment target here is Linux (GCE COS images, Docker containers).
+# Several .tf modules embed shell startup-scripts as heredocs — CRLF in one
+# of those corrupts the shebang line (`/bin/bash^M: bad interpreter`) and
+# the script fails before its first real command, silently (GCE just marks
+# the startup-scripts service as failed; nothing here surfaces it). Force
+# LF for all text files regardless of a contributor's local core.autocrlf,
+# so a Windows checkout can't reintroduce this.
+* text=auto eol=lf
+
+*.xlsx binary
