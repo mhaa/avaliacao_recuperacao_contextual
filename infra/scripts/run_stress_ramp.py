@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import shlex
 import sys
 import threading
@@ -45,6 +46,7 @@ from analysis.resources import write_resources_csv
 from infra.scripts.cloud_smoke_test import (
     _confirm_billable,
     _run,
+    fetch_terraform_access_token,
     gcloud_ssh,
     gcloud_ssh_with_retry,
     restart_container,
@@ -468,6 +470,9 @@ def main(argv=None) -> int:
         )
         applied = True
 
+        print("Mintando token de acesso via impersonação da SA do Terraform (nunca fica em disco)...")
+        os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = fetch_terraform_access_token(args.project_id)
+
         terraform(
             [
                 "init",
@@ -733,6 +738,13 @@ def main(argv=None) -> int:
                 f"terraform destroy da campanha de estresse de '{args.cell}'.",
                 auto_approve=args.yes,
             )
+            # Reminta o token: dura só ~1h, e a sondagem + rampa somadas passam
+            # disso com folga (ver mesmo problema e correção em
+            # run_measurement_battery.py) — sem isto o destroy final falha com
+            # "Error 401: invalid authentication credentials", deixando as 3 VMs
+            # (maiores que o padrão nesta campanha) presas cobrando.
+            print("Remintando token de acesso antes do destroy (o anterior pode ter expirado)...")
+            os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = fetch_terraform_access_token(args.project_id)
             terraform(
                 ["destroy", "-auto-approve", *tf_vars],
                 tf_dir=TF_DIR,
