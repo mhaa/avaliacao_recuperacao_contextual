@@ -260,6 +260,58 @@ def build_probe_k6_cmd(
     ]
 
 
+def build_ramp_k6_cmd(
+    requests_out: Path,
+    cell_id: str,
+    target_url: str,
+    selectivity_tier: str,
+    stages_json: str,
+    max_vus: int,
+    *,
+    user_count: int,
+) -> list[str]:
+    """Rampa de estresse com foco no banco (STRESS_RAMP_MODE em
+    load/scenarios.js, docs/DESIGN.md "Experimento complementar").
+
+    Três diferenças deliberadas em relação a `build_probe_k6_cmd`:
+
+    1. **Sem `--out json=`.** `k6-raw.json` é só diagnóstico nativo, pesa
+       ~524 B/requisição (4x a NDJSON) e a proteção que o mantém sob
+       controle — upload e `unlink` a cada repetição — não existe numa
+       rampa contínua, que é UMA execução do k6. Com ele, e3-postgres
+       (~169 M requisições) e e3-valkey (~208 M) estourariam o disco de
+       100 GB do gerador.
+    2. **Cronograma inteiro por env.** `stages_json` vem de
+       `load/ramp.py:build_step_schedule`, já validado pelo pré-voo de
+       disco. Recalcular a geometria dentro do JS duplicaria a regra.
+    3. **`max_vus` explícito.** A heurística `RATE * 2` de scenarios.js
+       pediria 100.000 VUs a 50k req/s, e o custo de memória por VU faria o
+       gerador derrubar o offered_ratio — envenenando em silêncio a própria
+       medição.
+    """
+    return [
+        "k6",
+        "run",
+        SCENARIOS_SCRIPT.as_posix(),
+        f"--console-output={Path(requests_out).as_posix()}",
+        "--log-format=raw",
+        "-e",
+        f"CELL={cell_id}",
+        "-e",
+        f"TARGET_URL={target_url}",
+        "-e",
+        f"SELECTIVITY_TIER={selectivity_tier}",
+        "-e",
+        f"USER_COUNT={user_count}",
+        "-e",
+        "STRESS_RAMP_MODE=true",
+        "-e",
+        f"RAMP_STAGES={stages_json}",
+        "-e",
+        f"RAMP_MAX_VUS={max_vus}",
+    ]
+
+
 def run_k6(
     cell_id: str,
     repetition: int,

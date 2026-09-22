@@ -379,10 +379,24 @@ taxa de chegada constante (modelo aberto de verdade) e suporte nativo a gRPC.
 via `k6 inspect` — com dois cenários por execução: `warmup` (2 min,
 descartado) seguido de `measurement` (`startTime: '2m'`, 5 min), usando a tag
 automática `scenario` do k6 (não timestamps) para a Etapa 8 filtrar o que
-entra na análise. Um segundo modo (`RAMP_MODE=true`) troca para
-`ramping-arrival-rate` com `abortOnFail` nos thresholds — implementa a
-"rampa até violar o SLO" parando sozinho quando o SLO estoura, em vez de
-rodar a rampa inteira.
+entra na análise.
+
+**Correção de registro.** O `RAMP_MODE=true` descrito aqui antes — um
+`ramping-arrival-rate` com `abortOnFail`, que parava sozinho ao estourar o
+SLO — foi **removido no commit `c695388`**, por não implementar o protocolo
+de busca (sem busca binária, sem checagem do gerador). Seu lugar é ocupado
+por `PROBE_MODE`, que sonda UM patamar por vez; quem decide os patamares é
+`load/saturation.py`, em Python e testável.
+
+`ramping-arrival-rate` voltou a existir depois, mas com propósito oposto:
+`STRESS_RAMP_MODE` (campanha complementar de estresse, docs/DESIGN.md)
+percorre uma rampa contínua que **atravessa** o joelho sem parar, segura em
+sobrecarga e desce de volta — justamente para medir se o banco se recupera
+ou se perde. Por isso ela roda **sem threshold nenhum**: um `abortOnFail`
+encerraria a execução exatamente no ponto de interesse. A atribuição por
+degrau também é diferente — um só cenário cobre a rampa inteira, então cada
+linha NDJSON carrega o campo `step_rate` (valor-verdade do cronograma
+gerado por `load/ramp.py`), em vez de depender da tag `scenario`.
 
 `load/zipf.js` amostra `user_id` por Zipf (expoente 1,0, fixo pelo desenho
 experimental) — sem lib externa no runtime do k6, a CDF é pré-computada uma

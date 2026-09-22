@@ -24,12 +24,14 @@ SCHEMA_SCRIPT_opensearch = schemas/opensearch/create_index.py
 SCHEMA_SCRIPT := $(SCHEMA_SCRIPT_$(STORAGE))
 
 .PHONY: help gen-data up load-schema verify verify-all smoke down analyze \
-        tf-plan tf-apply tf-destroy measure saturation-triagem saturation-confirmacao
+        tf-plan tf-apply tf-destroy measure saturation-triagem saturation-confirmacao \
+        stress-ramp fetch-estresse stress-figures
 
 help:
 	@echo "Ambiente local:  gen-data up load-schema verify verify-all smoke down analyze"
 	@echo "Nuvem:           tf-plan tf-apply tf-destroy measure"
 	@echo "Vazao saturacao: saturation-triagem saturation-confirmacao"
+	@echo "Estresse (extra): stress-ramp fetch-estresse stress-figures"
 	@echo "Variaveis (ex.: make up DB=valkey): SAMPLE CELL DB PHASE PROJECT_ID REGION ZONE"
 	@echo "  TF_STATE_BUCKET RESULTS_BUCKET DATASET_BUCKET TOOLS_IMAGE START"
 
@@ -107,3 +109,23 @@ saturation-triagem:
 
 saturation-confirmacao:
 	$(MAKE) measure PHASE=confirmacao START=$(START)
+
+## Campanha COMPLEMENTAR de estresse com foco no banco (docs/DESIGN.md,
+## "Experimento complementar"). Infraestrutura, estado Terraform e namespace
+## de resultados totalmente separados da campanha principal — ver
+## infra/envs/estresse/main.tf. FATURÁVEL: usa VMs bem maiores que o padrão.
+
+stress-ramp:
+	TOOLS_IMAGE=$(TOOLS_IMAGE) python -m infra.scripts.run_stress_ramp \
+	    $(CELL) $(PROJECT_ID) $(REGION) $(ZONE) $(TF_STATE_BUCKET) $(RESULTS_BUCKET) $(DATASET_BUCKET) \
+	    --service-image $(SERVICE_IMAGE) --tools-image $(TOOLS_IMAGE) \
+	    $(if $(KNEE),--knee $(KNEE),) $(if $(STEP),--fine-step $(STEP),)
+
+## Baixa do bucket (destino primário) para o ambiente local. Por padrão só os
+## derivados; RAW=1 traz também a NDJSON bruta, que soma dezenas de GB.
+fetch-estresse:
+	python -m analysis.fetch_results $(RESULTS_BUCKET) $(if $(RAW),--include-raw,)
+
+## As três figuras, a partir de um ramp_<tier>.json já baixado.
+stress-figures:
+	python -m analysis.ramp_figures $(RAMP_JSON)

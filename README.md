@@ -429,3 +429,74 @@ máquina: `gcloud storage cp --recursive gs://<results_bucket>/<cell>/ results/<
 
 As 14 células rodam sobre **hardware idêntico** — ver a tabela completa em
 [docs/DESIGN.md#equivalência-de-infraestrutura-entre-células](docs/DESIGN.md#equivalência-de-infraestrutura-entre-células).
+
+### Fase 6 — Campanha complementar: estresse com foco no banco
+
+**Não faz parte da matriz 4×4** e seus números nunca entram na fronteira de
+Pareto nem no modelo de custo. Ver
+[docs/DESIGN.md](docs/DESIGN.md), "Experimento complementar — estresse com foco
+no banco", para o desenho completo.
+
+**Por que existe.** `results/report/extra/resource_bottleneck_by_cell_tier.csv`
+acusa `bottleneck=service_cpu` em **12 de 12** combinações medidas: a CPU do
+banco nunca passou de 21% (Scylla) e chegou a 0,9% (Valkey). Por mil
+requisições, o serviço custa de 4× (Scylla) a 91× (Valkey/E-3) o que o banco
+custa. As vazões de saturação da confirmação são, portanto, propriedade do
+processo Python. Isso não invalida a matriz principal — delimita o que ela
+mede.
+
+**O que a campanha faz.** Escala a VM de serviço (e o gerador junto) até o
+banco virar o gargalo, e percorre uma rampa contínua que **atravessa** o
+joelho sem parar, segura em sobrecarga e **desce de volta** pelos mesmos
+degraus. Comparar subida e descida na mesma taxa é o que separa "o banco se
+recupera sozinho" de "o banco se perde".
+
+**O joelho é medido, não projetado.** Antes de montar a rampa, uma sondagem
+rápida (patamares em dobra, **1 repetição por patamar**, busca binária para
+refinar) encontra onde a célula realmente quebra. Custa ~20-26 min, cerca de
+13% do tempo da rampa. Sem ela, um erro de projeção de mais de 40% para baixo
+joga a violação na fase grossa — resolução 10× pior — e gasta a fase fina
+inteira em sobrecarga, devolvendo `recovery=undetermined` depois de horas de VM
+pagas. `--skip-probe` usa a projeção; `--knee N` força um valor e também pula a
+sondagem.
+
+```bash
+# 1. Sondagem + rampa (FATURÁVEL — VMs bem maiores que o padrão; ~2-3,4 h por célula)
+make stress-ramp CELL=e4-valkey PROJECT_ID=... REGION=... ZONE=... \
+     TF_STATE_BUCKET=... RESULTS_BUCKET=... DATASET_BUCKET=... \
+     SERVICE_IMAGE=... TOOLS_IMAGE=...
+
+# 2. Baixar do bucket (destino primário). Só os derivados; RAW=1 traz a
+#    NDJSON bruta, que soma dezenas de GB.
+make fetch-estresse RESULTS_BUCKET=...
+
+# 3. As três figuras
+make stress-figures RAMP_JSON=results/_estresse/e4-valkey/<ts>/ramp_medium.json
+```
+
+Ordem sugerida por custo (sondagem + rampa): `e4-valkey` (~$4,08) →
+`e2-scylla` (~$7,84), que são as duas que **alcançam saturação real do banco**;
+só então decidir sobre `e3-postgres` (~$17,52) e `e3-valkey` (~$27,99), que
+exigem serviço e gerador de 64-96 vCPU. Total nominal das quatro: **~$57**.
+
+**Isolamento — nada da campanha principal é tocado.** Root module próprio
+(`infra/envs/estresse/`), prefixo de estado `estresse/<cell>` em vez de
+`cells/<cell>`, `TF_DATA_DIR` próprio e sufixo `-st` nos nomes de recurso. Os
+resultados vão para `_estresse/<cell>/<timestamp>/`, fora do glob que
+`analysis/report.py` varre, e o artefato chama-se `ramp_<tier>.json` para
+nunca casar com `saturation*.json`. **Nada é apagado**: a execução recusa
+começar se o destino já existir.
+
+> **Como ler os degraus além do joelho.** Passado o ponto de saturação,
+> `offered_ratio` cai abaixo de 0,95 e os percentis passam a ser só das
+> requisições sobreviventes. Aqui esse regime é o objeto de estudo, não um
+> defeito — os degraus ficam **marcados** no JSON (`offered_load_ok=false`) e
+> nas figuras, e o p99 deles nunca deve ser lido como se o modelo aberto
+> tivesse se mantido.
+
+> **Valkey e o veredito automático.** `classify_bottleneck` soma CPU sobre
+> todos os núcleos; um Valkey saturado lê ~12,5% numa VM de 8 vCPU e o
+> veredito jamais diria `database_cpu`. Por isso a campanha grava também
+> `db_cpu_cores.csv` (CPU **por núcleo**, de `/proc/stat` a cada 5 s): o
+> agregado em ~12,5% ao lado do máximo por núcleo em ~100% é a prova da
+> saturação de thread única.

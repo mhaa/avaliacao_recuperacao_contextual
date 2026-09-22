@@ -371,6 +371,88 @@ via consulta direta). Corrigido: rede agora é best-effort, mesmo padrão já
 usado para `memory_available_mb` — uma janela sem ponto de rede vira
 `network_mbps=None` nessa amostra, sem derrubar CPU/memória.
 
+### Experimento complementar — estresse com foco no banco
+
+**Não faz parte da matriz 4×4.** Roda em hardware diferente, com objetivo
+diferente, e seus números **nunca** entram na fronteira de Pareto nem no modelo
+de custo. Existe para responder uma pergunta que o experimento principal, por
+construção, não responde.
+
+**Motivo.** `results/report/extra/resource_bottleneck_by_cell_tier.csv` registra
+`bottleneck=service_cpu` em 12 de 12 combinações célula×seletividade medidas na
+confirmação. A CPU do banco nunca passou de 21% (Scylla) e chegou a 0,9%
+(Valkey). Normalizando por mil requisições, o serviço custa de 4× (Scylla) a 91×
+(Valkey/E-3) o que o banco custa. Sob carga fixa (100/1.000 req/s) o p99 fica em
+3-4 ms — o piso de serialização previsto em `docs/BENCHMARKS.md` §6. Ou seja: as
+vazões de saturação de 1.325 a 4.711 req/s são propriedade do processo Python,
+não das tecnologias de banco. Isso **não invalida** a matriz principal, cuja
+pergunta é a latência da recuperação contextual ponta a ponta sob hardware
+idêntico; apenas delimita o que ela mede.
+
+**Desenho.** Para cada uma das 4 células já confirmadas (e2-scylla, e3-postgres,
+e3-valkey, e4-valkey), com seletividade fixa no patamar médio:
+- VM de serviço escalada em vCPUs (memória igual ou maior), dimensionada por
+  célula até o teto arquitetural do banco correspondente — Scylla `--smp 7` →
+  ~87,5% da VM; Postgres → 100%; Valkey, **thread única no caminho de dados** →
+  ~12,5% de uma VM de 8 vCPU. A VM de banco **não muda**: é ela que se quer
+  saturar.
+- Gerador escalado junto: sob 11-38k req/s um `n2-standard-8` violaria o portão
+  dos 60%, e a curva medida seria do gerador, não do banco.
+- **Sondagem rápida do joelho, antes de montar a rampa.** Reaproveita
+  `load/saturation.py:run_saturation_search` com patamares em dobra, **uma
+  repetição por patamar** e busca binária para refinar — 9 a 12 sondagens de
+  90 s, ~20-26 min. O objetivo é *enquadrar* o joelho, não reportá-lo com
+  dispersão; a precisão vem depois, da fase fina construída em torno dele.
+
+  Não é refinamento opcional: o cronograma da rampa é **estático** (execução
+  única do k6), e sua fase fina cobre `[0,6·K, 1,3·K]`. Uma projeção errada em
+  mais de ~40% para baixo joga a violação na fase grossa — resolução 10× pior —
+  e gasta a fase fina inteira em sobrecarga, sem nenhum degrau de subida
+  saudável e portanto sem veredito de recuperação. Simulado sobre e3-valkey com
+  joelho real em 12.000 contra projeção de 38.300: primeira violação a 13.000
+  req/s na fase grossa, 0 de 69 degraus finos saudáveis, `recovery=undetermined`
+  — a campanha inteira paga sem produzir resultado. Sondar custa ~13% do tempo
+  da rampa e elimina esse risco.
+
+  Três desfechos, tratados separadamente: gerador saturado (execução abortada —
+  a rampa herdaria o teto do gerador), censurado (joelho acima de 50.000 req/s —
+  usa-se o piso, marcado como piso) e o caso normal.
+- Rampa contínua em degraus: fase grossa (+1.000 req/s a cada 30 s) até ~60% do
+  joelho **medido**, fase fina (passo configurável, 1 min por degrau)
+  atravessando o joelho **sem parar na primeira violação do SLO**, patamar em
+  sobrecarga por 5 min, e **descida** pelos mesmos degraus.
+- O artefato registra, em `knee`, onde a violação caiu e com que resolução —
+  para que um joelho resolvido na fase grossa (projeção manual via `--knee`,
+  ou sondagem pulada) nunca seja lido como se tivesse a precisão prometida.
+- A descida é o instrumento: comparando degraus de mesma taxa na subida e na
+  descida (vazão sustentada e p50/p95/p99), separa-se "o banco se recupera
+  sozinho" de "o banco se perde". A assinatura de não-recuperação já apareceu
+  espontaneamente em `results/e4-valkey/.../saturation_high.json` — p99 de
+  3.987 ms ao voltar para 4.709 req/s, abaixo dos 4.695 req/s que eram limpos
+  na subida.
+
+**Duas limitações de instrumentação que o desenho precisa contornar**, ambas já
+conhecidas do protocolo principal:
+- `classify_bottleneck` calcula CPU como `1 - idle/total` **somada sobre todos os
+  núcleos**. Um Valkey saturado lê ~12,5% numa VM de 8 vCPU, então o veredito
+  automático nunca acusaria `database_cpu` nas células Valkey. Por isso a
+  campanha amostra `/proc/stat` **por núcleo** na VM do banco.
+- Essa mesma amostragem resolve a resolução temporal: o piso de ~60s do Cloud
+  Monitoring (ver "Atribuição de gargalo" acima) borraria um único ponto sobre
+  ~2,5 degraus de 1 min. `/proc/stat` a cada 5 s dá ~12 pontos por degrau.
+
+**Leitura dos degraus além do joelho.** Passado o ponto de saturação,
+`offered_ratio` cai abaixo de 0,95 e os percentis passam a ser só das
+requisições sobreviventes — a omissão coordenada que "Vazão ofertada verificada,
+não presumida" descreve. Aqui esse regime é o objeto de estudo, não um defeito:
+os degraus não são descartados, mas ficam **marcados** no artefato e nas figuras,
+e o p99 deles nunca deve ser lido como se o modelo aberto tivesse se mantido.
+
+**Isolamento.** Estado Terraform, `TF_DATA_DIR`, nomes de recurso e namespace de
+resultados são todos próprios (`_estresse/`, `ramp_<tier>.json`). O env
+`infra/envs/experiment` e os artefatos `saturation*.json` da campanha principal
+não são tocados nem relidos.
+
 ### Métricas
 
 p50, p95, p99, p99,9 da latência · vazão atendida · vazão de saturação

@@ -85,9 +85,11 @@ e em nenhum outro.
 │   └── test_service_smoke.py                   # amostra via HTTP real
 │
 ├── load/                        # scripts de carga
-│   ├── scenarios.js              # k6, executor constant-arrival-rate / ramping-arrival-rate
+│   ├── scenarios.js              # k6: constant-arrival-rate (bateria/sondagem) e
+│   │                             #     ramping-arrival-rate (STRESS_RAMP_MODE)
 │   ├── zipf.js                   # sorteio de user_id (CDF pré-computada)
-│   ├── saturation.py             # rampa de busca de vazão de saturação
+│   ├── saturation.py             # busca de vazão de saturação — PARA na 1ª violação
+│   ├── ramp.py                   # rampa de estresse — ATRAVESSA o joelho e volta
 │   ├── run_battery.py            # roda scenarios.js N vezes por célula, grava em results/
 │   └── export_contexts_by_tier.py
 │

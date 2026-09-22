@@ -48,6 +48,22 @@ variable "subnetwork_self_link" {
   description = "Self-link da sub-rede privada (output do módulo network)."
 }
 
+variable "name_suffix" {
+  type        = string
+  description = <<-EOT
+    Sufixo dos nomes de recurso; vazio por padrão (renderização byte a byte
+    idêntica à atual). Ver a mesma variável em infra/modules/service/main.tf
+    para o porquê — campanha de estresse com estado Terraform próprio,
+    docs/DESIGN.md "Experimento complementar".
+  EOT
+  default     = ""
+
+  validation {
+    condition     = length(var.name_suffix) <= 4
+    error_message = "name_suffix precisa ter no máximo 4 caracteres (teto de 30 do account_id do GCP)."
+  }
+}
+
 variable "machine_type" {
   type        = string
   description = "Tipo de máquina — n2-standard-8 por padrão (docs/ARCHITECTURE.md, topologia); dimensionamento.xlsx (Etapa 1) pode indicar outro valor por célula."
@@ -288,7 +304,7 @@ locals {
 }
 
 resource "google_compute_disk" "data" {
-  name     = "tcc-${var.cell}-data"
+  name     = "tcc-${var.cell}-data${var.name_suffix}"
   zone     = var.zone
   size     = var.data_disk_size_gb
   type     = "pd-ssd"
@@ -296,7 +312,7 @@ resource "google_compute_disk" "data" {
 }
 
 resource "google_service_account" "database" {
-  account_id   = "tcc-${var.cell}-database"
+  account_id   = "tcc-${var.cell}-database${var.name_suffix}"
   display_name = "tcc-recsys database service account (${var.cell})"
 }
 
@@ -321,7 +337,7 @@ resource "google_project_iam_member" "database_metric_writer" {
 }
 
 resource "google_compute_instance" "database" {
-  name         = "tcc-${var.cell}-database"
+  name         = "tcc-${var.cell}-database${var.name_suffix}"
   zone         = var.zone
   machine_type = var.machine_type
 

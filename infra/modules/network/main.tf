@@ -35,13 +35,32 @@ variable "subnet_cidr" {
   }
 }
 
+variable "name_suffix" {
+  type        = string
+  description = <<-EOT
+    Sufixo dos nomes de recurso; vazio por padrão (renderização byte a byte
+    idêntica à atual). Ver a mesma variável em infra/modules/service/main.tf.
+
+    Aqui o sufixo importa MAIS que nos outros módulos: estes nomes são fixos,
+    não derivados de `var.cell`, então dois estados Terraform sem sufixo
+    disputariam literalmente a mesma VPC, sub-rede, regras de firewall,
+    router e NAT.
+  EOT
+  default     = ""
+
+  validation {
+    condition     = length(var.name_suffix) <= 4
+    error_message = "name_suffix precisa ter no máximo 4 caracteres."
+  }
+}
+
 resource "google_compute_network" "main" {
-  name                    = "tcc-recsys-network"
+  name                    = "tcc-recsys-network${var.name_suffix}"
   auto_create_subnetworks = false
 }
 
 resource "google_compute_subnetwork" "private" {
-  name                     = "tcc-recsys-subnet"
+  name                     = "tcc-recsys-subnet${var.name_suffix}"
   ip_cidr_range            = var.subnet_cidr
   region                   = var.region
   network                  = google_compute_network.main.id
@@ -50,7 +69,7 @@ resource "google_compute_subnetwork" "private" {
 
 # SSH só via faixa de IP do IAP (docs/ARCHITECTURE.md) — nunca 0.0.0.0/0.
 resource "google_compute_firewall" "allow_iap_ssh" {
-  name          = "tcc-recsys-allow-iap-ssh"
+  name          = "tcc-recsys-allow-iap-ssh${var.name_suffix}"
   network       = google_compute_network.main.id
   direction     = "INGRESS"
   source_ranges = ["35.235.240.0/20"]
@@ -64,7 +83,7 @@ resource "google_compute_firewall" "allow_iap_ssh" {
 # Tráfego interno banco<->serviço<->gerador — restrito à própria sub-rede;
 # tudo mais fica negado pela regra implícita de deny-all do GCP.
 resource "google_compute_firewall" "allow_internal" {
-  name          = "tcc-recsys-allow-internal"
+  name          = "tcc-recsys-allow-internal${var.name_suffix}"
   network       = google_compute_network.main.id
   direction     = "INGRESS"
   source_ranges = [var.subnet_cidr]
@@ -80,13 +99,13 @@ resource "google_compute_firewall" "allow_internal" {
 # Saída à internet para VMs sem IP público (pull de imagem Docker, gcloud,
 # apt) — sem isto, instâncias sem access_config não teriam rota de saída.
 resource "google_compute_router" "main" {
-  name    = "tcc-recsys-router"
+  name    = "tcc-recsys-router${var.name_suffix}"
   network = google_compute_network.main.id
   region  = var.region
 }
 
 resource "google_compute_router_nat" "main" {
-  name                               = "tcc-recsys-nat"
+  name                               = "tcc-recsys-nat${var.name_suffix}"
   router                             = google_compute_router.main.name
   region                             = var.region
   nat_ip_allocate_option             = "AUTO_ONLY"

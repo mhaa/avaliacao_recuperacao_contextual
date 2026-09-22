@@ -49,6 +49,34 @@ variable "results_bucket" {
   description = "Bucket de resultados (output do bootstrap: results_bucket) — load/upload_results.py escreve aqui direto desta VM, via ADC/metadata server."
 }
 
+variable "name_suffix" {
+  type        = string
+  description = <<-EOT
+    Sufixo dos nomes de recurso; vazio por padrão (renderização byte a byte
+    idêntica à atual). Ver a mesma variável em infra/modules/service/main.tf
+    para o porquê — campanha de estresse com estado Terraform próprio,
+    docs/DESIGN.md "Experimento complementar".
+  EOT
+  default     = ""
+
+  validation {
+    condition     = length(var.name_suffix) <= 4
+    error_message = "name_suffix precisa ter no máximo 4 caracteres (teto de 30 do account_id do GCP)."
+  }
+}
+
+variable "boot_disk_size_gb" {
+  type        = number
+  description = <<-EOT
+    Disco de boot do gerador, onde o k6 grava a NDJSON por requisição. O
+    default de 100 é o valor que já estava fixo aqui — vira variável só para
+    a campanha de estresse poder crescer se o pré-voo aritmético de
+    load/ramp.py:check_disk_budget pedir. Em condição normal não precisa:
+    aquela rampa não grava k6-raw.json, que era o que dominava o volume.
+  EOT
+  default     = 100
+}
+
 variable "machine_type" {
   type        = string
   description = "Tipo de máquina — n2-standard-8 (docs/ARCHITECTURE.md, topologia)."
@@ -56,7 +84,7 @@ variable "machine_type" {
 }
 
 resource "google_service_account" "loadgen" {
-  account_id   = "tcc-${var.cell}-loadgen"
+  account_id   = "tcc-${var.cell}-loadgen${var.name_suffix}"
   display_name = "tcc-recsys loadgen service account (${var.cell})"
 }
 
@@ -176,7 +204,7 @@ resource "google_compute_instance" "loadgen" {
   # ampliar o retry de 5x10s para 10x15s.
   depends_on = [google_project_iam_member.loadgen_artifact_reader]
 
-  name         = "tcc-${var.cell}-loadgen"
+  name         = "tcc-${var.cell}-loadgen${var.name_suffix}"
   zone         = var.zone
   machine_type = var.machine_type
 
@@ -192,7 +220,7 @@ resource "google_compute_instance" "loadgen" {
       # confirmado ao vivo em e2-opensearch ("no space left on device" +
       # JSONDecodeError logo em seguida). 100GB é folga generosa e barata
       # (pd-standard, cobrado só pelas horas reais da VM).
-      size = 100
+      size = var.boot_disk_size_gb
     }
   }
 

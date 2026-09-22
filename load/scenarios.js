@@ -156,13 +156,83 @@ const smokeScenarios = {
   },
 };
 
+// Rampa de estresse com foco no banco (docs/DESIGN.md, "Experimento
+// complementar"). UMA execução contínua do k6, não um degrau por processo:
+// reiniciar o k6 entre degraus daria ao banco janelas de ociosidade para
+// drenar fila, destruindo justamente o fenômeno sob observação (se ele se
+// recupera ou se perde).
+//
+// O cronograma inteiro vem pronto do Python (load/ramp.py:build_step_schedule)
+// em RAMP_STAGES, em vez de ser recalculado aqui: manter a geometria da rampa
+// em dois lugares garantiria divergência, e é o lado Python que já é testado
+// e que faz o pré-voo de disco sobre esse mesmo cronograma.
+const STRESS_RAMP_MODE = (__ENV.STRESS_RAMP_MODE || 'false') === 'true';
+const RAMP_STAGES = JSON.parse(__ENV.RAMP_STAGES || '[]');
+// Dimensionado explicitamente, NÃO pela heurística `RATE * 2` acima: a 50k
+// req/s ela pediria 100.000 VUs, e o custo de memória por VU faria o próprio
+// gerador derrubar o offered_ratio — envenenando em silêncio exatamente a
+// medição em questão (o mesmo modo de falha do excesso de séries de métricas
+// documentado no topo deste arquivo).
+const RAMP_MAX_VUS = parseInt(__ENV.RAMP_MAX_VUS || '2000', 10);
+
+// Fronteiras cumulativas dos degraus, em ms desde o início do teste.
+// Calculadas uma vez no carregamento do módulo (não por iteração).
+const rampBoundaries = [];
+{
+  let elapsed = 0;
+  for (const stage of RAMP_STAGES) {
+    elapsed += stage.duration_s * 1000;
+    rampBoundaries.push(elapsed);
+  }
+}
+
+// Atribuição de degrau pelo VALOR-VERDADE do cronograma, não por bucketing de
+// timestamp na análise (docs/DECISIONS.md: atribuição sempre por dado
+// estruturado). Um só cenário k6 cobre a rampa inteira, então a tag `scenario`
+// não distingue degraus — este campo é que distingue.
+function currentStep() {
+  const elapsedMs = exec.instance.currentTestRunDuration;
+  for (let i = 0; i < rampBoundaries.length; i++) {
+    if (elapsedMs < rampBoundaries[i]) {
+      return RAMP_STAGES[i];
+    }
+  }
+  return RAMP_STAGES[RAMP_STAGES.length - 1];
+}
+
+// Estágios PAREADOS: `{target, duration:'0s'}` seguido de `{target, duration}`
+// produz platôs quadrados. Sem o par de 0s, `ramping-arrival-rate` interpola
+// linearmente entre alvos e não haveria degrau nenhum — só uma diagonal, na
+// qual "a vazão sustentada no patamar X" não existiria como grandeza.
+const rampStages = [];
+for (const stage of RAMP_STAGES) {
+  rampStages.push({ target: stage.rate, duration: '0s' });
+  rampStages.push({ target: stage.rate, duration: `${stage.duration_s}s` });
+}
+
+const stressRampScenarios = {
+  stress_ramp: {
+    executor: 'ramping-arrival-rate',
+    startRate: RAMP_STAGES.length > 0 ? RAMP_STAGES[0].rate : 1,
+    timeUnit: '1s',
+    stages: rampStages,
+    preAllocatedVUs: Math.min(Math.max(50, Math.ceil(RAMP_MAX_VUS * 0.25)), RAMP_MAX_VUS),
+    maxVUs: RAMP_MAX_VUS,
+  },
+};
+
 // Sem threshold nenhum em SMOKE_MODE (só sanidade, "não deu erro", não
 // medição) nem em PROBE_MODE (o Python decide violação de SLO olhando o
 // summary calculado por analysis/collect.py depois — comparar contra o
 // mesmo p99/taxa-de-erro que entra no manifest, em vez de duas
 // implementações do mesmo julgamento, uma em JS outra em Python).
+// STRESS_RAMP_MODE também roda sem threshold, e por um motivo mais forte que
+// os outros dois: a rampa PRECISA continuar depois da violação do SLO — é o
+// que se quer observar. Um threshold com abortOnFail encerraria a execução
+// exatamente no ponto de interesse, e sem abortOnFail só sujaria o código de
+// saída de uma execução bem-sucedida.
 const thresholds =
-  SMOKE_MODE || PROBE_MODE
+  SMOKE_MODE || PROBE_MODE || STRESS_RAMP_MODE
     ? {}
     : {
         'http_req_duration{scenario:measurement}': ['p(99)<200'],
@@ -170,7 +240,13 @@ const thresholds =
       };
 
 export const options = {
-  scenarios: SMOKE_MODE ? smokeScenarios : PROBE_MODE ? probeScenarios : constantRateScenarios,
+  scenarios: SMOKE_MODE
+    ? smokeScenarios
+    : STRESS_RAMP_MODE
+      ? stressRampScenarios
+      : PROBE_MODE
+        ? probeScenarios
+        : constantRateScenarios,
   thresholds,
 };
 
@@ -195,14 +271,24 @@ export default function () {
   const res = http.post(TARGET_URL, payload, params);
   const latencyMs = Date.now() - t0;
   check(res, { 'status is 200': (r) => r.status === 200 });
-  console.log(
-    JSON.stringify({
-      request_id: requestId,
-      scenario: exec.scenario.name,
-      timestamp: new Date().toISOString(),
-      latency_ms: latencyMs,
-      status: res.status,
-      returned_count: res.status === 200 ? res.json('returned_count') : null,
-    })
-  );
+  const line = {
+    scenario: exec.scenario.name,
+    timestamp: new Date().toISOString(),
+    latency_ms: latencyMs,
+    status: res.status,
+    returned_count: res.status === 200 ? res.json('returned_count') : null,
+  };
+  if (STRESS_RAMP_MODE) {
+    // `step_rate` é a carga OFERTADA do degrau — o denominador de
+    // offered_ratio em analysis/ramp_report.py. `request_id` fica de fora:
+    // nenhum código de produção o lê (analysis/collect.py só o menciona num
+    // comentário sobre uma abordagem abandonada), e numa rampa que emite
+    // centenas de milhões de linhas cada byte por linha vira GB de disco.
+    const step = currentStep();
+    line.step_rate = step.rate;
+    line.step_phase = step.phase;
+  } else {
+    line.request_id = requestId;
+  }
+  console.log(JSON.stringify(line));
 }

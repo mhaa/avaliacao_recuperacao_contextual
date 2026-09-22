@@ -46,6 +46,30 @@ variable "database_internal_ip" {
   description = "IP interno da VM de banco desta célula (output do módulo database)."
 }
 
+variable "name_suffix" {
+  type        = string
+  description = <<-EOT
+    Sufixo dos nomes de recurso. Vazio por padrão: com "", a renderização é
+    byte a byte idêntica à que já existe, então `terraform plan` do env
+    principal continua dando diff vazio.
+
+    Serve à campanha de estresse (docs/DESIGN.md, "Experimento complementar"),
+    que roda em estado Terraform próprio: sem sufixo, os dois estados
+    disputariam o MESMO nome de VM/service account/disco, e o segundo apply
+    falharia — ou pior, adotaria recurso alheio.
+
+    Mantenha curto. O ID de service account do GCP tem teto de 30 caracteres e
+    "tcc-e1-opensearch-loadgen" já usa 25; a campanha usa "-st" (28 no total),
+    não "-estresse" (34, que falharia no apply).
+  EOT
+  default     = ""
+
+  validation {
+    condition     = length(var.name_suffix) <= 4
+    error_message = "name_suffix precisa ter no máximo 4 caracteres (teto de 30 do account_id do GCP)."
+  }
+}
+
 variable "machine_type" {
   type        = string
   description = "Tipo de máquina — n2-standard-8 (docs/ARCHITECTURE.md, topologia)."
@@ -53,7 +77,7 @@ variable "machine_type" {
 }
 
 resource "google_service_account" "service" {
-  account_id   = "tcc-${var.cell}-service"
+  account_id   = "tcc-${var.cell}-service${var.name_suffix}"
   display_name = "tcc-recsys service account (${var.cell})"
 }
 
@@ -151,7 +175,7 @@ resource "google_compute_instance" "service" {
   # privada) em paralelo com a concessão de IAM ainda propagando.
   depends_on = [google_project_iam_member.service_artifact_reader]
 
-  name         = "tcc-${var.cell}-service"
+  name         = "tcc-${var.cell}-service${var.name_suffix}"
   zone         = var.zone
   machine_type = var.machine_type
 

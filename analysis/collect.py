@@ -36,6 +36,17 @@ MEASUREMENT_SCENARIOS = frozenset({"measurement"})
 # de analysis/smoke_report.py:SMOKE_SCENARIOS).
 PROBE_SCENARIOS = frozenset({"probe"})
 
+# Rampa de estresse com foco no banco (load/scenarios.js STRESS_RAMP_MODE,
+# docs/DESIGN.md "Experimento complementar"). Um único cenário k6 cobre a
+# rampa inteira — a distinção entre degraus vem do campo `step_rate` de cada
+# linha, não do nome do cenário; ver `extra_fields` em parse_requests_ndjson.
+RAMP_SCENARIOS = frozenset({"stress_ramp"})
+
+# Colunas extras que a rampa precisa preservar. Ficam fora do schema padrão
+# de propósito: latencies.parquet da bateria principal não tem degraus, e
+# acrescentar colunas sempre-nulas lá mudaria um formato já gravado em disco.
+RAMP_EXTRA_FIELDS = ("step_rate", "step_phase")
+
 # docs/DESIGN.md, "Vazão ofertada verificada, não presumida": abaixo desta
 # fração da taxa-alvo, o k6 esgotou maxVUs e descartou chegadas — as
 # latências registradas são só das requisições sobreviventes, e o modelo
@@ -47,8 +58,13 @@ PROBE_SCENARIOS = frozenset({"probe"})
 MIN_OFFERED_RATIO = 0.95
 
 
+_EXTRA_FIELD_DTYPES = {"step_rate": pl.Int64, "step_phase": pl.Utf8}
+
+
 def parse_requests_ndjson(
-    path: Path, scenarios: frozenset[str] = MEASUREMENT_SCENARIOS
+    path: Path,
+    scenarios: frozenset[str] = MEASUREMENT_SCENARIOS,
+    extra_fields: tuple[str, ...] = (),
 ) -> pl.DataFrame:
     """latencies.parquet: uma linha por requisição — timestamp, latência,
     status, returned_count. Lida direto de `path`, o arquivo que
@@ -71,7 +87,14 @@ def parse_requests_ndjson(
     `warmup`). infra/scripts/cloud_smoke_test.py passa
     `scenarios={"smoke"}` para o mesmo parser, sobre o cenário de smoke de
     load/scenarios.js — nunca o padrão, pra não haver risco de dado de
-    smoke entrar em MEASUREMENT_SCENARIOS por engano."""
+    smoke entrar em MEASUREMENT_SCENARIOS por engano.
+
+    `extra_fields` preserva colunas adicionais da linha NDJSON, e é vazio por
+    padrão para o schema de 4 colunas — o formato já gravado em todos os
+    latencies.parquet existentes — continuar idêntico. A rampa de estresse
+    passa RAMP_EXTRA_FIELDS: ela roda num cenário k6 único, então precisa de
+    `step_rate` na própria linha para saber a que degrau cada requisição
+    pertence (analysis/ramp_report.py)."""
     rows: list[dict] = []
 
     with path.open() as f:
@@ -82,14 +105,15 @@ def parse_requests_ndjson(
             event = json.loads(line)
             if event.get("scenario") not in scenarios:
                 continue
-            rows.append(
-                {
-                    "timestamp": event["timestamp"],
-                    "latency_ms": float(event["latency_ms"]),
-                    "status": int(event["status"]),
-                    "returned_count": event["returned_count"],
-                }
-            )
+            row = {
+                "timestamp": event["timestamp"],
+                "latency_ms": float(event["latency_ms"]),
+                "status": int(event["status"]),
+                "returned_count": event["returned_count"],
+            }
+            for extra in extra_fields:
+                row[extra] = event.get(extra)
+            rows.append(row)
 
     df = pl.DataFrame(
         rows,
@@ -98,6 +122,7 @@ def parse_requests_ndjson(
             "latency_ms": pl.Float64,
             "status": pl.Int32,
             "returned_count": pl.Int32,
+            **{name: _EXTRA_FIELD_DTYPES[name] for name in extra_fields},
         },
     )
     # k6 emite timestamps ISO-8601 em UTC com precisão de nanossegundos
