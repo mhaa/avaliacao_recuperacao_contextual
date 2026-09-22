@@ -13,6 +13,7 @@ import pytest
 
 from analysis.report import (
     DISK_USD_PER_GB_MONTH,
+    _resolve_max_workers,
     build_report,
     discover_rep_dirs,
     ensure_collected,
@@ -23,6 +24,23 @@ from analysis.report import (
     storage_medium_for_cell,
     unit_storage_cost_usd_month,
 )
+
+
+def test_resolve_max_workers_defaults_to_the_smaller_of_labels_and_cpus():
+    assert _resolve_max_workers(label_count=3, cpu_count=16, override=None) == 3
+    assert _resolve_max_workers(label_count=16, cpu_count=4, override=None) == 4
+
+
+def test_resolve_max_workers_override_caps_but_never_raises_the_default():
+    # Achado ao vivo: 3 workers em paralelo estouraram ArrayMemoryError numa
+    # máquina de 16GB — --max-workers existe pra reduzir isso, nunca pra
+    # pedir mais workers do que o default já permitiria.
+    assert _resolve_max_workers(label_count=3, cpu_count=16, override=1) == 1
+    assert _resolve_max_workers(label_count=3, cpu_count=16, override=10) == 3
+
+
+def test_resolve_max_workers_never_returns_less_than_one():
+    assert _resolve_max_workers(label_count=3, cpu_count=16, override=0) == 1
 
 
 def _request_line(

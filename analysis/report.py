@@ -456,11 +456,19 @@ def _compute_cell_report_entry(
     return entry, {"low": ci.low, "high": ci.high}
 
 
+def _resolve_max_workers(label_count: int, cpu_count: int, override: int | None) -> int:
+    resolved = max(1, min(label_count, cpu_count))
+    if override is not None:
+        resolved = max(1, min(resolved, override))
+    return resolved
+
+
 def build_report(
     groups: dict[str, list[float]],
     saturation_by_cell: dict[str, dict] | None = None,
     storage_root: Path = _DEFAULT_STORAGE_ROOT,
     returned_counts_by_key: dict[str, list[tuple[int, int]]] | None = None,
+    max_workers: int | None = None,
 ) -> dict:
     saturation_by_cell = saturation_by_cell or {}
     returned_counts_by_key = returned_counts_by_key or {}
@@ -486,12 +494,16 @@ def build_report(
     # Um processo por célula: percentiles_of + bootstrap_percentile_ci são o
     # gargalo real (bootstrap é single-threaded, np.percentile/sort não
     # paraleliza via BLAS — confirmado ao vivo numa VM de 8 núcleos rodando
-    # só 1). max_workers limitado a os.cpu_count() (nunca mais que o nº de
-    # células, ProcessPoolExecutor não reaproveita workers ociosos além do
+    # só 1). Teto default em os.cpu_count() (nunca mais que o nº de células,
+    # ProcessPoolExecutor não reaproveita workers ociosos além do
     # necessário) — cada worker aloca seu próprio lote do bootstrap
     # (analysis/stats.py:_BOOTSTRAP_BATCH_TARGET_BYTES), então o teto de
     # memória agregado escala com max_workers, não com o nº de células.
-    max_workers = max(1, min(len(labels), os.cpu_count() or 1))
+    # `max_workers` do parâmetro (quando informado) baixa esse teto ainda
+    # mais — achado ao vivo: 3 workers em paralelo, cada um perto do pico
+    # (900MB+ só o lote do bootstrap), estourou um ArrayMemoryError num
+    # host de 16GB total quando os 3 picos coincidiram.
+    max_workers = _resolve_max_workers(len(labels), os.cpu_count() or 1, max_workers)
     print(
         f"Calculando estatísticas por célula ({len(labels)} células, até "
         f"{max_workers} em paralelo)...",
@@ -630,6 +642,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("results_root", type=Path)
     parser.add_argument("--phase", required=True, choices=["triagem", "confirmacao"])
     parser.add_argument("--out", type=Path, default=Path("results/report"))
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=(
+            "teto de processos em paralelo pro cálculo por célula (default: "
+            "min(nº de células, nº de CPUs)) — baixe numa máquina com pouca "
+            "RAM, cada worker pode picar 1GB+ só no lote do bootstrap "
+            "(analysis/stats.py:_BOOTSTRAP_BATCH_TARGET_BYTES)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     rep_dirs = discover_rep_dirs(args.results_root, args.phase)
@@ -688,7 +711,10 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     report = build_report(
-        groups, saturation_by_cell, returned_counts_by_key=returned_counts_by_key
+        groups,
+        saturation_by_cell,
+        returned_counts_by_key=returned_counts_by_key,
+        max_workers=args.max_workers,
     )
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "report.json").write_text(json.dumps(report, indent=2))
