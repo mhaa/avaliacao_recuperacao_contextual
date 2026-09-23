@@ -508,6 +508,26 @@ def test_build_remote_probe_aggregate_command_includes_requested_decision_statis
     assert "--decision-statistic median-per-repetition" in cmd
 
 
+def test_build_remote_probe_aggregate_command_omits_ignore_latency_slo_by_default():
+    # A bateria principal (triagem/confirmação) nunca deve receber esta
+    # flag — só infra/scripts/run_stress_ramp.py:make_stress_probe_fn a
+    # passa explicitamente. Regressão: default precisa continuar False.
+    cmd = build_remote_probe_aggregate_command(
+        "_saturation/e1-postgres/confirm-low-0-1000", 5, 1000, "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+    )
+    assert "--ignore-latency-slo" not in cmd
+
+
+def test_build_remote_probe_aggregate_command_includes_ignore_latency_slo_when_requested():
+    cmd = build_remote_probe_aggregate_command(
+        "_estresse/e4-valkey/20260101T000000Z/probe/knee-0-1000", 1, 1000, "60s",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        ignore_latency_slo=True,
+    )
+    assert "--ignore-latency-slo" in cmd
+
+
 def test_parse_probe_result_reads_violated_slo_true():
     stdout = (
         "algum log irrelevante\nPROBE_RESULT violated_slo=True p99=250.0 error_rate=0.0 "

@@ -414,6 +414,24 @@ e3-valkey, e4-valkey), com seletividade fixa no patamar médio:
   — a campanha inteira paga sem produzir resultado. Sondar custa ~13% do tempo
   da rampa e elimina esse risco.
 
+  **A sondagem desta campanha ignora a SLO de latência** (`--ignore-latency-slo`
+  em `analysis/probe_report.py:violated_slo()`, `ignore_latency_slo=True` em
+  `infra/scripts/run_stress_ramp.py:make_stress_probe_fn`) — só taxa de erro
+  >1% (e o portão de vazão ofertada, nunca ignorado) decidem violação aqui,
+  ao contrário da bateria principal, que usa a SLO real (p99>200ms OU erro
+  >1%). Motivo: esta campanha quer o teto real do **banco**, não a
+  experiência de cliente — e p99>200ms é um limiar de UX, não de capacidade.
+  Achado ao vivo na 1ª sondagem de e4-valkey: CPU/memória agregados
+  ficaram bem abaixo de qualquer teto quando o joelho "violou" por p99 —
+  esperado, já que Valkey é single-thread no caminho de dados (~12,5% de
+  CPU agregada quando saturado, ver "Valkey e o veredito automático" acima),
+  mas levanta a suspeita de que o p99 do cliente pode estourar por fila em
+  outra camada (serviço) antes do banco saturar de fato, subestimando o
+  joelho que esta campanha existe para medir — daí a troca de critério.
+  Decisão tomada antes de re-executar a sondagem com o critério novo;
+  nenhum resultado de e4-valkey publicado até aqui usa `--ignore-latency-slo`
+  (a sondagem que mediu 5.875 req/s foi descartada, refeita do zero).
+
   Três desfechos, tratados separadamente: gerador saturado (execução abortada —
   a rampa herdaria o teto do gerador), censurado (joelho acima de 50.000 req/s —
   usa-se o piso, marcado como piso) e o caso normal.

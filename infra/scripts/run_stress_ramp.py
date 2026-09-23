@@ -183,17 +183,31 @@ def make_stress_probe_fn(
     """`probe_fn(rate) -> ProbeResult` para `run_saturation_search`.
 
     Espelha `run_measurement_battery.make_probe_fn` mas é escrito aqui, em
-    vez de importado, por UM motivo: aquele monta o caminho remoto sob
-    `_saturation/`, o namespace da campanha principal. Manter esta campanha
-    inteiramente sob `_estresse/` vale as ~20 linhas — e os pedaços que
-    importam (`build_remote_probe_rep_command`,
-    `build_remote_probe_aggregate_command`, `_parse_probe_result`) são
-    reusados verbatim, não recopiados.
+    vez de importado, por DOIS motivos: aquele monta o caminho remoto sob
+    `_saturation/`, o namespace da campanha principal — manter esta campanha
+    inteiramente sob `_estresse/` vale as ~20 linhas duplicadas; e o veredito
+    de violação usa `ignore_latency_slo=True` (ver abaixo), que a bateria
+    principal nunca deve receber. Os pedaços que importam
+    (`build_remote_probe_rep_command`, `build_remote_probe_aggregate_command`,
+    `_parse_probe_result`) são reusados verbatim, não recopiados.
 
     Uma repetição por patamar (`rep=0`, capturando /proc/stat nas duas
     pontas): a sondagem existe para ACHAR o joelho, não para reportá-lo com
     dispersão — a precisão vem depois, da fase fina da rampa construída em
     torno dele.
+
+    `ignore_latency_slo=True` no `build_remote_probe_aggregate_command`
+    abaixo: esta campanha quer o teto real do BANCO, não a SLO de latência
+    de cliente (p99>200ms) que orienta a bateria principal. Achado ao vivo
+    na 1ª sondagem de e4-valkey: CPU/memória agregados ficaram bem abaixo de
+    qualquer teto quando o joelho "violou" por p99, porque o Valkey é
+    single-thread no caminho de dados (~12,5% de CPU agregada numa VM de 8
+    vCPU quando saturado — ver docs/DESIGN.md, "Valkey e o veredito
+    automático") e o p99 do cliente pode estourar por fila em outra camada
+    (serviço) antes do banco saturar de fato — o que subestimaria o joelho
+    que esta campanha quer medir. Com `ignore_latency_slo=True`, só taxa de
+    erro >1% (e o portão de vazão ofertada, nunca ignorado) decidem
+    `violated_slo` aqui.
     """
     counter = itertools.count()
 
@@ -231,6 +245,13 @@ def make_stress_probe_fn(
             tools_image,
             RESULTS_MOUNT,
             FIXTURES_MOUNT,
+            # A campanha de estresse quer o teto real do BANCO, não a SLO de
+            # latência do cliente (p99>200ms) — essa pode disparar por fila
+            # em outra camada (serviço) antes do banco saturar de fato,
+            # subestimando o joelho. Só a taxa de erro (>1%) e o portão de
+            # vazão ofertada (nunca ignorado) decidem violated_slo aqui. Ver
+            # analysis/probe_report.py:violated_slo().
+            ignore_latency_slo=True,
         )
         result = gcloud_ssh_with_retry(loadgen_instance, zone, project_id, aggregate_cmd)
         verdict = _parse_probe_result(result.stdout)

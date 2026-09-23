@@ -75,7 +75,9 @@ def _cpu_percent_from_stat(before: tuple[int, ...], after: tuple[int, ...]) -> f
     return 100.0 * (delta_total - delta_idle) / delta_total
 
 
-def violated_slo(summary: dict, offered_ratio: float | None = None) -> bool:
+def violated_slo(
+    summary: dict, offered_ratio: float | None = None, ignore_latency: bool = False
+) -> bool:
     p99 = summary["latency_ms_p99"]
     error_rate = summary["error_rate"]
     if p99 is None or error_rate is None:
@@ -91,6 +93,15 @@ def violated_slo(summary: dict, offered_ratio: float | None = None) -> bool:
         # violação (direção segura: subestima S em vez de superestimá-lo, e
         # S entra direto no custo via n(D) = ⌈D/S⌉).
         return True
+    if ignore_latency:
+        # Só a campanha de estresse (infra/scripts/run_stress_ramp.py) passa
+        # isto — lá o objetivo é achar o teto real do BANCO, e o p99>200ms da
+        # SLO de cliente é um limiar de experiência de usuário, não de
+        # capacidade: pode disparar por fila em outra camada (serviço) antes
+        # do banco saturar de fato, subestimando o joelho que a campanha quer
+        # medir. A bateria principal (triagem/confirmação) nunca passa isto —
+        # lá o p99 real da SLO é exatamente o que se quer medir.
+        return error_rate > SLO_ERROR_RATE
     return p99 > SLO_P99_MS or error_rate > SLO_ERROR_RATE
 
 
@@ -180,6 +191,14 @@ def main(argv: list[str] | None = None) -> int:
         "puxa (ou esconde) a violação do agregado poolizado (achado ao vivo, docs/DESIGN.md). "
         "Só troca a estatística de decisão; violated_slo() em si não muda.",
     )
+    parser.add_argument(
+        "--ignore-latency-slo",
+        action="store_true",
+        help="ignora p99>200ms na decisão de violated_slo — só taxa de erro >1% conta "
+        "(além do portão de vazão ofertada, que nunca é ignorado). Usado só pela campanha "
+        "de estresse (infra/scripts/run_stress_ramp.py): ver violated_slo() para o motivo. "
+        "Nunca usado pela bateria principal (triagem/confirmação).",
+    )
     args = parser.parse_args(argv)
 
     per_rep_p99_ms: list[float] | None = None
@@ -197,7 +216,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         offered_ratio = min_offered_ratio(per_rep_summaries, expected_per_rep)
         per_rep_p99_ms = [_worst_case_if_empty(s)[0] for s in per_rep_summaries]
-        per_rep_violated = [violated_slo(s) for s in per_rep_summaries]
+        per_rep_violated = [
+            violated_slo(s, ignore_latency=args.ignore_latency_slo) for s in per_rep_summaries
+        ]
     else:
         # "pooled" (default): comportamento histórico, intocado — concatena
         # todos os ndjson num só dataframe e calcula UM p99/error_rate
@@ -219,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
 
-    violated = violated_slo(decision_summary, offered_ratio)
+    violated = violated_slo(decision_summary, offered_ratio, ignore_latency=args.ignore_latency_slo)
 
     before = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_BEFORE"])
     after = _parse_proc_stat_cpu_fields(os.environ["GENERATOR_CPU_STAT_AFTER"])
@@ -229,7 +250,8 @@ def main(argv: list[str] | None = None) -> int:
         f"PROBE_RESULT violated_slo={violated} p99={decision_summary['latency_ms_p99']} "
         f"error_rate={decision_summary['error_rate']} request_count={request_count} "
         f"offered_ratio={offered_ratio} "
-        f"generator_cpu_percent={generator_cpu_percent}"
+        f"generator_cpu_percent={generator_cpu_percent} "
+        f"ignore_latency_slo={args.ignore_latency_slo}"
     )
     if per_rep_p99_ms is not None and per_rep_violated is not None:
         # Tokens aditivos, só no modo mediana — sem espaços (vírgula como

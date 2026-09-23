@@ -47,6 +47,25 @@ def test_violated_slo_ignores_offered_ratio_when_unknown_or_sufficient():
     assert violated_slo(summary, offered_ratio=0.99) is False
 
 
+def test_ignore_latency_drops_only_the_p99_clause():
+    # infra/scripts/run_stress_ramp.py:make_stress_probe_fn passa isto — a
+    # campanha de estresse quer o teto do banco, não a SLO de latência de
+    # cliente (docs/DESIGN.md, "Experimento complementar").
+    over_latency = {"latency_ms_p99": 250.0, "error_rate": 0.0}
+    assert violated_slo(over_latency, ignore_latency=True) is False
+
+    over_error = {"latency_ms_p99": 50.0, "error_rate": 0.02}
+    assert violated_slo(over_error, ignore_latency=True) is True
+
+
+def test_ignore_latency_still_treats_missing_data_and_short_offered_load_as_violations():
+    # Nem o portão de "nenhuma requisição parseada" nem o de vazão ofertada
+    # são a SLO de latência — continuam valendo mesmo com ignore_latency=True.
+    assert violated_slo({"latency_ms_p99": None, "error_rate": None}, ignore_latency=True) is True
+    summary = {"latency_ms_p99": 50.0, "error_rate": 0.0}
+    assert violated_slo(summary, offered_ratio=0.43, ignore_latency=True) is True
+
+
 def test_parse_proc_stat_cpu_fields_reads_the_first_8_jiffie_counters():
     # Formato real de /proc/stat: "cpu" seguido de espaço duplo, depois
     # user nice system idle iowait irq softirq steal guest guest_nice.
@@ -161,6 +180,28 @@ def test_main_without_expected_requests_reports_offered_ratio_none(tmp_path, mon
     out = capsys.readouterr().out
     assert "violated_slo=False" in out
     assert "offered_ratio=None" in out
+
+
+def test_main_ignore_latency_slo_flag_flips_a_latency_only_violation(tmp_path, monkeypatch, capsys):
+    # infra/scripts/run_stress_ramp.py:make_stress_probe_fn passa
+    # --ignore-latency-slo — só a campanha de estresse, nunca a bateria
+    # principal. p99 acima do limiar, sem erro nenhum: sem a flag é
+    # violated_slo=True; com ela, False.
+    ndjson_path = tmp_path / "requests.ndjson"
+    ndjson_path.write_text(_probe_request(250.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main([str(ndjson_path)])
+    assert exit_code == 0
+    assert "violated_slo=True" in capsys.readouterr().out
+
+    exit_code = main(["--ignore-latency-slo", str(ndjson_path)])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "violated_slo=False" in out
+    assert "ignore_latency_slo=True" in out
 
 
 def test_median_decision_summary_takes_the_median_p99_and_error_rate_across_reps():

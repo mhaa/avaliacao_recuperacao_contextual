@@ -556,6 +556,7 @@ def build_remote_probe_aggregate_command(
     results_mount: str,
     fixtures_mount: str,
     decision_statistic: str = "pooled",
+    ignore_latency_slo: bool = False,
 ) -> str:
     """Consolida as `repetitions` já rodadas por build_remote_probe_rep_command
     com analysis/probe_report.py, na sessão SSH final e separada da
@@ -582,13 +583,19 @@ def build_remote_probe_aggregate_command(
     # lado do container) — o comando remoto fica autodocumentado no log da
     # sessão SSH, sem precisar cruzar com a versão do container pra saber
     # qual estatística decidiu o veredito.
+    # --ignore-latency-slo só quando o chamador pedir (default False, nunca
+    # usado pela bateria principal) — ver analysis/probe_report.py:
+    # violated_slo() para o motivo (campanha de estresse quer o teto real do
+    # BANCO, não a SLO de latência do cliente).
     inner = (
         f'BEFORE_STAT="$(cat {_probe_stat_path(remote_subdir, "before")})" && '
         f'AFTER_STAT="$(cat {_probe_stat_path(remote_subdir, "after")})" && '
         'GENERATOR_CPU_STAT_BEFORE="$BEFORE_STAT" GENERATOR_CPU_STAT_AFTER="$AFTER_STAT" '
         "python analysis/probe_report.py "
         f"--expected-requests {expected_requests} "
-        f"--decision-statistic {decision_statistic} " + shlex.join(ndjson_paths)
+        f"--decision-statistic {decision_statistic} "
+        + ("--ignore-latency-slo " if ignore_latency_slo else "")
+        + shlex.join(ndjson_paths)
     )
 
     docker_argv = [

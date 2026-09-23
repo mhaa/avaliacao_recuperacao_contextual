@@ -288,6 +288,49 @@ def test_probe_commands_stay_inside_the_stress_namespace(monkeypatch):
     assert not any("_saturation/" in c for c in sent)
 
 
+def test_stress_probe_ignores_latency_slo(monkeypatch):
+    # A campanha de estresse quer o teto do BANCO, não a SLO de cliente —
+    # docs/DESIGN.md, "Experimento complementar": achado ao vivo que CPU/
+    # memória agregados nunca chegavam perto de um teto quando o joelho
+    # "violava" só por p99 (Valkey é single-thread no caminho de dados).
+    # Regressão: a bateria principal nunca deve receber esta flag (ver
+    # test_build_remote_probe_aggregate_command_omits_ignore_latency_slo_by_default
+    # em test_run_measurement_battery.py).
+    import infra.scripts.run_stress_ramp as rsr
+
+    sent: list[str] = []
+
+    class _Completed:
+        stdout = (
+            "PROBE_RESULT violated_slo=False p99=250.0 error_rate=0.0 "
+            "request_count=60000 offered_ratio=1.0 generator_cpu_percent=30.0"
+        )
+
+    def _fake_ssh(instance, zone, project_id, command):
+        sent.append(command)
+        return _Completed()
+
+    monkeypatch.setattr(rsr, "gcloud_ssh_with_retry", _fake_ssh)
+
+    probe_fn = rsr.make_stress_probe_fn(
+        "e4-valkey",
+        "http://10.0.0.5:8000/v1/recommendations",
+        "medium",
+        "tcc-e4-valkey-loadgen-st",
+        "us-east4-c",
+        "proj",
+        "tools:latest",
+        "bucket",
+        "20260922T120000Z",
+        user_count=200_948,
+    )
+    probe_fn(4000)
+
+    aggregate_cmds = [c for c in sent if "analysis/probe_report.py" in c]
+    assert aggregate_cmds, "a sondagem precisa chamar analysis/probe_report.py"
+    assert all("--ignore-latency-slo" in c for c in aggregate_cmds)
+
+
 def test_probe_uploads_and_deletes_its_raw_json(monkeypatch):
     # A 32k req/s cada k6-raw.json passa de 1 GB; acumulá-los comeria o
     # disco que a NDJSON da rampa precisa.
