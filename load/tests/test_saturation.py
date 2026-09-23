@@ -4,12 +4,15 @@ disciplina de storage/tests/fakes.py."""
 
 from __future__ import annotations
 
+import pytest
+
 from load.saturation import (
     BACKWARD_WALK_MAX_STEPS,
     GENERATOR_CPU_THRESHOLD,
     ProbeResult,
     doubling_sequence,
     fine_sequence,
+    run_linear_probe_sweep,
     run_saturation_search,
 )
 
@@ -249,3 +252,94 @@ def test_run_saturation_search_without_min_step_keeps_the_old_fixed_iteration_be
         _healthy_probe(true_threshold=11_000), start_rate=1_000, binary_search_min_step=None
     )
     assert result.approx_throughput == 11_000.0
+
+
+def test_run_linear_probe_sweep_stops_at_the_first_violation():
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=rate >= 4_000, generator_cpu_percent=10.0)
+
+    result = run_linear_probe_sweep(probe_fn, start_rate=1_000, step=1_000, ceiling=50_000)
+
+    assert calls == [1_000, 2_000, 3_000, 4_000]
+    assert result.probes[-1].rate == 4_000
+    assert result.probes[-1].violated_slo is True
+    assert result.censored is False
+    assert result.loadgen_bottleneck is False
+
+
+def test_run_linear_probe_sweep_stops_when_generator_saturates():
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        cpu = GENERATOR_CPU_THRESHOLD + 1 if len(calls) == 2 else 30.0
+        return ProbeResult(rate=rate, violated_slo=False, generator_cpu_percent=cpu)
+
+    result = run_linear_probe_sweep(probe_fn, start_rate=1_000, step=1_000, ceiling=50_000)
+
+    assert result.loadgen_bottleneck is True
+    assert result.censored is False
+    assert len(calls) == 2  # nunca sonda um 3º patamar depois do gerador saturar
+
+
+def test_run_linear_probe_sweep_reaches_the_ceiling_cleanly():
+    def never_violates(rate: int) -> ProbeResult:
+        return ProbeResult(rate=rate, violated_slo=False, generator_cpu_percent=10.0)
+
+    result = run_linear_probe_sweep(never_violates, start_rate=1_000, step=1_000, ceiling=3_000)
+
+    assert result.censored is True
+    assert result.loadgen_bottleneck is False
+    assert [p.rate for p in result.probes] == [1_000, 2_000, 3_000]
+
+
+def test_run_linear_probe_sweep_stops_on_the_first_probe_when_it_already_violates():
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=True, generator_cpu_percent=10.0)
+
+    result = run_linear_probe_sweep(probe_fn, start_rate=1_000, step=1_000, ceiling=50_000)
+
+    assert calls == [1_000]
+    assert result.probes[0].violated_slo is True
+
+
+def test_run_linear_probe_sweep_respects_a_custom_step():
+    calls: list[int] = []
+
+    def never_violates(rate: int) -> ProbeResult:
+        calls.append(rate)
+        return ProbeResult(rate=rate, violated_slo=False, generator_cpu_percent=10.0)
+
+    run_linear_probe_sweep(never_violates, start_rate=1_000, step=500, ceiling=2_500)
+
+    assert calls == [1_000, 1_500, 2_000, 2_500]
+
+
+def test_run_linear_probe_sweep_rejects_a_start_rate_above_the_ceiling():
+    with pytest.raises(ValueError):
+        run_linear_probe_sweep(lambda rate: None, start_rate=5_000, ceiling=1_000)
+
+
+def test_run_linear_probe_sweep_rejects_a_non_positive_step():
+    with pytest.raises(ValueError):
+        run_linear_probe_sweep(lambda rate: None, start_rate=1_000, step=0, ceiling=5_000)
+
+
+def test_run_linear_probe_sweep_flags_unmeasured_generator_cpu():
+    calls: list[int] = []
+
+    def probe_fn(rate: int) -> ProbeResult:
+        calls.append(rate)
+        cpu = None if len(calls) == 2 else 30.0
+        return ProbeResult(rate=rate, violated_slo=rate >= 4_000, generator_cpu_percent=cpu)
+
+    result = run_linear_probe_sweep(probe_fn, start_rate=1_000, step=1_000, ceiling=50_000)
+
+    assert result.generator_cpu_unmeasured is True
+    assert result.loadgen_bottleneck is False

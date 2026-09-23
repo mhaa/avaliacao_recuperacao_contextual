@@ -36,7 +36,7 @@ from analysis.collect import (
     offered_load_fields,
     parse_requests_ndjson,
 )
-from analysis.probe_report import violated_slo
+from analysis.probe_report import slo_throughput_rps, violated_slo
 from load.ramp import RampStepResult, classify_recovery
 
 # Ordem canônica das fases. A rampa é uma trajetória, não um conjunto: o mesmo
@@ -49,13 +49,19 @@ def _isoformat(value) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def step_results(latencies_df: pl.DataFrame) -> list[RampStepResult]:
+def step_results(
+    latencies_df: pl.DataFrame, ignore_latency: bool = False
+) -> list[RampStepResult]:
     """Um `RampStepResult` por (degrau, fase), na ordem em que a rampa os
     percorreu.
 
     O agrupamento é por `step_rate` E `step_phase` porque a descida repete as
     taxas da subida: agrupar só por taxa fundiria os dois lados da histerese
     num número só, apagando exatamente o que se quer medir.
+
+    `ignore_latency`: mesmo parâmetro de `probe_report.violated_slo` — só a
+    campanha de estresse (`infra/scripts/run_stress_ramp.py`) passa True,
+    nunca a bateria principal. Ver `violated_slo()` para o motivo.
     """
     if latencies_df.is_empty():
         return []
@@ -63,7 +69,8 @@ def step_results(latencies_df: pl.DataFrame) -> list[RampStepResult]:
     results: list[RampStepResult] = []
     groups = latencies_df.group_by(["step_rate", "step_phase"], maintain_order=True)
     for (rate, phase), group in groups:
-        summary = build_summary(group.drop(["step_rate", "step_phase"]))
+        step_df = group.drop(["step_rate", "step_phase"])
+        summary = build_summary(step_df)
         offered = offered_load_fields(summary, float(rate))
         results.append(
             RampStepResult(
@@ -77,8 +84,11 @@ def step_results(latencies_df: pl.DataFrame) -> list[RampStepResult]:
                 error_rate=summary["error_rate"],
                 request_count=summary["request_count"],
                 offered_ratio=offered["offered_ratio"],
+                slo_throughput_rps=slo_throughput_rps(step_df),
                 offered_load_ok=offered["offered_load_ok"],
-                violated_slo=violated_slo(summary, offered["offered_ratio"]),
+                violated_slo=violated_slo(
+                    summary, offered["offered_ratio"], ignore_latency=ignore_latency
+                ),
                 started_at=_isoformat(group["timestamp"].min()),
                 ended_at=_isoformat(group["timestamp"].max()),
             )
@@ -156,12 +166,16 @@ def knee_summary(results: list[RampStepResult]) -> dict:
 
 
 def build_ramp_report(
-    requests_path: Path, cell_id: str, tier: str, generator_cpu_percent: float | None = None
+    requests_path: Path,
+    cell_id: str,
+    tier: str,
+    generator_cpu_percent: float | None = None,
+    ignore_latency: bool = False,
 ) -> dict:
     latencies_df = parse_requests_ndjson(
         requests_path, scenarios=RAMP_SCENARIOS, extra_fields=RAMP_EXTRA_FIELDS
     )
-    results = step_results(latencies_df)
+    results = step_results(latencies_df, ignore_latency=ignore_latency)
     verdict = classify_recovery(results)
 
     return {
@@ -184,6 +198,7 @@ def build_ramp_report(
                 "error_rate": r.error_rate,
                 "request_count": r.request_count,
                 "offered_ratio": r.offered_ratio,
+                "slo_throughput_rps": r.slo_throughput_rps,
                 "offered_load_ok": r.offered_load_ok,
                 "violated_slo": r.violated_slo,
                 "started_at": r.started_at,
@@ -211,7 +226,7 @@ def build_ramp_report(
     }
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("requests_ndjson", type=Path)
     parser.add_argument("--cell", required=True)
@@ -225,10 +240,22 @@ def main() -> None:
         "de analysis/report.py: esta rampa mede além da saturação de propósito, "
         "e o número nunca pode alimentar n(D) = ⌈D/S⌉.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--ignore-latency-slo",
+        action="store_true",
+        help="ignora p99>200ms no veredito por degrau — só taxa de erro >1%% conta (além do "
+        "portão de vazão ofertada, nunca ignorado). Espelha --ignore-latency-slo de "
+        "analysis/probe_report.py; usado só pela campanha de estresse "
+        "(infra/scripts/run_stress_ramp.py). Nunca usado fora dela.",
+    )
+    args = parser.parse_args(argv)
 
     report = build_ramp_report(
-        args.requests_ndjson, args.cell, args.tier, args.generator_cpu_percent
+        args.requests_ndjson,
+        args.cell,
+        args.tier,
+        args.generator_cpu_percent,
+        ignore_latency=args.ignore_latency_slo,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2))

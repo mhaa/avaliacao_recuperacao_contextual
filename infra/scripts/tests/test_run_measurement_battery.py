@@ -508,6 +508,26 @@ def test_build_remote_probe_aggregate_command_includes_requested_decision_statis
     assert "--decision-statistic median-per-repetition" in cmd
 
 
+def test_build_remote_probe_aggregate_command_omits_ignore_latency_slo_by_default():
+    # A bateria principal (triagem/confirmação) nunca deve receber esta
+    # flag — só infra/scripts/run_stress_ramp.py:make_stress_probe_fn a
+    # passa explicitamente. Regressão: default precisa continuar False.
+    cmd = build_remote_probe_aggregate_command(
+        "_saturation/e1-postgres/confirm-low-0-1000", 5, 1000, "3m",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+    )
+    assert "--ignore-latency-slo" not in cmd
+
+
+def test_build_remote_probe_aggregate_command_includes_ignore_latency_slo_when_requested():
+    cmd = build_remote_probe_aggregate_command(
+        "_estresse/e4-valkey/20260101T000000Z/probe/knee-0-1000", 1, 1000, "60s",
+        "gcr.io/x/tools:1", "/home/tcc/results", "/home/tcc/load-fixtures",
+        ignore_latency_slo=True,
+    )
+    assert "--ignore-latency-slo" in cmd
+
+
 def test_parse_probe_result_reads_violated_slo_true():
     stdout = (
         "algum log irrelevante\nPROBE_RESULT violated_slo=True p99=250.0 error_rate=0.0 "
@@ -585,6 +605,32 @@ def test_parse_probe_result_defaults_per_rep_fields_to_none_when_absent():
     verdict = _parse_probe_result(stdout)
     assert verdict.per_rep_p99_ms is None
     assert verdict.per_rep_violated_slo is None
+
+
+def test_parse_probe_result_reads_slo_throughput_rps_and_tolerates_its_absence():
+    # Token novo (analysis/probe_report.py:slo_throughput_rps, só no modo
+    # pooled) — linhas de execuções antigas não têm o token.
+    with_slo = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 request_count=1000 "
+        "slo_throughput_rps=42.5 generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(with_slo).slo_throughput_rps == 42.5
+
+    without_slo = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 "
+        "request_count=1000 generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(without_slo).slo_throughput_rps is None
+
+
+def test_parse_probe_result_reads_slo_throughput_rps_as_none_when_literal_none():
+    # Modo --decision-statistic median-per-repetition imprime o token
+    # literalmente "None" (ver analysis/probe_report.py main()) — não vazio.
+    stdout = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 request_count=1000 "
+        "slo_throughput_rps=None generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(stdout).slo_throughput_rps is None
 
 
 def test_write_saturation_json_round_trips(tmp_path, monkeypatch):

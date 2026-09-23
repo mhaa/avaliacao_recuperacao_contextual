@@ -414,6 +414,24 @@ e3-valkey, e4-valkey), com seletividade fixa no patamar médio:
   — a campanha inteira paga sem produzir resultado. Sondar custa ~13% do tempo
   da rampa e elimina esse risco.
 
+  **A sondagem desta campanha ignora a SLO de latência** (`--ignore-latency-slo`
+  em `analysis/probe_report.py:violated_slo()`, `ignore_latency_slo=True` em
+  `infra/scripts/run_stress_ramp.py:make_stress_probe_fn`) — só taxa de erro
+  >1% (e o portão de vazão ofertada, nunca ignorado) decidem violação aqui,
+  ao contrário da bateria principal, que usa a SLO real (p99>200ms OU erro
+  >1%). Motivo: esta campanha quer o teto real do **banco**, não a
+  experiência de cliente — e p99>200ms é um limiar de UX, não de capacidade.
+  Achado ao vivo na 1ª sondagem de e4-valkey: CPU/memória agregados
+  ficaram bem abaixo de qualquer teto quando o joelho "violou" por p99 —
+  esperado, já que Valkey é single-thread no caminho de dados (~12,5% de
+  CPU agregada quando saturado, ver "Valkey e o veredito automático" acima),
+  mas levanta a suspeita de que o p99 do cliente pode estourar por fila em
+  outra camada (serviço) antes do banco saturar de fato, subestimando o
+  joelho que esta campanha existe para medir — daí a troca de critério.
+  Decisão tomada antes de re-executar a sondagem com o critério novo;
+  nenhum resultado de e4-valkey publicado até aqui usa `--ignore-latency-slo`
+  (a sondagem que mediu 5.875 req/s foi descartada, refeita do zero).
+
   Três desfechos, tratados separadamente: gerador saturado (execução abortada —
   a rampa herdaria o teto do gerador), censurado (joelho acima de 50.000 req/s —
   usa-se o piso, marcado como piso) e o caso normal.
@@ -430,6 +448,64 @@ e3-valkey, e4-valkey), com seletividade fixa no patamar médio:
   espontaneamente em `results/e4-valkey/.../saturation_high.json` — p99 de
   3.987 ms ao voltar para 4.709 req/s, abaixo dos 4.695 req/s que eram limpos
   na subida.
+
+**Sondagem linear rápida, opcional, fora do fluxo padrão.** `--quick-probe`
+em `infra/scripts/run_stress_ramp.py` troca a sondagem do joelho + rampa
+completa por uma varredura de +1.000 req/s a cada 30s
+(`load/saturation.py:run_linear_probe_sweep`), subindo até a primeira
+violação ou `--quick-probe-top` (default: 2x o joelho projetado de
+`CELL_DEFAULTS`, ou 2x `--knee` se passado — `run_stress_ramp.py:_quick_probe_top`).
+Existe para dois usos: mapear a curva inteira em resolução grosseira em
+minutos em vez de horas, e checar rapidamente — via `db_cpu_cores.csv` — se o
+dimensionamento atual do serviço (`CELL_DEFAULTS[cell]["service"]`) deixa o
+BANCO aparecer como gargalo primeiro, antes de comprometer horas de VM numa
+rampa completa. Usa o mesmo critério `--ignore-latency-slo` da sondagem do
+joelho (só taxa de erro >1%, além do portão de vazão ofertada, nunca
+ignorado). Não substitui nem a sondagem do joelho (que existe para
+*enquadrar* um valor com busca binária) nem a rampa completa (que existe
+para medir histerese via subida/descida) — é um terceiro instrumento, mais
+barato e menos preciso, para checagem exploratória.
+
+`--ignore-latency-slo` também passou a se aplicar ao veredito por degrau da
+rampa COMPLETA (`analysis/ramp_report.py:step_results`), não só à sondagem do
+joelho — mesma consistência metodológica em toda a campanha, mesmo escopo
+(nunca a bateria principal, que nunca chama `ramp_report.py`).
+
+Tanto a sondagem rápida quanto a rampa completa agora imprimem um veredito
+explícito de gargalo (`analysis/resources.py:classify_bottleneck`, aplicado
+sobre `resources.csv`) logo após a execução — "database_cpu"/"service_cpu"/
+"loadgen_network" — em vez de só os tetos de memória usados no cálculo. Junto
+dele, a CPU de pico de UM núcleo do banco (`db_cpu_cores.csv`) e um aviso
+explícito quando o agregado aponta para outro componente mas o pico por
+núcleo sugere saturação de thread única (Valkey) — o mesmo caso descrito em
+"Valkey e o veredito automático" acima, agora superado automaticamente em vez
+de exigir inspeção manual dos dois CSVs. A rampa completa também passou a
+imprimir uma tabela por degrau (`infra/scripts/run_stress_ramp.py:format_ramp_step_table`),
+com CPU/memória das 3 VMs correlacionadas por timestamp a cada degrau (as
+mesmas colunas — em % da VM, nunca MB bruto — da tabela da sondagem rápida,
+`format_quick_probe_table`), cobrindo subida, platô e descida por inteiro;
+antes disso, o `RAMP_REPORT` de `analysis/ramp_report.py` era gerado
+corretamente na VM do gerador mas seu stdout nunca chegava ao console de
+quem roda a campanha, só ao JSON baixado depois. Ambas as tabelas renderizadas
+também são salvas como artefato próprio (`quick_probe_table.txt`/
+`ramp_<tier>_table.txt`, junto de `resources.csv`/`db_cpu_cores.csv`), não só
+impressas — sobrevivem ao terminal fechar.
+
+Ambas as tabelas ganharam três colunas logo após `rate`, para completar a
+leitura de vazão sem obrigar quem lê a cruzar campos manualmente: `vazão`
+(vazão realmente sustentada — `offered_ratio × rate` na sondagem rápida,
+`throughput_rps` direto na rampa completa, já existente em `RampStepResult`),
+`oferta%` (o mesmo `offered_ratio` em percentual — abaixo de 95% é o próprio
+portão de vazão ofertada, `analysis/collect.py:MIN_OFFERED_RATIO`, que pode
+ter violado o patamar mesmo com `err%=0,00`) e `vazãoSLO` (goodput: requisições
+com `status<400` **e** `latência<=200ms` por segundo —
+`analysis/probe_report.py:slo_throughput_rps` — distinta de `vazão`, que conta
+toda requisição aceita, SLO ou não; um patamar pode ter vazão alta e vazãoSLO
+baixa quando a fila cresce mas o k6 ainda não esgotou `maxVUs`). `vazãoSLO` só
+é calculada no modo `--decision-statistic pooled` (o único que a campanha de
+estresse usa) e nunca é lida pela bateria principal — `_ProbeVerdict`/
+`ProbeResult`/`RampStepResult` ganharam o campo, mas triagem/confirmação não o
+consomem.
 
 **Duas limitações de instrumentação que o desenho precisa contornar**, ambas já
 conhecidas do protocolo principal:

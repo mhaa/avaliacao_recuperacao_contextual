@@ -8,9 +8,11 @@ ou invalidam medição se regredirem."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from analysis.resources import ResourceSample
 from infra.scripts.run_measurement_battery import build_remote_probe_rep_command
 from infra.scripts.run_stress_ramp import (
     CELL_DEFAULTS,
@@ -20,12 +22,18 @@ from infra.scripts.run_stress_ramp import (
     PROBE_WARMUP,
     PROC_STAT_REMOTE_PATH,
     TIER,
+    _memory_ceilings,
+    _nearest_sample_per_component,
+    _quick_probe_top,
     build_proc_stat_sampler_command,
     build_remote_ramp_command,
+    format_quick_probe_table,
+    format_ramp_step_table,
     knee_from_search,
     schedule_duration_s,
 )
 from load.ramp import build_step_schedule, check_disk_budget
+from load.saturation import LinearSweepResult, ProbeResult
 
 GB = 1_000_000_000
 
@@ -57,6 +65,14 @@ def test_ramp_command_never_asks_k6_for_raw_json():
     assert "--out json=" not in cmd
     assert "k6-raw" not in cmd
     assert "analysis.ramp_report" in cmd
+
+
+def test_ramp_command_ignores_the_client_latency_slo():
+    # Só a campanha de estresse chama analysis.ramp_report — a bateria
+    # principal nunca deve receber esta flag (ver a suíte de
+    # probe_report.py/run_measurement_battery.py para o lado que garante
+    # isso do outro caminho).
+    assert "--ignore-latency-slo" in _ramp_command()
 
 
 def test_ramp_command_enables_stress_mode_and_passes_the_schedule():
@@ -288,6 +304,159 @@ def test_probe_commands_stay_inside_the_stress_namespace(monkeypatch):
     assert not any("_saturation/" in c for c in sent)
 
 
+def test_stress_probe_fn_carries_slo_throughput_rps_through(monkeypatch):
+    import infra.scripts.run_stress_ramp as rsr
+
+    class _Completed:
+        stdout = (
+            "PROBE_RESULT violated_slo=False p99=3.0 error_rate=0.0 "
+            "request_count=60000 offered_ratio=1.0 slo_throughput_rps=980.5 "
+            "generator_cpu_percent=30.0"
+        )
+
+    monkeypatch.setattr(rsr, "gcloud_ssh_with_retry", lambda *a, **k: _Completed())
+
+    probe_fn = rsr.make_stress_probe_fn(
+        "e2-scylla",
+        "http://10.0.0.5:8000/v1/recommendations",
+        "medium",
+        "tcc-e2-scylla-loadgen-st",
+        "us-east4-a",
+        "proj",
+        "tools:latest",
+        "bucket",
+        "20260922T120000Z",
+        user_count=200_948,
+    )
+    result = probe_fn(1000)
+
+    assert result.slo_throughput_rps == 980.5
+
+
+def test_stress_probe_fn_default_call_site_still_uses_the_knee_probe_timing(monkeypatch):
+    # Regressão: make_stress_probe_fn ganhou warmup/measure/label parametrizáveis
+    # para o --quick-probe reusar a mesma função — a sondagem do joelho (única
+    # chamadora hoje) não pode mudar de comportamento por default.
+    import infra.scripts.run_stress_ramp as rsr
+
+    sent: list[str] = []
+
+    class _Completed:
+        stdout = (
+            "PROBE_RESULT violated_slo=False p99=3.0 error_rate=0.0 "
+            "request_count=60000 offered_ratio=1.0 generator_cpu_percent=30.0"
+        )
+
+    def _fake_ssh(instance, zone, project_id, command):
+        sent.append(command)
+        return _Completed()
+
+    monkeypatch.setattr(rsr, "gcloud_ssh_with_retry", _fake_ssh)
+
+    probe_fn = rsr.make_stress_probe_fn(
+        "e2-scylla",
+        "http://10.0.0.5:8000/v1/recommendations",
+        "medium",
+        "tcc-e2-scylla-loadgen-st",
+        "us-east4-a",
+        "proj",
+        "tools:latest",
+        "bucket",
+        "20260922T120000Z",
+        user_count=200_948,
+    )
+    probe_fn(4000)
+
+    assert any(rsr.PROBE_WARMUP in c for c in sent)
+    assert any(rsr.PROBE_MEASURE in c for c in sent)
+    assert any("knee-0-4000" in c for c in sent)
+
+
+def test_stress_probe_fn_honors_custom_warmup_measure_and_label(monkeypatch):
+    import infra.scripts.run_stress_ramp as rsr
+
+    sent: list[str] = []
+
+    class _Completed:
+        stdout = (
+            "PROBE_RESULT violated_slo=False p99=3.0 error_rate=0.0 "
+            "request_count=60000 offered_ratio=1.0 generator_cpu_percent=30.0"
+        )
+
+    def _fake_ssh(instance, zone, project_id, command):
+        sent.append(command)
+        return _Completed()
+
+    monkeypatch.setattr(rsr, "gcloud_ssh_with_retry", _fake_ssh)
+
+    probe_fn = rsr.make_stress_probe_fn(
+        "e4-valkey",
+        "http://10.0.0.5:8000/v1/recommendations",
+        "medium",
+        "tcc-e4-valkey-loadgen-st",
+        "us-east4-c",
+        "proj",
+        "tools:latest",
+        "bucket",
+        "20260922T120000Z",
+        user_count=200_948,
+        warmup=rsr.QUICK_PROBE_WARMUP,
+        measure=rsr.QUICK_PROBE_MEASURE,
+        label="quick",
+    )
+    probe_fn(1000)
+
+    # QUICK_PROBE_WARMUP="5s" (distinto de PROBE_WARMUP="30s") é o sinal
+    # inequívoco de que o warmup passado foi honrado, não o default.
+    assert any(rsr.QUICK_PROBE_WARMUP in c for c in sent)
+    assert any(rsr.QUICK_PROBE_MEASURE in c for c in sent)
+    assert any("quick-0-1000" in c for c in sent)
+    assert not any("knee-" in c for c in sent)
+
+
+def test_stress_probe_ignores_latency_slo(monkeypatch):
+    # A campanha de estresse quer o teto do BANCO, não a SLO de cliente —
+    # docs/DESIGN.md, "Experimento complementar": achado ao vivo que CPU/
+    # memória agregados nunca chegavam perto de um teto quando o joelho
+    # "violava" só por p99 (Valkey é single-thread no caminho de dados).
+    # Regressão: a bateria principal nunca deve receber esta flag (ver
+    # test_build_remote_probe_aggregate_command_omits_ignore_latency_slo_by_default
+    # em test_run_measurement_battery.py).
+    import infra.scripts.run_stress_ramp as rsr
+
+    sent: list[str] = []
+
+    class _Completed:
+        stdout = (
+            "PROBE_RESULT violated_slo=False p99=250.0 error_rate=0.0 "
+            "request_count=60000 offered_ratio=1.0 generator_cpu_percent=30.0"
+        )
+
+    def _fake_ssh(instance, zone, project_id, command):
+        sent.append(command)
+        return _Completed()
+
+    monkeypatch.setattr(rsr, "gcloud_ssh_with_retry", _fake_ssh)
+
+    probe_fn = rsr.make_stress_probe_fn(
+        "e4-valkey",
+        "http://10.0.0.5:8000/v1/recommendations",
+        "medium",
+        "tcc-e4-valkey-loadgen-st",
+        "us-east4-c",
+        "proj",
+        "tools:latest",
+        "bucket",
+        "20260922T120000Z",
+        user_count=200_948,
+    )
+    probe_fn(4000)
+
+    aggregate_cmds = [c for c in sent if "analysis/probe_report.py" in c]
+    assert aggregate_cmds, "a sondagem precisa chamar analysis/probe_report.py"
+    assert all("--ignore-latency-slo" in c for c in aggregate_cmds)
+
+
 def test_probe_uploads_and_deletes_its_raw_json(monkeypatch):
     # A 32k req/s cada k6-raw.json passa de 1 GB; acumulá-los comeria o
     # disco que a NDJSON da rampa precisa.
@@ -317,3 +486,354 @@ def test_stages_json_round_trips_into_the_command():
     cmd = _ramp_command(stages_json=json.dumps(stages, separators=(",", ":")))
 
     assert "rate" in cmd and "duration_s" in cmd
+
+
+# --- _memory_ceilings / _nearest_sample_per_component / tabelas -----------
+
+BASE = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _sample(component, cpu, mem_mb, at):
+    return ResourceSample(component=component, cpu_percent=cpu, memory_mb=mem_mb, timestamp=at)
+
+
+def test_memory_ceilings_defaults_database_and_overrides_service_and_loadgen():
+    ceilings = _memory_ceilings("n2-highcpu-32", "n2-highcpu-16")
+
+    assert ceilings["database"] == 32768.0  # DEFAULT_MEMORY_MB_BY_COMPONENT, nunca sobrescrito
+    assert ceilings["service"] == MACHINE_MEMORY_MB["n2-highcpu-32"]
+    assert ceilings["loadgen"] == MACHINE_MEMORY_MB["n2-highcpu-16"]
+
+
+def test_memory_ceilings_falls_back_for_an_unknown_machine_type():
+    ceilings = _memory_ceilings("n2-standard-999", "n2-standard-999")
+    assert ceilings["service"] == 32768.0
+    assert ceilings["loadgen"] == 32768.0
+
+
+def test_nearest_sample_per_component_picks_the_latest_sample_at_or_before():
+    samples = [
+        _sample("database", 10.0, 1000.0, BASE),
+        _sample("database", 20.0, 1100.0, BASE + timedelta(seconds=30)),
+        _sample("database", 99.0, 9999.0, BASE + timedelta(seconds=90)),  # depois de `at`
+    ]
+    nearest = _nearest_sample_per_component(samples, at=BASE + timedelta(seconds=30))
+
+    assert nearest["database"].cpu_percent == 20.0
+    assert nearest["service"] is None
+    assert nearest["loadgen"] is None
+
+
+def test_nearest_sample_per_component_is_none_before_the_first_sample():
+    samples = [_sample("database", 10.0, 1000.0, BASE + timedelta(seconds=60))]
+    nearest = _nearest_sample_per_component(samples, at=BASE)
+
+    assert nearest["database"] is None
+
+
+def test_nearest_sample_per_component_ignores_samples_without_a_timestamp():
+    # docker stats local não tem série temporal — timestamp=None não pode
+    # explodir a comparação nem ser escolhido como "mais recente".
+    samples = [ResourceSample(component="database", cpu_percent=10.0, memory_mb=1000.0)]
+    nearest = _nearest_sample_per_component(samples, at=BASE)
+
+    assert nearest["database"] is None
+
+
+def _probe(rate, *, p99, error_rate, violated, generator_cpu, offered_ratio=None, slo_throughput_rps=None):
+    return ProbeResult(
+        rate=rate,
+        violated_slo=violated,
+        generator_cpu_percent=generator_cpu,
+        p99_ms=p99,
+        error_rate=error_rate,
+        offered_ratio=offered_ratio,
+        slo_throughput_rps=slo_throughput_rps,
+    )
+
+
+def test_format_quick_probe_table_renders_one_row_per_probe_in_order():
+    sweep = LinearSweepResult(
+        probes=[
+            _probe(1000, p99=3.0, error_rate=0.0, violated=False, generator_cpu=5.0),
+            _probe(2000, p99=250.0, error_rate=0.03, violated=True, generator_cpu=8.0),
+        ],
+        loadgen_bottleneck=False,
+        censored=False,
+    )
+    timestamps = [BASE, BASE + timedelta(seconds=30)]
+    samples = [
+        _sample("service", 20.0, 3000.0, BASE),
+        _sample("database", 5.0, 600.0, BASE),
+        _sample("service", 40.0, 4000.0, BASE + timedelta(seconds=30)),
+        _sample("database", 10.0, 700.0, BASE + timedelta(seconds=30)),
+    ]
+    ceilings = {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+
+    table = format_quick_probe_table(sweep, timestamps, samples, ceilings)
+    lines = table.splitlines()
+
+    assert len(lines) == 4  # header + separator + 2 patamares
+    assert "1000" in lines[2] and "OK" in lines[2]
+    assert "2000" in lines[3] and "VIOLOU" in lines[3]
+    # CPU do gerador vem de ProbeResult, não da amostra correlacionada (que
+    # não tem "loadgen" nenhuma nestes dados) — 5.0%/8.0%, não "—".
+    assert "5.0%" in lines[2]
+    assert "8.0%" in lines[3]
+
+
+def test_format_quick_probe_table_degrades_to_a_dash_without_a_sample():
+    sweep = LinearSweepResult(
+        probes=[_probe(1000, p99=3.0, error_rate=0.0, violated=False, generator_cpu=5.0)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
+def test_format_quick_probe_table_computes_memory_as_a_percentage_of_the_ceiling():
+    sweep = LinearSweepResult(
+        probes=[_probe(1000, p99=3.0, error_rate=0.0, violated=False, generator_cpu=5.0)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+    samples = [_sample("database", 10.0, 3276.8, BASE)]
+    ceilings = {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+
+    table = format_quick_probe_table(sweep, [BASE], samples, ceilings)
+    # 3276.8 / 32768.0 * 100 = 10.0%
+    assert "10.0%" in table.splitlines()[2]
+
+
+def test_format_quick_probe_table_computes_vazao_as_offered_ratio_times_rate():
+    sweep = LinearSweepResult(
+        probes=[_probe(2000, p99=4.0, error_rate=0.0, violated=False, generator_cpu=8.0, offered_ratio=0.97)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    # vazão = offered_ratio * rate = 0.97 * 2000 = 1940
+    assert "1940" in line
+    assert "97.0%" in line
+
+
+def test_format_quick_probe_table_degrades_vazao_to_a_dash_without_offered_ratio():
+    sweep = LinearSweepResult(
+        probes=[_probe(1000, p99=3.0, error_rate=0.0, violated=False, generator_cpu=5.0, offered_ratio=None)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
+def test_format_quick_probe_table_passes_through_slo_throughput_rps():
+    sweep = LinearSweepResult(
+        probes=[_probe(2000, p99=4.0, error_rate=0.0, violated=False, generator_cpu=8.0, slo_throughput_rps=1940.0)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    assert "1940" in line
+
+
+def test_format_quick_probe_table_degrades_slo_throughput_to_a_dash_without_it():
+    sweep = LinearSweepResult(
+        probes=[_probe(1000, p99=3.0, error_rate=0.0, violated=False, generator_cpu=5.0, slo_throughput_rps=None)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
+def test_format_ramp_step_table_renders_one_row_per_step_and_reads_ended_at():
+    steps = [
+        {
+            "rate": 1000,
+            "phase": "coarse_up",
+            "latency_ms_p50": 2.0,
+            "latency_ms_p95": 3.0,
+            "latency_ms_p99": 4.0,
+            "error_rate": 0.0,
+            "offered_load_ok": True,
+            "violated_slo": False,
+            "ended_at": BASE.isoformat(),
+        },
+        {
+            "rate": 7000,
+            "phase": "fine_up",
+            "latency_ms_p50": 20.0,
+            "latency_ms_p95": 200.0,
+            "latency_ms_p99": 500.0,
+            "error_rate": 0.034,
+            "offered_load_ok": True,
+            "violated_slo": True,
+            "ended_at": (BASE + timedelta(seconds=60)).isoformat(),
+        },
+    ]
+    samples = [
+        _sample("database", 12.1, 750.0, BASE),
+        _sample("database", 12.1, 750.0, BASE + timedelta(seconds=60)),
+    ]
+    ceilings = {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+
+    table = format_ramp_step_table(steps, samples, ceilings)
+    lines = table.splitlines()
+
+    assert len(lines) == 4
+    assert "coarse_up" in lines[2] and "OK" in lines[2]
+    assert "fine_up" in lines[3] and "VIOLOU" in lines[3]
+
+
+def test_format_ramp_step_table_passes_through_throughput_and_offered_ratio():
+    steps = [
+        {
+            "rate": 7000,
+            "phase": "fine_up",
+            "latency_ms_p50": 20.0,
+            "latency_ms_p95": 200.0,
+            "latency_ms_p99": 500.0,
+            "error_rate": 0.034,
+            "offered_load_ok": True,
+            "violated_slo": True,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": 6874.3,
+            "offered_ratio": 0.982,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    # throughput_rps já vem pronto de RampStepResult — sem derivação, ao
+    # contrário da tabela da sondagem rápida.
+    assert "6874" in line
+    assert "98.2%" in line
+
+
+def test_format_ramp_step_table_degrades_vazao_to_a_dash_without_throughput():
+    steps = [
+        {
+            "rate": 1000,
+            "phase": "coarse_up",
+            "latency_ms_p50": 2.0,
+            "latency_ms_p95": 3.0,
+            "latency_ms_p99": 4.0,
+            "error_rate": 0.0,
+            "offered_load_ok": True,
+            "violated_slo": False,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": None,
+            "offered_ratio": None,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
+def test_format_ramp_step_table_passes_through_slo_throughput_rps():
+    steps = [
+        {
+            "rate": 7000,
+            "phase": "fine_up",
+            "latency_ms_p50": 20.0,
+            "latency_ms_p95": 200.0,
+            "latency_ms_p99": 500.0,
+            "error_rate": 0.034,
+            "offered_load_ok": True,
+            "violated_slo": True,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": 6874.3,
+            "offered_ratio": 0.982,
+            "slo_throughput_rps": 3120.7,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    assert "3121" in line
+
+
+def test_format_ramp_step_table_degrades_slo_throughput_to_a_dash_without_it():
+    steps = [
+        {
+            "rate": 1000,
+            "phase": "coarse_up",
+            "latency_ms_p50": 2.0,
+            "latency_ms_p95": 3.0,
+            "latency_ms_p99": 4.0,
+            "error_rate": 0.0,
+            "offered_load_ok": True,
+            "violated_slo": False,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": None,
+            "offered_ratio": None,
+            "slo_throughput_rps": None,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
+def test_format_ramp_step_table_degrades_to_a_dash_when_ended_at_is_missing():
+    steps = [
+        {
+            "rate": 1000,
+            "phase": "coarse_up",
+            "latency_ms_p50": 2.0,
+            "latency_ms_p95": 3.0,
+            "latency_ms_p99": 4.0,
+            "error_rate": 0.0,
+            "offered_load_ok": True,
+            "violated_slo": False,
+            "ended_at": None,
+        }
+    ]
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    assert "—" in table.splitlines()[2]
+
+
+def test_quick_probe_top_defaults_to_twice_the_resolved_knee():
+    assert _quick_probe_top(None, knee=4_900) == 9_800
+
+
+def test_quick_probe_top_honors_an_explicit_value_over_the_knee_default():
+    assert _quick_probe_top(6_000, knee=4_900) == 6_000
+
+
+def test_quick_probe_top_is_capped_at_the_ceiling():
+    assert _quick_probe_top(None, knee=40_000, ceiling=50_000) == 50_000
+    assert _quick_probe_top(999_999, knee=1_000, ceiling=50_000) == 50_000

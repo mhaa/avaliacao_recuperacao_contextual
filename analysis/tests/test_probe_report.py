@@ -6,6 +6,9 @@ que substituiu a consulta ao Cloud Monitoring para este portão."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
+
+import polars as pl
 
 from analysis.probe_report import (
     _cpu_percent_from_stat,
@@ -13,6 +16,7 @@ from analysis.probe_report import (
     main,
     median_decision_summary,
     min_offered_ratio,
+    slo_throughput_rps,
     violated_slo,
 )
 
@@ -45,6 +49,25 @@ def test_violated_slo_ignores_offered_ratio_when_unknown_or_sufficient():
     summary = {"latency_ms_p99": 50.0, "error_rate": 0.0}
     assert violated_slo(summary, offered_ratio=None) is False
     assert violated_slo(summary, offered_ratio=0.99) is False
+
+
+def test_ignore_latency_drops_only_the_p99_clause():
+    # infra/scripts/run_stress_ramp.py:make_stress_probe_fn passa isto — a
+    # campanha de estresse quer o teto do banco, não a SLO de latência de
+    # cliente (docs/DESIGN.md, "Experimento complementar").
+    over_latency = {"latency_ms_p99": 250.0, "error_rate": 0.0}
+    assert violated_slo(over_latency, ignore_latency=True) is False
+
+    over_error = {"latency_ms_p99": 50.0, "error_rate": 0.02}
+    assert violated_slo(over_error, ignore_latency=True) is True
+
+
+def test_ignore_latency_still_treats_missing_data_and_short_offered_load_as_violations():
+    # Nem o portão de "nenhuma requisição parseada" nem o de vazão ofertada
+    # são a SLO de latência — continuam valendo mesmo com ignore_latency=True.
+    assert violated_slo({"latency_ms_p99": None, "error_rate": None}, ignore_latency=True) is True
+    summary = {"latency_ms_p99": 50.0, "error_rate": 0.0}
+    assert violated_slo(summary, offered_ratio=0.43, ignore_latency=True) is True
 
 
 def test_parse_proc_stat_cpu_fields_reads_the_first_8_jiffie_counters():
@@ -80,12 +103,14 @@ def test_cpu_percent_from_stat_is_50_when_half_the_delta_is_idle():
     assert _cpu_percent_from_stat(before, after) == 50.0
 
 
-def _probe_request(latency_ms: float, status: int = 200) -> str:
+def _probe_request(
+    latency_ms: float, status: int = 200, timestamp: str = "2026-01-01T00:00:00.000Z"
+) -> str:
     return json.dumps(
         {
             "request_id": "0-0",
             "scenario": "probe",
-            "timestamp": "2026-01-01T00:00:00.000Z",
+            "timestamp": timestamp,
             "latency_ms": latency_ms,
             "status": status,
             "returned_count": 20,
@@ -161,6 +186,28 @@ def test_main_without_expected_requests_reports_offered_ratio_none(tmp_path, mon
     out = capsys.readouterr().out
     assert "violated_slo=False" in out
     assert "offered_ratio=None" in out
+
+
+def test_main_ignore_latency_slo_flag_flips_a_latency_only_violation(tmp_path, monkeypatch, capsys):
+    # infra/scripts/run_stress_ramp.py:make_stress_probe_fn passa
+    # --ignore-latency-slo — só a campanha de estresse, nunca a bateria
+    # principal. p99 acima do limiar, sem erro nenhum: sem a flag é
+    # violated_slo=True; com ela, False.
+    ndjson_path = tmp_path / "requests.ndjson"
+    ndjson_path.write_text(_probe_request(250.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main([str(ndjson_path)])
+    assert exit_code == 0
+    assert "violated_slo=True" in capsys.readouterr().out
+
+    exit_code = main(["--ignore-latency-slo", str(ndjson_path)])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "violated_slo=False" in out
+    assert "ignore_latency_slo=True" in out
 
 
 def test_median_decision_summary_takes_the_median_p99_and_error_rate_across_reps():
@@ -283,3 +330,76 @@ def test_main_omits_per_rep_diagnostic_tokens_in_pooled_mode(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "per_rep_p99_ms" not in out
     assert "per_rep_violated" not in out
+
+
+def _requests_df(rows: list[tuple[float, int, datetime]]) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "timestamp": [r[2] for r in rows],
+            "latency_ms": [r[0] for r in rows],
+            "status": [r[1] for r in rows],
+        }
+    )
+
+
+def test_slo_throughput_rps_counts_only_fast_successful_requests():
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    df = _requests_df(
+        [
+            (50.0, 200, base),
+            (250.0, 200, base + timedelta(seconds=1)),  # lenta demais — não é goodput
+            (50.0, 500, base + timedelta(seconds=2)),  # rápida mas erro — não é goodput
+            (50.0, 200, base + timedelta(seconds=10)),
+        ]
+    )
+    # span=10s, 2 das 4 atendem status<400 e latência<=200ms → 2/10 = 0,2 req/s
+    assert slo_throughput_rps(df) == 0.2
+
+
+def test_slo_throughput_rps_is_none_on_empty_dataframe():
+    assert slo_throughput_rps(_requests_df([])) is None
+
+
+def test_slo_throughput_rps_is_none_when_span_is_zero():
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    df = _requests_df([(50.0, 200, base), (50.0, 200, base)])
+    assert slo_throughput_rps(df) is None
+
+
+def test_main_prints_slo_throughput_rps_in_pooled_mode(tmp_path, monkeypatch, capsys):
+    ndjson_path = tmp_path / "requests.ndjson"
+    lines = [
+        _probe_request(50.0, timestamp="2026-01-01T00:00:00.000Z"),
+        _probe_request(250.0, timestamp="2026-01-01T00:00:01.000Z"),  # lenta — não é goodput
+        _probe_request(50.0, timestamp="2026-01-01T00:00:10.000Z"),
+    ]
+    ndjson_path.write_text("\n".join(lines) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main([str(ndjson_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    # span=10s, 2 das 3 requisições atendem o SLO → 2/10 = 0,2 req/s
+    assert "slo_throughput_rps=0.2" in out
+
+
+def test_main_reports_slo_throughput_rps_as_none_in_median_mode(tmp_path, monkeypatch, capsys):
+    # Modo mediana ainda não computa o goodput (ver docstring de main()) —
+    # o token precisa continuar presente e explicitamente None, nunca
+    # omitido (mesma disciplina de p99=None/error_rate=None).
+    rep0 = tmp_path / "rep0.ndjson"
+    rep0.write_text(_probe_request(10.0) + "\n")
+    rep1 = tmp_path / "rep1.ndjson"
+    rep1.write_text(_probe_request(300.0) + "\n")
+
+    monkeypatch.setenv("GENERATOR_CPU_STAT_BEFORE", "cpu  0 0 0 0 0 0 0 0 0 0")
+    monkeypatch.setenv("GENERATOR_CPU_STAT_AFTER", "cpu  0 0 0 0 0 0 0 0 0 0")
+
+    exit_code = main(["--decision-statistic", "median-per-repetition", str(rep0), str(rep1)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "slo_throughput_rps=None" in out

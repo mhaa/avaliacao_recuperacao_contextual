@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import shlex
 import sys
 import threading
@@ -41,10 +42,11 @@ from pathlib import Path
 from typing import Callable
 
 from analysis.ramp_resources import max_core_percent, samples_from_log, write_db_cpu_cores_csv
-from analysis.resources import write_resources_csv
+from analysis.resources import ResourceSample, classify_bottleneck, write_resources_csv
 from infra.scripts.cloud_smoke_test import (
     _confirm_billable,
     _run,
+    fetch_terraform_access_token,
     gcloud_ssh,
     gcloud_ssh_with_retry,
     restart_container,
@@ -70,7 +72,7 @@ from infra.scripts.run_measurement_battery import (
 )
 from load.ramp import build_step_schedule, check_disk_budget
 from load.run_battery import build_ramp_k6_cmd
-from load.saturation import ProbeResult, run_saturation_search
+from load.saturation import CEILING_RPS, ProbeResult, run_linear_probe_sweep, run_saturation_search
 
 # Diretório do root module próprio. `terraform()` já aceita `tf_dir`, e
 # `cell=` já define TF_DATA_DIR — as duas camadas de isolamento saem de
@@ -107,6 +109,19 @@ PROBE_MEASURE = "60s"
 # bracket, e `doubling_sequence` já existe e é testado em load/saturation.py.
 PROBE_STEP_MODE = "doubling"
 PROBE_START_RATE = 1_000
+
+# --quick-probe (varredura linear, load/saturation.py:run_linear_probe_sweep).
+# 5s de aquecimento, não 0s: um aquecimento zerado dilui a leitura de CPU do
+# gerador que _generator_saturated usa (mesmo motivo do PROBE_WARMUP de 30s
+# acima) — a sondagem rápida é exploratória, não autoritativa, mas o portão
+# dos 60% que ela protege é exatamente o que garante que "o banco satura
+# primeiro" não seja, na verdade, "o gerador satura primeiro" — enfraquecê-lo
+# por alguns segundos de economia contradiria o propósito da própria sondagem.
+QUICK_PROBE_WARMUP = "5s"
+# 30s por patamar: mesmo grão da fase grossa da rampa completa
+# (load/ramp.py:DEFAULT_COARSE_DURATION_S) — a sondagem rápida existe para
+# mapear a curva com essa resolução, não com a precisão de PROBE_MEASURE.
+QUICK_PROBE_MEASURE = "30s"
 
 # Amostragem de /proc/stat por núcleo na VM do BANCO. 5s dá ~12 pontos por
 # degrau fino de 60s, contra ~1 ponto borrado do Cloud Monitoring — ver
@@ -177,26 +192,51 @@ def make_stress_probe_fn(
     run_timestamp: str,
     *,
     user_count: int,
+    warmup: str = PROBE_WARMUP,
+    measure: str = PROBE_MEASURE,
+    label: str = "knee",
 ) -> Callable[[int], ProbeResult]:
     """`probe_fn(rate) -> ProbeResult` para `run_saturation_search`.
 
     Espelha `run_measurement_battery.make_probe_fn` mas é escrito aqui, em
-    vez de importado, por UM motivo: aquele monta o caminho remoto sob
-    `_saturation/`, o namespace da campanha principal. Manter esta campanha
-    inteiramente sob `_estresse/` vale as ~20 linhas — e os pedaços que
-    importam (`build_remote_probe_rep_command`,
-    `build_remote_probe_aggregate_command`, `_parse_probe_result`) são
-    reusados verbatim, não recopiados.
+    vez de importado, por DOIS motivos: aquele monta o caminho remoto sob
+    `_saturation/`, o namespace da campanha principal — manter esta campanha
+    inteiramente sob `_estresse/` vale as ~20 linhas duplicadas; e o veredito
+    de violação usa `ignore_latency_slo=True` (ver abaixo), que a bateria
+    principal nunca deve receber. Os pedaços que importam
+    (`build_remote_probe_rep_command`, `build_remote_probe_aggregate_command`,
+    `_parse_probe_result`) são reusados verbatim, não recopiados.
 
     Uma repetição por patamar (`rep=0`, capturando /proc/stat nas duas
     pontas): a sondagem existe para ACHAR o joelho, não para reportá-lo com
     dispersão — a precisão vem depois, da fase fina da rampa construída em
     torno dele.
+
+    `ignore_latency_slo=True` no `build_remote_probe_aggregate_command`
+    abaixo: esta campanha quer o teto real do BANCO, não a SLO de latência
+    de cliente (p99>200ms) que orienta a bateria principal. Achado ao vivo
+    na 1ª sondagem de e4-valkey: CPU/memória agregados ficaram bem abaixo de
+    qualquer teto quando o joelho "violou" por p99, porque o Valkey é
+    single-thread no caminho de dados (~12,5% de CPU agregada numa VM de 8
+    vCPU quando saturado — ver docs/DESIGN.md, "Valkey e o veredito
+    automático") e o p99 do cliente pode estourar por fila em outra camada
+    (serviço) antes do banco saturar de fato — o que subestimaria o joelho
+    que esta campanha quer medir. Com `ignore_latency_slo=True`, só taxa de
+    erro >1% (e o portão de vazão ofertada, nunca ignorado) decidem
+    `violated_slo` aqui.
+
+    `warmup`/`measure`/`label`: default para a sondagem do joelho
+    (`PROBE_WARMUP`/`PROBE_MEASURE`/`"knee"`) — `--quick-probe`
+    (`run_quick_probe`) passa `QUICK_PROBE_WARMUP`/`QUICK_PROBE_MEASURE`/
+    `"quick"` em vez disso, mesma função, sem duplicar a closure inteira.
+    `label` só distingue o prefixo do caminho remoto
+    (`probe/{label}-N-rate`), para as duas sondagens nunca colidirem se
+    rodadas na mesma campanha/timestamp.
     """
     counter = itertools.count()
 
     def probe_fn(rate: int) -> ProbeResult:
-        probe_id = f"knee-{next(counter)}-{rate}"
+        probe_id = f"{label}-{next(counter)}-{rate}"
         remote_subdir = f"{ESTRESSE_PREFIX}/{cell_id}/{run_timestamp}/probe/{probe_id}"
 
         rep_cmd = build_remote_probe_rep_command(
@@ -204,8 +244,8 @@ def make_stress_probe_fn(
             target_url,
             tier,
             rate,
-            PROBE_WARMUP,
-            PROBE_MEASURE,
+            warmup,
+            measure,
             tools_image,
             RESULTS_MOUNT,
             FIXTURES_MOUNT,
@@ -225,10 +265,17 @@ def make_stress_probe_fn(
             remote_subdir,
             1,
             rate,
-            PROBE_MEASURE,
+            measure,
             tools_image,
             RESULTS_MOUNT,
             FIXTURES_MOUNT,
+            # A campanha de estresse quer o teto real do BANCO, não a SLO de
+            # latência do cliente (p99>200ms) — essa pode disparar por fila
+            # em outra camada (serviço) antes do banco saturar de fato,
+            # subestimando o joelho. Só a taxa de erro (>1%) e o portão de
+            # vazão ofertada (nunca ignorado) decidem violated_slo aqui. Ver
+            # analysis/probe_report.py:violated_slo().
+            ignore_latency_slo=True,
         )
         result = gcloud_ssh_with_retry(loadgen_instance, zone, project_id, aggregate_cmd)
         verdict = _parse_probe_result(result.stdout)
@@ -240,6 +287,7 @@ def make_stress_probe_fn(
             p99_ms=verdict.p99_ms,
             error_rate=verdict.error_rate,
             offered_ratio=verdict.offered_ratio,
+            slo_throughput_rps=verdict.slo_throughput_rps,
         )
 
     return probe_fn
@@ -338,6 +386,10 @@ def build_remote_ramp_command(
         tier,
         "--out",
         report_out,
+        # Só a campanha de estresse chama analysis.ramp_report — sempre
+        # ignora a SLO de latência, mesmo critério da sondagem do joelho
+        # (make_stress_probe_fn). Ver analysis/probe_report.py:violated_slo().
+        "--ignore-latency-slo",
     ]
     steps = [
         shlex.join(["mkdir", "-p", run_dir]),
@@ -365,8 +417,191 @@ def build_remote_ramp_command(
     return shlex.join(docker_argv)
 
 
+def _memory_ceilings(service_machine: str, loadgen_machine: str) -> dict[str, float]:
+    """Teto de memória (MB) por componente, para `classify_bottleneck` e para
+    as colunas de memória em % das tabelas de sondagem/rampa. Espelha
+    DEFAULT_MEMORY_MB_BY_COMPONENT da bateria principal, que assume
+    n2-standard-8 em tudo — aqui serviço e gerador mudam por célula
+    (CELL_DEFAULTS), então o teto tem de acompanhar ou tanto o veredito de
+    gargalo quanto a % de memória saem errados. Chamada de main() e de
+    run_quick_probe() — nunca recomputada separadamente, para as duas nunca
+    poderem divergir sobre o que é 100% de memória para uma VM."""
+    return {
+        **DEFAULT_MEMORY_MB_BY_COMPONENT,
+        "service": MACHINE_MEMORY_MB.get(service_machine, 32768.0),
+        "loadgen": MACHINE_MEMORY_MB.get(loadgen_machine, 32768.0),
+    }
+
+
+def _nearest_sample_per_component(
+    resource_samples: list[ResourceSample], at: datetime
+) -> dict[str, ResourceSample | None]:
+    """Para cada componente (database/service/loadgen), a amostra de
+    resources.csv mais recente com timestamp <= `at`. `None` só nos
+    primeiros patamares/degraus, antes da 1ª amostra do coletor em
+    segundo plano (sample_resources_periodically) — nunca fabricado como
+    zero, mesma disciplina de ProbeResult.generator_cpu_percent."""
+    latest: dict[str, ResourceSample | None] = {"database": None, "service": None, "loadgen": None}
+    for sample in resource_samples:
+        if sample.timestamp is not None and sample.timestamp <= at:
+            current = latest.get(sample.component)
+            if current is None or sample.timestamp > current.timestamp:
+                latest[sample.component] = sample
+    return latest
+
+
+def _memory_percent(sample: ResourceSample | None, memory_ceilings: dict[str, float]) -> str:
+    if sample is None:
+        return "—"
+    ceiling = memory_ceilings.get(sample.component)
+    if not ceiling:
+        return "—"
+    return f"{sample.memory_mb / ceiling * 100:.1f}%"
+
+
+def _cpu_percent(sample: ResourceSample | None) -> str:
+    if sample is None or sample.cpu_percent is None:
+        return "—"
+    return f"{sample.cpu_percent:.1f}%"
+
+
+def format_quick_probe_table(
+    sweep,
+    level_timestamps: list[datetime],
+    resource_samples: list[ResourceSample],
+    memory_ceilings: dict[str, float],
+) -> str:
+    """Uma linha por patamar sondado por --quick-probe (load/saturation.py:
+    LinearSweepResult), com CPU/memória das 3 VMs correlacionadas por
+    timestamp via _nearest_sample_per_component. CPU do gerador vem de
+    ProbeResult.generator_cpu_percent (leitura de /proc/stat específica
+    daquele patamar, a mesma que o portão dos 60% usa) — nunca da amostra
+    correlacionada, para a tabela nunca mostrar dois números diferentes
+    para a mesma medição. Memória sempre em % do teto da VM (mesma base de
+    classify_bottleneck), nunca MB bruto — ver docs/DESIGN.md.
+
+    `vazão` = `offered_ratio * rate` — exato, não aproximado:
+    ProbeResult.offered_ratio já é `request_count / (rate * duração)`
+    (analysis/probe_report.py), então multiplicar por `rate` devolve
+    exatamente `request_count / duração`, a vazão real sustentada naquele
+    patamar. `oferta%` é o mesmo `offered_ratio` em percentual — abaixo de
+    95% é o próprio portão de vazão ofertada (analysis/collect.py:
+    MIN_OFFERED_RATIO) que pode ter violado o patamar mesmo com err%=0,00
+    (ver docs/DESIGN.md, "Vazão ofertada verificada, não presumida") —
+    mostrar os dois números lado a lado é o que permite distinguir essa
+    causa de uma violação por taxa de erro.
+
+    `vazãoSLO` = ProbeResult.slo_throughput_rps (analysis/probe_report.py:
+    slo_throughput_rps) — requisições bem-sucedidas E dentro dos 200ms do
+    SLO, por segundo. Distinto de `vazão` (toda requisição aceita, SLO ou
+    não): a diferença entre as duas colunas é o que separa "o banco aceitou
+    a carga" de "o banco respondeu dentro do prometido" — um patamar pode
+    ter vazão alta e vazãoSLO baixa quando a fila cresce mas ainda não
+    estoura maxVUs."""
+    header = (
+        f"  {'rate':>6}  {'vazão':>7}  {'oferta%':>8}  {'vazãoSLO':>8}  {'p99(ms)':>8}  {'err%':>6}  {'veredito':<8}  "
+        f"{'cpuGer%':>8}  {'cpuSrv%':>8}  {'cpuBD%':>7}  "
+        f"{'memGer%':>8}  {'memSrv%':>8}  {'memBD%':>7}"
+    )
+    sep = (
+        f"  {'-' * 6}  {'-' * 7}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 6}  {'-' * 8}  "
+        f"{'-' * 8}  {'-' * 8}  {'-' * 7}  "
+        f"{'-' * 8}  {'-' * 8}  {'-' * 7}"
+    )
+    lines = [header, sep]
+    for probe, at in zip(sweep.probes, level_timestamps):
+        nearest = _nearest_sample_per_component(resource_samples, at)
+        if probe.offered_ratio is not None:
+            vazao = f"{probe.offered_ratio * probe.rate:.0f}"
+            oferta = f"{probe.offered_ratio * 100:.1f}%"
+        else:
+            vazao = oferta = "—"
+        vazao_slo = f"{probe.slo_throughput_rps:.0f}" if probe.slo_throughput_rps is not None else "—"
+        p99 = f"{probe.p99_ms:.1f}" if probe.p99_ms is not None else "—"
+        err = f"{probe.error_rate * 100:.2f}%" if probe.error_rate is not None else "—"
+        veredito = "VIOLOU" if probe.violated_slo else "OK"
+        cpu_ger = f"{probe.generator_cpu_percent:.1f}%" if probe.generator_cpu_percent is not None else "—"
+        lines.append(
+            f"  {probe.rate:>6}  {vazao:>7}  {oferta:>8}  {vazao_slo:>8}  {p99:>8}  {err:>6}  {veredito:<8}  "
+            f"{cpu_ger:>8}  {_cpu_percent(nearest['service']):>8}  {_cpu_percent(nearest['database']):>7}  "
+            f"{_memory_percent(nearest['loadgen'], memory_ceilings):>8}  "
+            f"{_memory_percent(nearest['service'], memory_ceilings):>8}  "
+            f"{_memory_percent(nearest['database'], memory_ceilings):>7}"
+        )
+    return "\n".join(lines)
+
+
+def format_ramp_step_table(
+    steps: list[dict],
+    resource_samples: list[ResourceSample],
+    memory_ceilings: dict[str, float],
+) -> str:
+    """Uma linha por degrau da rampa completa (report["steps"] de
+    analysis/ramp_report.py:build_ramp_report, já achatado em dict pelo
+    round-trip JSON), com CPU/memória das 3 VMs correlacionadas pelo
+    `ended_at` de cada degrau — mesma correlação de format_quick_probe_table,
+    mesma _nearest_sample_per_component, sem segundo algoritmo. Ao contrário
+    da sondagem rápida, não há leitura de /proc/stat POR DEGRAU do gerador
+    (o portão dos 60% da rampa só amostra uma vez, cercando a campanha
+    inteira) — cpuGer% aqui também vem da amostra correlacionada, não de uma
+    fonte mais precisa como na tabela da sondagem (ver docs/DESIGN.md).
+
+    `vazãoSLO` = RampStepResult.slo_throughput_rps (analysis/ramp_report.py:
+    step_results, via analysis/probe_report.py:slo_throughput_rps) —
+    passagem direta, sem derivação: o dataframe bruto do degrau já existe
+    em step_results antes de build_summary colapsá-lo em percentis. Mesmo
+    significado da coluna homônima da tabela da sondagem rápida: goodput
+    (status<400 E latência<=200ms), distinto de `vazão` (toda requisição
+    aceita)."""
+    header = (
+        f"  {'rate':>6}  {'phase':<10}  {'vazão':>7}  {'oferta%':>8}  {'vazãoSLO':>8}  {'p50':>7}  {'p95':>7}  {'p99':>7}  {'err%':>5}  "
+        f"{'oferta':<7}  {'veredito':<8}  {'cpuGer%':>8}  {'cpuSrv%':>8}  {'cpuBD%':>7}  "
+        f"{'memGer%':>8}  {'memSrv%':>8}  {'memBD%':>7}"
+    )
+    sep = (
+        f"  {'-' * 6}  {'-' * 10}  {'-' * 7}  {'-' * 8}  {'-' * 8}  {'-' * 7}  {'-' * 7}  {'-' * 7}  {'-' * 5}  "
+        f"{'-' * 7}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 7}  "
+        f"{'-' * 8}  {'-' * 8}  {'-' * 7}"
+    )
+    lines = [header, sep]
+    for step in steps:
+        ended_at = step.get("ended_at")
+        at = datetime.fromisoformat(ended_at) if ended_at else None
+        nearest = (
+            _nearest_sample_per_component(resource_samples, at)
+            if at is not None
+            else {"database": None, "service": None, "loadgen": None}
+        )
+        vazao = f"{step['throughput_rps']:.0f}" if step.get("throughput_rps") is not None else "—"
+        oferta_pct = f"{step['offered_ratio'] * 100:.1f}%" if step.get("offered_ratio") is not None else "—"
+        vazao_slo = f"{step['slo_throughput_rps']:.0f}" if step.get("slo_throughput_rps") is not None else "—"
+        p50 = f"{step['latency_ms_p50']:.1f}" if step.get("latency_ms_p50") is not None else "—"
+        p95 = f"{step['latency_ms_p95']:.1f}" if step.get("latency_ms_p95") is not None else "—"
+        p99 = f"{step['latency_ms_p99']:.1f}" if step.get("latency_ms_p99") is not None else "—"
+        err = f"{step['error_rate'] * 100:.2f}%" if step.get("error_rate") is not None else "—"
+        oferta = "OK" if step.get("offered_load_ok") else "DEFICIT"
+        veredito = "VIOLOU" if step.get("violated_slo") else "OK"
+        lines.append(
+            f"  {step['rate']:>6}  {step['phase']:<10}  {vazao:>7}  {oferta_pct:>8}  {vazao_slo:>8}  {p50:>7}  {p95:>7}  {p99:>7}  {err:>5}  "
+            f"{oferta:<7}  {veredito:<8}  "
+            f"{_cpu_percent(nearest['loadgen']):>8}  {_cpu_percent(nearest['service']):>8}  "
+            f"{_cpu_percent(nearest['database']):>7}  "
+            f"{_memory_percent(nearest['loadgen'], memory_ceilings):>8}  "
+            f"{_memory_percent(nearest['service'], memory_ceilings):>8}  "
+            f"{_memory_percent(nearest['database'], memory_ceilings):>7}"
+        )
+    return "\n".join(lines)
+
+
 def schedule_duration_s(schedule) -> int:
     return sum(step.duration_s for step in schedule)
+
+
+def _quick_probe_top(explicit_top: int | None, knee: int, ceiling: int = CEILING_RPS) -> int:
+    """Teto da sondagem linear rápida (--quick-probe-top): valor explícito, ou
+    2x o joelho já resolvido (--knee ou CELL_DEFAULTS) — capado no teto global
+    de load/saturation.py:CEILING_RPS, mesma disciplina da busca binária."""
+    return min(ceiling, explicit_top or knee * 2)
 
 
 def _parse_args(argv=None):
@@ -403,6 +638,33 @@ def _parse_args(argv=None):
         "mais de 40%% para baixo desperdiça a campanha inteira. Passar --knee também "
         "pula a sondagem (valor explícito manda).",
     )
+    parser.add_argument(
+        "--quick-probe",
+        action="store_true",
+        help="roda uma varredura linear rápida em vez da sondagem do joelho + rampa "
+        "completa: patamares de +--quick-probe-step req/s a cada 30s, subindo até a "
+        "primeira violação (taxa de erro >1%%, mesmo critério --ignore-latency-slo da "
+        "sondagem do joelho) ou até --quick-probe-top. Sem busca binária, sem "
+        "cronograma multi-fase — minutos, não horas. Existe para checar rápido onde a "
+        "célula falha e se o dimensionamento atual do serviço (CELL_DEFAULTS) deixa o "
+        "BANCO aparecer como gargalo primeiro (ver db_cpu_cores.csv). Ignora "
+        "--skip-probe/--knee/--fine-step/--max-vus: não há rampa para eles configurarem.",
+    )
+    parser.add_argument(
+        "--quick-probe-step",
+        type=int,
+        default=1_000,
+        help="incremento em req/s entre patamares da varredura linear (--quick-probe). "
+        "Default 1.000, o mesmo grão da fase grossa da rampa completa.",
+    )
+    parser.add_argument(
+        "--quick-probe-top",
+        type=int,
+        default=None,
+        help="teto em req/s da varredura linear (--quick-probe); para antes disso se "
+        "violar primeiro. Default: 2x o joelho projetado da célula (CELL_DEFAULTS ou "
+        "--knee), capado no teto de load/saturation.py:CEILING_RPS.",
+    )
     parser.add_argument("--service-machine-type", default=None)
     parser.add_argument("--loadgen-machine-type", default=None)
     parser.add_argument("--loadgen-boot-disk-gb", type=int, default=100)
@@ -410,6 +672,221 @@ def _parse_args(argv=None):
     parser.add_argument("--keep-infra", action="store_true")
     parser.add_argument("--yes", action="store_true", help="pula a confirmação de gasto")
     return parser.parse_args(argv)
+
+
+def run_quick_probe(
+    args,
+    target_url: str,
+    loadgen_instance: str,
+    database_instance: str,
+    outputs: dict,
+    timestamp: str,
+    remote_subdir: str,
+    top: int,
+    step: int,
+    duration_estimate_s: int,
+) -> int:
+    """Corpo de --quick-probe: mesma amostragem de recursos (thread de
+    resources.csv + /proc/stat por núcleo do banco) que a rampa completa já
+    usa, mas roda load/saturation.py:run_linear_probe_sweep em vez de montar
+    e disparar um cronograma k6. Extraído de main() (em vez de ramificado
+    inline) porque main() já provisiona infraestrutura faturável e decide o
+    destroy final — mesma razão de "Isolamento estrutural" no topo deste
+    módulo: mais fácil revisar um corpo nomeado do que três ramos
+    espalhados dentro de uma função de ~340 linhas."""
+    defaults = CELL_DEFAULTS[args.cell]
+    service_machine = args.service_machine_type or defaults["service"]
+    loadgen_machine = args.loadgen_machine_type or defaults["loadgen"]
+    memory_ceilings = _memory_ceilings(service_machine, loadgen_machine)
+
+    instance_by_component = {
+        "database": outputs["database_instance_id"],
+        "service": outputs["service_instance_id"],
+        "loadgen": outputs["loadgen_instance_id"],
+    }
+    resource_samples: list = []
+    stop_event = threading.Event()
+    sampler = threading.Thread(
+        target=sample_resources_periodically,
+        args=(
+            make_resource_collect_fn(args.project_id, instance_by_component),
+            stop_event,
+            resource_samples,
+        ),
+        daemon=True,
+    )
+    sampler.start()
+
+    # Amostrador por núcleo na VM do BANCO, em segundo plano — mesmo motivo
+    # da rampa completa: sem ele, a saturação de um Valkey de thread única é
+    # literalmente invisível no agregado.
+    gcloud_ssh(
+        database_instance,
+        args.zone,
+        args.project_id,
+        build_proc_stat_sampler_command(duration_estimate_s),
+    )
+
+    print(
+        f"\n--- sondagem linear rápida ({args.cell}, +{step} req/s a cada 30s, "
+        f"até {top} req/s) ---"
+    )
+    level_timestamps: list[datetime] = []
+    base_probe_fn = make_stress_probe_fn(
+        args.cell,
+        target_url,
+        TIER,
+        loadgen_instance,
+        args.zone,
+        args.project_id,
+        args.tools_image,
+        args.results_bucket,
+        timestamp,
+        user_count=args.user_count,
+        warmup=QUICK_PROBE_WARMUP,
+        measure=QUICK_PROBE_MEASURE,
+        label="quick",
+    )
+
+    def timestamped_probe_fn(rate: int) -> ProbeResult:
+        result = base_probe_fn(rate)
+        # Registrado DEPOIS do probe_fn retornar: é o instante mais próximo
+        # do fim real daquele patamar, para correlacionar com resources.csv.
+        level_timestamps.append(datetime.now(timezone.utc))
+        return result
+
+    sweep = run_linear_probe_sweep(
+        timestamped_probe_fn, start_rate=PROBE_START_RATE, step=step, ceiling=top
+    )
+
+    stop_event.set()
+    sampler.join(timeout=30)
+
+    host_tmp = Path("results") / ".tmp-estresse" / args.cell / timestamp
+    host_tmp.mkdir(parents=True, exist_ok=True)
+
+    resources_csv = host_tmp / "resources.csv"
+    write_resources_csv(resource_samples, resources_csv)
+
+    proc_stat_log = gcloud_ssh(
+        database_instance, args.zone, args.project_id, f"cat {PROC_STAT_REMOTE_PATH}"
+    )
+    core_samples = samples_from_log(proc_stat_log.stdout or "")
+    db_cpu_csv = host_tmp / "db_cpu_cores.csv"
+    write_db_cpu_cores_csv(core_samples, db_cpu_csv)
+    peak = max_core_percent(core_samples)
+
+    try:
+        bottleneck = classify_bottleneck(resource_samples, memory_ceiling_mb=memory_ceilings)
+    except ValueError:
+        bottleneck = None
+
+    print()
+    print(format_quick_probe_table(sweep, level_timestamps, resource_samples, memory_ceilings))
+    print()
+    if sweep.loadgen_bottleneck:
+        print(
+            "AVISO: o gerador saturou (CPU >= 60%) antes de qualquer violação da célula "
+            "— sondagem inválida como dado do banco. Escale --loadgen-machine-type."
+        )
+    elif sweep.censored:
+        print(f"AVISO: nenhuma violação até o teto de {top} req/s — o joelho está ACIMA disso.")
+    else:
+        last = sweep.probes[-1]
+        print(
+            f"Primeira violação: {last.rate} req/s "
+            f"(error_rate={last.error_rate}, p99={last.p99_ms}ms)"
+        )
+
+    if bottleneck is not None:
+        print(f"Gargalo dominante (agregado, resources.csv): {bottleneck}")
+    else:
+        print("AVISO: sem amostra de CPU suficiente para classificar o gargalo agregado.")
+    if peak is not None:
+        print(f"CPU máxima de um núcleo do banco (db_cpu_cores.csv): {peak:.1f}%")
+        if bottleneck is not None and not bottleneck.startswith("database"):
+            print(
+                f"AVISO: núcleo do banco chegou a {peak:.1f}% mesmo com o gargalo agregado "
+                f"apontando para '{bottleneck}' — típico de saturação de thread única "
+                "(ex.: Valkey), que o agregado de resources.csv não enxerga. Não descarte "
+                "o banco como candidato ao limite real só pelo veredito agregado."
+            )
+
+    probe_dicts = []
+    for probe, at in zip(sweep.probes, level_timestamps):
+        nearest = _nearest_sample_per_component(resource_samples, at)
+        probe_dicts.append(
+            {
+                **asdict(probe),
+                "service_cpu_percent": nearest["service"].cpu_percent if nearest["service"] else None,
+                "database_cpu_percent": nearest["database"].cpu_percent
+                if nearest["database"]
+                else None,
+                "generator_memory_mb": nearest["loadgen"].memory_mb if nearest["loadgen"] else None,
+                "service_memory_mb": nearest["service"].memory_mb if nearest["service"] else None,
+                "database_memory_mb": nearest["database"].memory_mb
+                if nearest["database"]
+                else None,
+            }
+        )
+
+    quick_probe_json = host_tmp / "quick_probe.json"
+    quick_probe_json.write_text(
+        json.dumps(
+            {
+                "loadgen_bottleneck": sweep.loadgen_bottleneck,
+                "censored": sweep.censored,
+                "generator_cpu_unmeasured": sweep.generator_cpu_unmeasured,
+                "bottleneck": bottleneck,
+                "db_peak_core_percent": peak,
+                "probes": probe_dicts,
+            },
+            indent=2,
+        )
+    )
+    quick_probe_table_txt = host_tmp / "quick_probe_table.txt"
+    quick_probe_table_txt.write_text(
+        format_quick_probe_table(sweep, level_timestamps, resource_samples, memory_ceilings),
+        # Sem isto, Path.write_text() usa a codificação padrão do locale do
+        # host — cp1252 num host Windows — e corrompe permanentemente "ã"/"õ"
+        # dos cabeçalhos ("vazão", "oferta%") no arquivo salvo: não é só a
+        # exibição no console (isso é só o codepage do terminal), os BYTES
+        # gravados ficam errados, e sobem assim para o GCS. Confirmado ao
+        # vivo: quick_probe_table.txt salvo tinha 0xE3 (cp1252 de "ã") em vez
+        # de 0xC3 0xA3 (UTF-8).
+        encoding="utf-8",
+    )
+
+    for path in (resources_csv, db_cpu_csv, quick_probe_json, quick_probe_table_txt):
+        _run(
+            [
+                "gcloud",
+                "storage",
+                "cp",
+                str(path),
+                f"gs://{args.results_bucket}/{remote_subdir}/{path.name}",
+            ]
+        )
+        path.unlink()
+
+    gcloud_ssh(
+        loadgen_instance,
+        args.zone,
+        args.project_id,
+        build_remote_upload_command(
+            f"/app/results/{remote_subdir}",
+            RESULTS_MOUNT,
+            args.results_bucket,
+            remote_subdir,
+            args.tools_image,
+        ),
+    )
+
+    print(
+        f"\nResultados em gs://{args.results_bucket}/{remote_subdir}/\n"
+        f"Baixe com: python -m analysis.fetch_results {args.results_bucket}"
+    )
+    return 0
 
 
 def main(argv=None) -> int:
@@ -432,17 +909,45 @@ def main(argv=None) -> int:
         check_disk_budget(sched, disk_budget_bytes)
         return sched, top, vus, schedule_duration_s(sched)
 
-    # Provisório, a partir da projeção: serve de sanidade antes de provisionar
-    # qualquer VM e de estimativa no aviso de gasto. Se a sondagem rodar, este
-    # cronograma é descartado pelo medido.
-    schedule, top_rate, max_vus, duration_s = plan_ramp(knee)
-    probing = not args.skip_probe and args.knee is None
-    print(
-        f"Rampa (projetada, joelho={knee}): {len(schedule)} degraus, topo em {top_rate} req/s, "
-        f"~{duration_s / 60:.0f} min de carga, maxVUs={max_vus}."
-    )
-    if probing:
-        print("Sondagem do joelho ATIVA: o cronograma acima será refeito sobre o valor medido.")
+    schedule = top_rate = max_vus = duration_s = None
+    quick_probe_top = quick_probe_duration_estimate_s = None
+    probing = False
+
+    if args.quick_probe:
+        if args.quick_probe_step <= 0:
+            print(f"ERRO: --quick-probe-step precisa ser positivo, recebeu {args.quick_probe_step}.")
+            return 1
+        quick_probe_top = _quick_probe_top(args.quick_probe_top, knee)
+        if quick_probe_top < PROBE_START_RATE:
+            print(
+                f"ERRO: --quick-probe-top ({quick_probe_top}) é menor que o patamar "
+                f"inicial da sondagem ({PROBE_START_RATE})."
+            )
+            return 1
+        levels = (quick_probe_top - PROBE_START_RATE) // args.quick_probe_step + 1
+        # 45s de folga por patamar (30s de medição + latência das duas sessões
+        # SSH por nível, cada uma com retry), não 30s — sem essa folga o
+        # amostrador de /proc/stat do banco (contagem FIXA de iterações) pode
+        # expirar antes do último patamar, deixando os degraus finais sem
+        # leitura de CPU por núcleo.
+        quick_probe_duration_estimate_s = levels * 45 + PROC_STAT_MARGIN_S
+        print(
+            f"Sondagem linear rápida: +{args.quick_probe_step} req/s a cada 30s, até "
+            f"{quick_probe_top} req/s (~{levels} patamares, "
+            f"~{quick_probe_duration_estimate_s / 60:.0f} min)."
+        )
+    else:
+        # Provisório, a partir da projeção: serve de sanidade antes de
+        # provisionar qualquer VM e de estimativa no aviso de gasto. Se a
+        # sondagem rodar, este cronograma é descartado pelo medido.
+        schedule, top_rate, max_vus, duration_s = plan_ramp(knee)
+        probing = not args.skip_probe and args.knee is None
+        print(
+            f"Rampa (projetada, joelho={knee}): {len(schedule)} degraus, topo em "
+            f"{top_rate} req/s, ~{duration_s / 60:.0f} min de carga, maxVUs={max_vus}."
+        )
+        if probing:
+            print("Sondagem do joelho ATIVA: o cronograma acima será refeito sobre o valor medido.")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     remote_subdir = f"{ESTRESSE_PREFIX}/{args.cell}/{timestamp}"
@@ -458,15 +963,28 @@ def main(argv=None) -> int:
     applied = False
     tf_vars: list[str] = []
     try:
-        _confirm_billable(
-            f"terraform apply da campanha de ESTRESSE de '{args.cell}' em "
-            f"{args.project_id}/{args.region} vai criar 3 VMs reais — serviço em "
-            f"{service_machine} e gerador em {loadgen_machine}, bem maiores que o padrão — "
-            f"e rodar ~{duration_s / 60:.0f} min de carga contínua, cobrando o tempo todo. "
-            f"Estado e nomes de recurso são separados da campanha principal.",
-            auto_approve=args.yes,
-        )
+        if args.quick_probe:
+            billable_msg = (
+                f"terraform apply da campanha de ESTRESSE de '{args.cell}' (sondagem "
+                f"linear rápida) em {args.project_id}/{args.region} vai criar 3 VMs reais "
+                f"— serviço em {service_machine} e gerador em {loadgen_machine}, bem "
+                f"maiores que o padrão — e rodar ~{quick_probe_duration_estimate_s / 60:.0f} "
+                f"min de sondagem, cobrando o tempo todo. Estado e nomes de recurso são "
+                f"separados da campanha principal."
+            )
+        else:
+            billable_msg = (
+                f"terraform apply da campanha de ESTRESSE de '{args.cell}' em "
+                f"{args.project_id}/{args.region} vai criar 3 VMs reais — serviço em "
+                f"{service_machine} e gerador em {loadgen_machine}, bem maiores que o padrão — "
+                f"e rodar ~{duration_s / 60:.0f} min de carga contínua, cobrando o tempo todo. "
+                f"Estado e nomes de recurso são separados da campanha principal."
+            )
+        _confirm_billable(billable_msg, auto_approve=args.yes)
         applied = True
+
+        print("Mintando token de acesso via impersonação da SA do Terraform (nunca fica em disco)...")
+        os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = fetch_terraform_access_token(args.project_id)
 
         terraform(
             [
@@ -550,6 +1068,20 @@ def main(argv=None) -> int:
         wait_for_service_ready(loadgen_instance, args.zone, args.project_id, service_ip)
         target_url = f"http://{service_ip}:8000/v1/recommendations"
 
+        if args.quick_probe:
+            return run_quick_probe(
+                args,
+                target_url,
+                loadgen_instance,
+                database_instance,
+                outputs,
+                timestamp,
+                remote_subdir,
+                quick_probe_top,
+                args.quick_probe_step,
+                quick_probe_duration_estimate_s,
+            )
+
         # --- sondagem rápida do joelho ----------------------------------
         # Uma repetição por patamar, patamares em dobra, busca binária para
         # refinar. O objetivo é ENQUADRAR o joelho, não reportá-lo com
@@ -614,11 +1146,7 @@ def main(argv=None) -> int:
             "service": outputs["service_instance_id"],
             "loadgen": outputs["loadgen_instance_id"],
         }
-        memory_ceilings = {
-            **DEFAULT_MEMORY_MB_BY_COMPONENT,
-            "service": MACHINE_MEMORY_MB.get(service_machine, 32768.0),
-            "loadgen": MACHINE_MEMORY_MB.get(loadgen_machine, 32768.0),
-        }
+        memory_ceilings = _memory_ceilings(service_machine, loadgen_machine)
 
         resource_samples: list = []
         stop_event = threading.Event()
@@ -644,7 +1172,8 @@ def main(argv=None) -> int:
 
         print(f"\n--- rampa de estresse ({args.cell}, seletividade {TIER}) ---")
         stages_json = json.dumps([asdict(s) for s in schedule], separators=(",", ":"))
-        gcloud_ssh_with_retry(
+        report_path = f"/app/results/{remote_subdir}/ramp_{TIER}.json"
+        ramp_result = gcloud_ssh_with_retry(
             loadgen_instance,
             args.zone,
             args.project_id,
@@ -661,6 +1190,11 @@ def main(argv=None) -> int:
                 user_count=args.user_count,
             ),
         )
+        # O RAMP_REPORT/eventual AVISO que analysis/ramp_report.py já imprime
+        # na VM do gerador ficava só no stdout capturado, nunca chegava ao
+        # console de quem roda esta campanha — só o JSON baixado depois.
+        print("\n--- resumo da rampa (analysis/ramp_report.py, na VM do gerador) ---")
+        print((ramp_result.stdout or "").strip())
 
         stop_event.set()
         sampler.join(timeout=30)
@@ -677,6 +1211,13 @@ def main(argv=None) -> int:
         write_resources_csv(resource_samples, resources_csv)
         print(f"Tetos de memória usados na classificação de gargalo: {memory_ceilings}")
 
+        try:
+            bottleneck = classify_bottleneck(resource_samples, memory_ceiling_mb=memory_ceilings)
+            print(f"Gargalo dominante (agregado, resources.csv): {bottleneck}")
+        except ValueError:
+            bottleneck = None
+            print("AVISO: sem amostra de CPU suficiente para classificar o gargalo agregado.")
+
         # gcloud_ssh já roda com capture_output=True/text=True e devolve o
         # CompletedProcess — stdout sai pronto, sem kwarg extra.
         proc_stat_log = gcloud_ssh(
@@ -692,8 +1233,31 @@ def main(argv=None) -> int:
         peak = max_core_percent(core_samples)
         if peak is not None:
             print(f"CPU máxima de UM núcleo do banco durante a rampa: {peak:.1f}%")
+            if bottleneck is not None and not bottleneck.startswith("database"):
+                print(
+                    f"AVISO: núcleo do banco chegou a {peak:.1f}% mesmo com o gargalo "
+                    f"agregado apontando para '{bottleneck}' — típico de saturação de "
+                    "thread única (ex.: Valkey), que o agregado de resources.csv não "
+                    "enxerga. Não descarte o banco como candidato ao limite real só "
+                    "pelo veredito agregado."
+                )
 
-        for path in (resources_csv, db_cpu_csv):
+        # Busca o próprio ramp_<tier>.json de volta (mesmo padrão de "cat" já
+        # usado acima para /proc/stat) — é o único jeito de correlacionar cada
+        # degrau com resources.csv, que só existe aqui no HOST, depois que a
+        # sessão SSH da rampa (que gerou o JSON, do lado do gerador) retornou.
+        report_result = gcloud_ssh(loadgen_instance, args.zone, args.project_id, f"cat {report_path}")
+        report = json.loads(report_result.stdout)
+        step_table = format_ramp_step_table(report["steps"], resource_samples, memory_ceilings)
+        print("\n--- degraus da rampa (com uso de recursos por VM) ---")
+        print(step_table)
+        step_table_path = host_tmp / f"ramp_{TIER}_table.txt"
+        # encoding="utf-8" pelo mesmo motivo de quick_probe_table_txt acima —
+        # sem isto, o padrão do locale do host (cp1252 no Windows) corrompe
+        # "ã"/"õ" nos cabeçalhos permanentemente no arquivo salvo.
+        step_table_path.write_text(step_table, encoding="utf-8")
+
+        for path in (resources_csv, db_cpu_csv, step_table_path):
             _run(
                 [
                     "gcloud",
@@ -733,6 +1297,13 @@ def main(argv=None) -> int:
                 f"terraform destroy da campanha de estresse de '{args.cell}'.",
                 auto_approve=args.yes,
             )
+            # Reminta o token: dura só ~1h, e a sondagem + rampa somadas passam
+            # disso com folga (ver mesmo problema e correção em
+            # run_measurement_battery.py) — sem isto o destroy final falha com
+            # "Error 401: invalid authentication credentials", deixando as 3 VMs
+            # (maiores que o padrão nesta campanha) presas cobrando.
+            print("Remintando token de acesso antes do destroy (o anterior pode ter expirado)...")
+            os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = fetch_terraform_access_token(args.project_id)
             terraform(
                 ["destroy", "-auto-approve", *tf_vars],
                 tf_dir=TF_DIR,
