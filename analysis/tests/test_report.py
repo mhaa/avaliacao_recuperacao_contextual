@@ -17,6 +17,7 @@ from analysis.report import (
     build_report,
     discover_rep_dirs,
     ensure_collected,
+    legacy_final_level_p99_samples,
     load_cell_latencies,
     load_cell_returned_counts,
     load_cell_saturation,
@@ -167,6 +168,29 @@ def test_load_cell_latencies_groups_by_cell(tmp_path):
     assert len(groups["e1-postgres"]) == 100
 
 
+def test_loaders_return_compact_arrays_not_python_object_containers(tmp_path):
+    """Regressão de um SIGKILL real: com as 4 células da confirmação
+    (~95M requisições somadas), `groups` como list[float] custava ~3GB e
+    returned_counts como list[tuple[int, int]] custava 7,0GB — medidos, e
+    ambos residentes no processo pai durante o pico de ~11GB do
+    dunn_posthoc. Num host de 12GB o relatório morria sem imprimir nada.
+    Em ndarray a mesma carga cai para ~0,8GB cada. O tipo aqui não é
+    detalhe de implementação: é o que decide se a fase de confirmação
+    fecha."""
+    results_root, _ = _build_fake_results(tmp_path)
+    rep_dirs = discover_rep_dirs(results_root, "triagem")
+    ensure_collected(rep_dirs)
+
+    latencies = load_cell_latencies(rep_dirs)["e1-postgres"]
+    counts = load_cell_returned_counts(rep_dirs)["e1-postgres|medium"]
+
+    assert latencies.dtype == np.float64
+    # (n, 2): coluna 0 = returned_count, coluna 1 = k — int32 cobre ambos
+    # com folga (<= N=500) e é 8x mais barato que a tupla Python.
+    assert counts.dtype == np.int32
+    assert counts.shape == (len(latencies), 2)
+
+
 def test_confirmacao_combos_do_not_collide_on_the_same_rep_numbers(tmp_path):
     """Regressão do bug real que derrubou e3-postgres em produção: a
     confirmação varre 9 combinações (rate, tier), cada uma com suas 5
@@ -215,7 +239,9 @@ def test_discover_rep_dirs_ignores_older_timestamps_for_the_same_cell(tmp_path):
 
     ensure_collected(rep_dirs)
     groups = load_cell_latencies(rep_dirs)
-    assert groups["e3-postgres"] == [10.0] * 5
+    # load_cell_latencies devolve np.ndarray (não list[float]) — `==` num
+    # array compara elemento a elemento, então a asserção passa por tolist().
+    assert groups["e3-postgres"].tolist() == [10.0] * 5
 
 
 def test_discover_rep_dirs_keeps_older_tiers_rep_dirs_when_a_newer_timestamp_only_has_one_tier(
@@ -469,6 +495,96 @@ def test_build_report_computes_cost_per_million_requests_and_the_frontier(tmp_pa
     assert isinstance(report["pareto_frontier"], list)
     assert isinstance(report["cheapest_cell_ids"], list)
     assert "censorship_warning" in report
+
+
+def test_legacy_final_level_p99_samples_flattens_every_tier_in_by_tier():
+    # Formato real de e3-postgres/confirmacao (rodou antes da otimização de
+    # confirmação arquivada): final_level_probes tem uma entrada por
+    # sondagem de confirmação, cada uma com 5 p99 por repetição.
+    saturation_entry = {
+        "by_tier": {
+            "medium": {
+                "final_level_probes": [
+                    {"per_rep_p99_ms": [291.0, 145.0, 151.0, 242.0, 145.0]},
+                    {"per_rep_p99_ms": [105.0, 194.0, 121.0, 251.0, 299.0]},
+                ]
+            }
+        }
+    }
+
+    samples = legacy_final_level_p99_samples(saturation_entry)
+
+    assert len(samples) == 10
+    assert 291.0 in samples and 299.0 in samples
+
+
+def test_legacy_final_level_p99_samples_empty_when_no_final_level_probes():
+    # Célula com saturation_<tier>.json mas sem confirm_repetitions (ou
+    # já no formato arquivado, sem final_level_probes no JSON leve) — não
+    # finge ter amostra nenhuma.
+    assert legacy_final_level_p99_samples({"by_tier": {"medium": {}}}) == []
+    assert legacy_final_level_p99_samples({}) == []
+
+
+def test_build_report_folds_in_a_legacy_cell_without_raw_latencies(tmp_path):
+    # Regressão exata do e3-postgres/confirmacao real: a confirmação rodou
+    # antes da otimização de confirmação arquivada, então só sobrou
+    # saturation_medium.json com final_level_probes — sem rep_dirs, sem
+    # entrada em `groups`. O usuário confirmou que esse dado é válido e
+    # pediu para completar o relatório com ele em vez de remedir.
+    results_root, cells = _build_fake_results(tmp_path, phase="confirmacao")
+    rep_dirs = discover_rep_dirs(results_root, "confirmacao")
+    ensure_collected(rep_dirs)
+    groups = load_cell_latencies(rep_dirs)
+    storage_root = tmp_path / "storage"
+    _write_fake_storage_sizes(storage_root)
+
+    assert "e3-postgres" not in groups
+
+    saturation_by_cell = {
+        "e3-postgres": {
+            "approx_throughput": 3980.0,
+            "censored": False,
+            "lower_bound": None,
+            "by_tier": {
+                "medium": {
+                    "final_level_probes": [
+                        {"per_rep_p99_ms": [291.0, 145.0, 151.0, 242.0, 145.0]},
+                        {"per_rep_p99_ms": [105.0, 194.0, 121.0, 251.0, 299.0]},
+                        {"per_rep_p99_ms": [309.0, 90.0, 93.0, 275.0, 80.0]},
+                        {"per_rep_p99_ms": [104.0, 115.0, 59.0, 88.0, 146.0]},
+                        {"per_rep_p99_ms": [272.0, 175.0, 97.0, 104.0, 331.0]},
+                    ]
+                }
+            },
+        }
+    }
+    legacy_samples = legacy_final_level_p99_samples(saturation_by_cell["e3-postgres"])
+
+    report = build_report(
+        groups,
+        saturation_by_cell,
+        storage_root=storage_root,
+        legacy_p99_samples_by_cell={"e3-postgres": legacy_samples},
+    )
+
+    by_id = {c["cell_id"]: c for c in report["cells"]}
+    assert set(by_id) == set(cells) | {"e3-postgres"}
+    assert by_id["e3-postgres"]["latency_source"] == "legacy_per_repetition_summary"
+    assert by_id["e3-postgres"]["latency_source_sample_size"] == 25
+    assert by_id["e3-postgres"]["latency_p99_ms"] == pytest.approx(float(np.median(legacy_samples)))
+    assert by_id["e3-postgres"]["saturation_throughput_approx"] == 3980.0
+    for cell_id in cells:
+        assert by_id[cell_id]["latency_source"] == "raw_requests"
+
+    # A célula legacy nunca entra nos testes de hipótese entre células —
+    # eles comparam distribuições de requisição individual, e ela só tem
+    # ~25 amostras de p99 por repetição.
+    assert all("e3-postgres" not in pair for pair in report["vargha_delaney_a"])
+    assert all("e3-postgres" not in pair for pair in report["dunn_posthoc"])
+
+    # Mas ela conta pra custo/Pareto/CI como qualquer outra célula.
+    assert "e3-postgres" in report["bootstrap_ci_p99"]
 
 
 def test_valkey_storage_goes_to_the_capacity_term_and_the_others_to_the_disk_parcel(tmp_path):

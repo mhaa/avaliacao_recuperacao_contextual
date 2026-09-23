@@ -343,19 +343,31 @@ def load_cell_saturation(results_root: Path, phase: str) -> dict[str, dict]:
     return saturation_by_cell
 
 
-def load_cell_latencies(rep_dirs: list[Path]) -> dict[str, list[float]]:
+def load_cell_latencies(rep_dirs: list[Path]) -> dict[str, np.ndarray]:
     """Agrupa por cell_id, concatenando latency_ms de todas as repetições
     daquela célula — na triagem, de results/<cell_id>/<phase>/<timestamp>/
     rep<N>/; na confirmação, de .../<timestamp>/<rate>-<tier>/rep<N>/ (um
     nível a mais, load/run_battery.py:combo_out_dir). cell_id vem de
     manifest.json, não da profundidade do caminho — as duas layouts
-    convivem sem este código precisar saber qual é qual."""
-    by_cell: dict[str, list[float]] = {}
+    convivem sem este código precisar saber qual é qual.
+
+    Devolve um np.ndarray float64 por célula, não list[float]: a campanha
+    de confirmação soma ~95M requisições, e cada float numa lista Python
+    custa ~32 bytes (ponteiro na lista + objeto float) contra 8 no array —
+    ~3GB contra ~0,8GB só para segurar `groups`. Todo consumidor
+    (kruskal_wallis, dunn_posthoc, vargha_delaney_a, tost_equivalence,
+    percentiles_of, _compute_cell_report_entry) já faz np.asarray na
+    entrada, então o array entra direto e sem cópia; o que muda é só o pico
+    de memória do processo pai — que é o que decide se o relatório termina
+    ou leva SIGKILL (ver load_cell_returned_counts, mesma razão)."""
+    by_cell: dict[str, list[np.ndarray]] = {}
     for rep_dir in rep_dirs:
         cell_id = json.loads((rep_dir / "manifest.json").read_text())["cell_id"]
         df = pl.read_parquet(rep_dir / "latencies.parquet")
-        by_cell.setdefault(cell_id, []).extend(df["latency_ms"].to_list())
-    return by_cell
+        by_cell.setdefault(cell_id, []).append(
+            df["latency_ms"].to_numpy().astype(np.float64, copy=False)
+        )
+    return {cell_id: np.concatenate(chunks) for cell_id, chunks in by_cell.items()}
 
 
 def percentiles_of(latencies: list[float]) -> dict[str, float]:
@@ -368,7 +380,7 @@ def percentiles_of(latencies: list[float]) -> dict[str, float]:
     }
 
 
-def load_cell_returned_counts(rep_dirs: list[Path]) -> dict[str, list[tuple[int, int]]]:
+def load_cell_returned_counts(rep_dirs: list[Path]) -> dict[str, np.ndarray]:
     """Agrupa (returned_count, k) por "<cell_id>|<selectivity_tier>", um par
     por requisição — mesma disciplina de load_cell_latencies (cell_id do
     manifest.json, não da profundidade do caminho); k e selectivity_tier
@@ -379,30 +391,48 @@ def load_cell_returned_counts(rep_dirs: list[Path]) -> dict[str, list[tuple[int,
     a coluna; core/contract.py: "a contagem real de itens elegíveis quando
     menor que k" — a resposta pode legitimamente vir parcial quando poucos
     candidatos sobrevivem ao predicado). Pareado com k aqui para
-    returned_count_stats poder calcular a fração de respostas parciais."""
-    by_key: dict[str, list[tuple[int, int]]] = {}
+    returned_count_stats poder calcular a fração de respostas parciais.
+
+    Devolve um array (n, 2) de int32 por chave (coluna 0 = returned_count,
+    coluna 1 = k), não uma lista de tuplas Python: uma tupla de 2 inteiros
+    custa ~64 bytes contra 8 no array, e nos ~95M pares da confirmação isso
+    é 7,0GB contra ~0,8GB — medidos, e residentes no processo pai durante
+    todo o dunn_posthoc, que sozinho já pica em ~11GB. Era essa soma que
+    levava o relatório da confirmação a SIGKILL num host de 12GB. int32
+    cobre com folga returned_count e k (ambos <= N=500, docs/DESIGN.md)."""
+    by_key: dict[str, list[np.ndarray]] = {}
     for rep_dir in rep_dirs:
         manifest = json.loads((rep_dir / "manifest.json").read_text())
         key = f"{manifest['cell_id']}|{manifest['selectivity_tier']}"
         k = manifest["k"]
         df = pl.read_parquet(rep_dir / "latencies.parquet")
-        by_key.setdefault(key, []).extend((rc, k) for rc in df["returned_count"].to_list())
-    return by_key
+        counts = df["returned_count"].to_numpy()
+        pairs = np.empty((counts.size, 2), dtype=np.int32)
+        pairs[:, 0] = counts
+        pairs[:, 1] = k
+        by_key.setdefault(key, []).append(pairs)
+    return {key: np.concatenate(chunks) for key, chunks in by_key.items()}
 
 
-def returned_count_stats(pairs: list[tuple[int, int]]) -> dict:
+def returned_count_stats(pairs: np.ndarray | list[tuple[int, int]]) -> dict:
     """Média de itens por resposta e fração de respostas parciais
     (returned_count < k) para um grupo de (returned_count, k) — tipicamente
     uma célula num patamar de seletividade (load_cell_returned_counts).
-    `n=0` (grupo vazio) devolve Nones em vez de dividir por zero."""
-    if not pairs:
+    `n=0` (grupo vazio) devolve Nones em vez de dividir por zero.
+
+    Aceita tanto o array (n, 2) de load_cell_returned_counts quanto uma
+    sequência de tuplas (returned_count, k)."""
+    arr = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    n = int(arr.shape[0])
+    if n == 0:
         return {"mean_returned_count": None, "partial_response_rate": None, "n": 0}
-    counts = [rc for rc, _ in pairs]
-    partial = sum(1 for rc, k in pairs if rc < k)
+    counts, ks = arr[:, 0], arr[:, 1]
+    # int(...sum()) antes de dividir, não counts.mean(): soma inteira exata,
+    # idêntica bit a bit ao sum()/len() de listas Python que isto substituiu.
     return {
-        "mean_returned_count": sum(counts) / len(counts),
-        "partial_response_rate": partial / len(pairs),
-        "n": len(pairs),
+        "mean_returned_count": int(counts.sum()) / n,
+        "partial_response_rate": int((counts < ks).sum()) / n,
+        "n": n,
     }
 
 
@@ -452,6 +482,69 @@ def _compute_cell_report_entry(
         # chave existir continua legível (naqueles, 0.0 é ambíguo
         # entre "ocioso" e "não medido" — ver README, Fase 5).
         "saturation_generator_cpu_unmeasured": saturation.get("generator_cpu_unmeasured", False),
+        "latency_source": "raw_requests",
+    }
+    return entry, {"low": ci.low, "high": ci.high}
+
+
+def legacy_final_level_p99_samples(saturation_entry: dict) -> list[float]:
+    """Achata per_rep_p99_ms de final_level_probes de todos os tiers em
+    by_tier — fallback para uma célula cuja confirmação rodou ANTES da
+    otimização de confirmação arquivada (load/saturation.py,
+    build_final_level_confirmation_commands: e3-postgres, 2026-09-21). O
+    patamar aprovado FOI medido e confirmado (5 sondagens x 5 repetições
+    cada, todas arquivadas em saturation_<tier>.json), só que no formato
+    leve — sem manifest.json/latencies.parquet, então load_cell_latencies
+    não os enxerga. Não é substituto do dado bruto (não dá para bootstrap
+    sobre requisição individual, nem entra nos testes de hipótese entre
+    células — ver build_report), mas descartar esses valores de p99 por
+    repetição já arquivados jogaria fora uma medição real só porque o
+    formato mudou no meio da campanha."""
+    samples: list[float] = []
+    for tier_entry in saturation_entry.get("by_tier", {}).values():
+        for probe in tier_entry.get("final_level_probes") or []:
+            samples.extend(probe.get("per_rep_p99_ms") or [])
+    return samples
+
+
+def _compute_legacy_cell_report_entry(
+    cell_id: str,
+    per_rep_p99_samples: list[float],
+    saturation: dict,
+    storage_root: Path,
+) -> tuple[dict, dict]:
+    """Par ao _compute_cell_report_entry, para uma célula sem latências
+    brutas arquivadas nesta fase (ver legacy_final_level_p99_samples). O
+    p99 é a MEDIANA das amostras de p99 por repetição já arquivadas —
+    mesma unidade de reamostragem da estatística de decisão
+    median-per-repetition usada nesta campanha (load/saturation.py), só
+    que aplicada post-hoc para sumarizar em vez de decidir. O IC bootstrap
+    reamostra essas mesmas amostras por repetição (não requisições
+    individuais) — por isso mais largo que o das outras células, e
+    marcado via latency_source para o relatório não confundir os dois."""
+    samples = np.asarray(per_rep_p99_samples, dtype=float)
+    p99 = float(np.median(samples))
+    storage_bytes = storage_bytes_for_cell(cell_id, storage_root)
+    medium = storage_medium_for_cell(cell_id)
+    compute_month = unit_compute_cost_usd_month(cell_id)
+    storage_month = unit_storage_cost_usd_month(cell_id, storage_root)
+    ci = bootstrap_percentile_ci(samples.tolist(), percentile=0.5)
+    entry = {
+        "cell_id": cell_id,
+        "latency_p99_ms": p99,
+        "storage_bytes": storage_bytes,
+        "storage_medium": medium,
+        "memory_bytes": storage_bytes if medium == "memory" else 0,
+        "memory_per_unit_bytes": MEMORY_PER_UNIT_BYTES,
+        "unit_compute_usd_month": compute_month,
+        "unit_storage_usd_month": storage_month,
+        "unit_cost_usd_month": compute_month + storage_month,
+        "saturation_throughput_approx": saturation.get("approx_throughput"),
+        "saturation_censored": saturation.get("censored", False),
+        "saturation_lower_bound": saturation.get("lower_bound"),
+        "saturation_generator_cpu_unmeasured": saturation.get("generator_cpu_unmeasured", False),
+        "latency_source": "legacy_per_repetition_summary",
+        "latency_source_sample_size": len(samples),
     }
     return entry, {"low": ci.low, "high": ci.high}
 
@@ -464,14 +557,23 @@ def _resolve_max_workers(label_count: int, cpu_count: int, override: int | None)
 
 
 def build_report(
-    groups: dict[str, list[float]],
+    groups: dict[str, np.ndarray],
     saturation_by_cell: dict[str, dict] | None = None,
     storage_root: Path = _DEFAULT_STORAGE_ROOT,
-    returned_counts_by_key: dict[str, list[tuple[int, int]]] | None = None,
+    returned_counts_by_key: dict[str, np.ndarray] | None = None,
     max_workers: int | None = None,
+    legacy_p99_samples_by_cell: dict[str, list[float]] | None = None,
 ) -> dict:
+    """`legacy_p99_samples_by_cell`: células sem latências brutas
+    arquivadas nesta fase (ver legacy_final_level_p99_samples) — entram em
+    `cells`/`bootstrap_ci_p99`/custo/Pareto como qualquer outra célula, mas
+    NUNCA em `groups`/`labels`: Kruskal-Wallis, Dunn e Vargha-Delaney
+    comparam distribuições de requisições individuais, e uma célula assim
+    só tem ~25 amostras de p99 por repetição — misturá-la corromperia o
+    teste entre as células que TÊM dado bruto."""
     saturation_by_cell = saturation_by_cell or {}
     returned_counts_by_key = returned_counts_by_key or {}
+    legacy_p99_samples_by_cell = legacy_p99_samples_by_cell or {}
     labels = list(groups)
     kruskal = kruskal_wallis([groups[label] for label in labels])
     dunn = dunn_posthoc(groups) if kruskal.reject_h0 else {}
@@ -524,6 +626,15 @@ def build_report(
         for future in as_completed(futures):
             cell_id = futures[future]
             results_by_cell[cell_id] = future.result()
+
+    # Células legacy (sem dado bruto arquivado nesta fase) são baratas de
+    # calcular (~25 amostras, não milhões) — sem pool de processos, direto
+    # neste mesmo processo, fora de `groups`/`labels` (nunca entram no
+    # Kruskal-Wallis/Dunn/Vargha-Delaney acima).
+    for cell_id, samples in legacy_p99_samples_by_cell.items():
+        results_by_cell[cell_id] = _compute_legacy_cell_report_entry(
+            cell_id, samples, saturation_by_cell.get(cell_id, {}), storage_root
+        )
 
     # Ordem determinística (sorted por cell_id), não a ordem de conclusão do
     # ProcessPoolExecutor — mesma disciplina de discover_rep_dirs.
@@ -613,7 +724,7 @@ def build_report(
     }
 
 
-def build_confirmation_extras(groups: dict[str, list[float]]) -> dict:
+def build_confirmation_extras(groups: dict[str, np.ndarray]) -> dict:
     """TOST par-a-par entre as células da fronteira — 'não rejeitou H0' não
     é o mesmo que 'equivalente na prática' (docs/DESIGN.md, "Delineamento em
     duas etapas"). `vargha_delaney_a` acompanha cada par: mesmo quando o TOST
@@ -710,11 +821,34 @@ def main(argv: list[str] | None = None) -> int:
                 "Trate como não validada nessa dimensão."
             )
 
+    # Células com saturation_<tier>.json mas SEM rep_dirs correspondentes
+    # (não estão em `groups`) rodaram a confirmação antes da otimização de
+    # confirmação arquivada e não têm latência bruta desta fase — ver
+    # legacy_final_level_p99_samples. Só entram como legacy se sobrar
+    # alguma amostra (uma célula sem final_level_probes nenhum, por
+    # qualquer outro motivo, não finge ter dado).
+    legacy_p99_samples_by_cell = {
+        cell_id: samples
+        for cell_id, entry in saturation_by_cell.items()
+        if cell_id not in groups
+        for samples in [legacy_final_level_p99_samples(entry)]
+        if samples
+    }
+    for cell_id, samples in legacy_p99_samples_by_cell.items():
+        print(
+            f"AVISO: {cell_id} — sem latências brutas arquivadas nesta fase; p99 estimado pela "
+            f"mediana de {len(samples)} valores de p99 por repetição já arquivados em "
+            "saturation_<tier>.json (confirmação rodou antes da otimização de confirmação "
+            "arquivada). IC mais largo que o das demais células, e fica de fora dos testes de "
+            "hipótese entre células (Kruskal-Wallis/Dunn/Vargha-Delaney) — ver latency_source."
+        )
+
     report = build_report(
         groups,
         saturation_by_cell,
         returned_counts_by_key=returned_counts_by_key,
         max_workers=args.max_workers,
+        legacy_p99_samples_by_cell=legacy_p99_samples_by_cell,
     )
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "report.json").write_text(json.dumps(report, indent=2))

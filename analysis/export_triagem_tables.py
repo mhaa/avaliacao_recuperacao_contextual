@@ -26,6 +26,8 @@ import statistics
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from analysis.report import (
     discover_rep_dirs,
     ensure_collected,
@@ -84,7 +86,7 @@ def _run_timestamp_of(rep_dirs: list[Path], cell_id: str) -> str:
 
 def build_resultados_rows(
     rep_dirs: list[Path],
-    groups: dict[str, list[float]],
+    groups: dict[str, np.ndarray],
     saturation_by_cell: dict[str, dict],
 ) -> list[dict]:
     summaries_by_cell = _rep_summaries(rep_dirs)
@@ -122,7 +124,7 @@ def build_resultados_rows(
     return rows
 
 
-def build_latencias_long_rows(groups: dict[str, list[float]]) -> list[dict]:
+def build_latencias_long_rows(groups: dict[str, np.ndarray]) -> list[dict]:
     rows = []
     for cell_id, latencies in groups.items():
         percentiles = percentiles_of(latencies)
