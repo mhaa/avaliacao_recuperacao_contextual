@@ -491,6 +491,22 @@ também são salvas como artefato próprio (`quick_probe_table.txt`/
 `ramp_<tier>_table.txt`, junto de `resources.csv`/`db_cpu_cores.csv`), não só
 impressas — sobrevivem ao terminal fechar.
 
+Ambas as tabelas ganharam três colunas logo após `rate`, para completar a
+leitura de vazão sem obrigar quem lê a cruzar campos manualmente: `vazão`
+(vazão realmente sustentada — `offered_ratio × rate` na sondagem rápida,
+`throughput_rps` direto na rampa completa, já existente em `RampStepResult`),
+`oferta%` (o mesmo `offered_ratio` em percentual — abaixo de 95% é o próprio
+portão de vazão ofertada, `analysis/collect.py:MIN_OFFERED_RATIO`, que pode
+ter violado o patamar mesmo com `err%=0,00`) e `vazãoSLO` (goodput: requisições
+com `status<400` **e** `latência<=200ms` por segundo —
+`analysis/probe_report.py:slo_throughput_rps` — distinta de `vazão`, que conta
+toda requisição aceita, SLO ou não; um patamar pode ter vazão alta e vazãoSLO
+baixa quando a fila cresce mas o k6 ainda não esgotou `maxVUs`). `vazãoSLO` só
+é calculada no modo `--decision-statistic pooled` (o único que a campanha de
+estresse usa) e nunca é lida pela bateria principal — `_ProbeVerdict`/
+`ProbeResult`/`RampStepResult` ganharam o campo, mas triagem/confirmação não o
+consomem.
+
 **Duas limitações de instrumentação que o desenho precisa contornar**, ambas já
 conhecidas do protocolo principal:
 - `classify_bottleneck` calcula CPU como `1 - idle/total` **somada sobre todos os

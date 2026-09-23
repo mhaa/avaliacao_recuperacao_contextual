@@ -42,6 +42,21 @@ SLO_P99_MS = 200.0
 SLO_ERROR_RATE = 0.01
 
 
+def slo_throughput_rps(df: pl.DataFrame) -> float | None:
+    """Vazão SLO: requisições bem-sucedidas (status<400) com latência <=
+    SLO_P99_MS, por segundo de duração da janela — o goodput real, distinto
+    de throughput_rps (analysis/collect.py:build_summary), que conta toda
+    requisição aceita, SLO ou não. Mesma convenção de build_summary: None
+    quando a janela é vazia ou tem duração zero (não fabrica um 0,0)."""
+    if df.is_empty():
+        return None
+    span_seconds = (df["timestamp"].max() - df["timestamp"].min()).total_seconds()
+    if span_seconds <= 0:
+        return None
+    good = df.filter((pl.col("status") < 400) & (pl.col("latency_ms") <= SLO_P99_MS))
+    return good.height / span_seconds
+
+
 def _parse_proc_stat_cpu_fields(line: str) -> tuple[int, ...]:
     """Primeira linha de /proc/stat ('cpu  user nice system idle iowait irq
     softirq steal ...'), em jiffies acumulados desde o boot."""
@@ -203,6 +218,14 @@ def main(argv: list[str] | None = None) -> int:
 
     per_rep_p99_ms: list[float] | None = None
     per_rep_violated: list[bool] | None = None
+    # Só o modo "pooled" mantém o dataframe bruto por perto o suficiente
+    # para calcular o goodput — no modo mediana cada repetição é resumida e
+    # descartada separadamente (ver _per_repetition_summaries). A campanha
+    # de estresse, única consumidora de slo_throughput_rps, só usa "pooled"
+    # (sondagem de 1 repetição) — estender ao modo mediana exigiria uma
+    # decisão de design própria (poolar linhas cruas entre repetições? medi
+    # ana por repetição?) que nada nesta issue pede.
+    slo_rps: float | None = None
 
     if args.decision_statistic == "median-per-repetition":
         # Parseia cada ndjson SEPARADAMENTE (um build_summary por repetição)
@@ -229,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             [parse_requests_ndjson(path, scenarios=PROBE_SCENARIOS) for path in args.ndjson_path]
         )
         decision_summary = build_summary(df)
+        slo_rps = slo_throughput_rps(df)
         request_count = decision_summary["request_count"]
         # Contagem contra o esperado, não throughput/span como em
         # analysis/collect.py:offered_load_fields: aqui o df concatena
@@ -249,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     line = (
         f"PROBE_RESULT violated_slo={violated} p99={decision_summary['latency_ms_p99']} "
         f"error_rate={decision_summary['error_rate']} request_count={request_count} "
-        f"offered_ratio={offered_ratio} "
+        f"offered_ratio={offered_ratio} slo_throughput_rps={slo_rps} "
         f"generator_cpu_percent={generator_cpu_percent} "
         f"ignore_latency_slo={args.ignore_latency_slo}"
     )

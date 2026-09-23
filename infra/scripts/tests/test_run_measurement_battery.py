@@ -607,6 +607,32 @@ def test_parse_probe_result_defaults_per_rep_fields_to_none_when_absent():
     assert verdict.per_rep_violated_slo is None
 
 
+def test_parse_probe_result_reads_slo_throughput_rps_and_tolerates_its_absence():
+    # Token novo (analysis/probe_report.py:slo_throughput_rps, só no modo
+    # pooled) — linhas de execuções antigas não têm o token.
+    with_slo = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 request_count=1000 "
+        "slo_throughput_rps=42.5 generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(with_slo).slo_throughput_rps == 42.5
+
+    without_slo = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 "
+        "request_count=1000 generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(without_slo).slo_throughput_rps is None
+
+
+def test_parse_probe_result_reads_slo_throughput_rps_as_none_when_literal_none():
+    # Modo --decision-statistic median-per-repetition imprime o token
+    # literalmente "None" (ver analysis/probe_report.py main()) — não vazio.
+    stdout = (
+        "PROBE_RESULT violated_slo=False p99=50.0 error_rate=0.0 request_count=1000 "
+        "slo_throughput_rps=None generator_cpu_percent=20.0"
+    )
+    assert _parse_probe_result(stdout).slo_throughput_rps is None
+
+
 def test_write_saturation_json_round_trips(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = SaturationSearchResult(

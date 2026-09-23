@@ -304,6 +304,35 @@ def test_probe_commands_stay_inside_the_stress_namespace(monkeypatch):
     assert not any("_saturation/" in c for c in sent)
 
 
+def test_stress_probe_fn_carries_slo_throughput_rps_through(monkeypatch):
+    import infra.scripts.run_stress_ramp as rsr
+
+    class _Completed:
+        stdout = (
+            "PROBE_RESULT violated_slo=False p99=3.0 error_rate=0.0 "
+            "request_count=60000 offered_ratio=1.0 slo_throughput_rps=980.5 "
+            "generator_cpu_percent=30.0"
+        )
+
+    monkeypatch.setattr(rsr, "gcloud_ssh_with_retry", lambda *a, **k: _Completed())
+
+    probe_fn = rsr.make_stress_probe_fn(
+        "e2-scylla",
+        "http://10.0.0.5:8000/v1/recommendations",
+        "medium",
+        "tcc-e2-scylla-loadgen-st",
+        "us-east4-a",
+        "proj",
+        "tools:latest",
+        "bucket",
+        "20260922T120000Z",
+        user_count=200_948,
+    )
+    result = probe_fn(1000)
+
+    assert result.slo_throughput_rps == 980.5
+
+
 def test_stress_probe_fn_default_call_site_still_uses_the_knee_probe_timing(monkeypatch):
     # Regressão: make_stress_probe_fn ganhou warmup/measure/label parametrizáveis
     # para o --quick-probe reusar a mesma função — a sondagem do joelho (única
@@ -511,13 +540,15 @@ def test_nearest_sample_per_component_ignores_samples_without_a_timestamp():
     assert nearest["database"] is None
 
 
-def _probe(rate, *, p99, error_rate, violated, generator_cpu):
+def _probe(rate, *, p99, error_rate, violated, generator_cpu, offered_ratio=None, slo_throughput_rps=None):
     return ProbeResult(
         rate=rate,
         violated_slo=violated,
         generator_cpu_percent=generator_cpu,
         p99_ms=p99,
         error_rate=error_rate,
+        offered_ratio=offered_ratio,
+        slo_throughput_rps=slo_throughput_rps,
     )
 
 
@@ -577,6 +608,60 @@ def test_format_quick_probe_table_computes_memory_as_a_percentage_of_the_ceiling
     assert "10.0%" in table.splitlines()[2]
 
 
+def test_format_quick_probe_table_computes_vazao_as_offered_ratio_times_rate():
+    sweep = LinearSweepResult(
+        probes=[_probe(2000, p99=4.0, error_rate=0.0, violated=False, generator_cpu=8.0, offered_ratio=0.97)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    # vazão = offered_ratio * rate = 0.97 * 2000 = 1940
+    assert "1940" in line
+    assert "97.0%" in line
+
+
+def test_format_quick_probe_table_degrades_vazao_to_a_dash_without_offered_ratio():
+    sweep = LinearSweepResult(
+        probes=[_probe(1000, p99=3.0, error_rate=0.0, violated=False, generator_cpu=5.0, offered_ratio=None)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
+def test_format_quick_probe_table_passes_through_slo_throughput_rps():
+    sweep = LinearSweepResult(
+        probes=[_probe(2000, p99=4.0, error_rate=0.0, violated=False, generator_cpu=8.0, slo_throughput_rps=1940.0)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    assert "1940" in line
+
+
+def test_format_quick_probe_table_degrades_slo_throughput_to_a_dash_without_it():
+    sweep = LinearSweepResult(
+        probes=[_probe(1000, p99=3.0, error_rate=0.0, violated=False, generator_cpu=5.0, slo_throughput_rps=None)],
+        loadgen_bottleneck=False,
+        censored=True,
+    )
+
+    table = format_quick_probe_table(sweep, [BASE], [], {"database": 32768.0, "service": 32768.0})
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
 def test_format_ramp_step_table_renders_one_row_per_step_and_reads_ended_at():
     steps = [
         {
@@ -614,6 +699,111 @@ def test_format_ramp_step_table_renders_one_row_per_step_and_reads_ended_at():
     assert len(lines) == 4
     assert "coarse_up" in lines[2] and "OK" in lines[2]
     assert "fine_up" in lines[3] and "VIOLOU" in lines[3]
+
+
+def test_format_ramp_step_table_passes_through_throughput_and_offered_ratio():
+    steps = [
+        {
+            "rate": 7000,
+            "phase": "fine_up",
+            "latency_ms_p50": 20.0,
+            "latency_ms_p95": 200.0,
+            "latency_ms_p99": 500.0,
+            "error_rate": 0.034,
+            "offered_load_ok": True,
+            "violated_slo": True,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": 6874.3,
+            "offered_ratio": 0.982,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    # throughput_rps já vem pronto de RampStepResult — sem derivação, ao
+    # contrário da tabela da sondagem rápida.
+    assert "6874" in line
+    assert "98.2%" in line
+
+
+def test_format_ramp_step_table_degrades_vazao_to_a_dash_without_throughput():
+    steps = [
+        {
+            "rate": 1000,
+            "phase": "coarse_up",
+            "latency_ms_p50": 2.0,
+            "latency_ms_p95": 3.0,
+            "latency_ms_p99": 4.0,
+            "error_rate": 0.0,
+            "offered_load_ok": True,
+            "violated_slo": False,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": None,
+            "offered_ratio": None,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    assert "—" in line
+
+
+def test_format_ramp_step_table_passes_through_slo_throughput_rps():
+    steps = [
+        {
+            "rate": 7000,
+            "phase": "fine_up",
+            "latency_ms_p50": 20.0,
+            "latency_ms_p95": 200.0,
+            "latency_ms_p99": 500.0,
+            "error_rate": 0.034,
+            "offered_load_ok": True,
+            "violated_slo": True,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": 6874.3,
+            "offered_ratio": 0.982,
+            "slo_throughput_rps": 3120.7,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    assert "3121" in line
+
+
+def test_format_ramp_step_table_degrades_slo_throughput_to_a_dash_without_it():
+    steps = [
+        {
+            "rate": 1000,
+            "phase": "coarse_up",
+            "latency_ms_p50": 2.0,
+            "latency_ms_p95": 3.0,
+            "latency_ms_p99": 4.0,
+            "error_rate": 0.0,
+            "offered_load_ok": True,
+            "violated_slo": False,
+            "ended_at": BASE.isoformat(),
+            "throughput_rps": None,
+            "offered_ratio": None,
+            "slo_throughput_rps": None,
+        }
+    ]
+
+    table = format_ramp_step_table(
+        steps, [], {"database": 32768.0, "service": 32768.0, "loadgen": 16384.0}
+    )
+    line = table.splitlines()[2]
+
+    assert "—" in line
 
 
 def test_format_ramp_step_table_degrades_to_a_dash_when_ended_at_is_missing():

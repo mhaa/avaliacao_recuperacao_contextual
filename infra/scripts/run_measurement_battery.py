@@ -800,6 +800,11 @@ class _ProbeVerdict:
     # None no modo pooled (default) ou em saídas antigas sem esses tokens.
     per_rep_p99_ms: list[float] | None = None
     per_rep_violated_slo: list[bool] | None = None
+    # Goodput (status<400 AND latência<=200ms) por segundo — só a campanha
+    # de estresse (infra/scripts/run_stress_ramp.py) consome isto; None em
+    # saídas de probe_report.py anteriores a este campo, ou no modo
+    # --decision-statistic median-per-repetition, que ainda não o calcula.
+    slo_throughput_rps: float | None = None
 
 
 def _parse_probe_result(stdout: str) -> _ProbeVerdict:
@@ -821,6 +826,7 @@ def _parse_probe_result(stdout: str) -> _ProbeVerdict:
                 offered_ratio=_parse_optional_float(tokens.get("offered_ratio")),
                 per_rep_p99_ms=_parse_optional_float_list(tokens.get("per_rep_p99_ms")),
                 per_rep_violated_slo=_parse_optional_bool_list(tokens.get("per_rep_violated")),
+                slo_throughput_rps=_parse_optional_float(tokens.get("slo_throughput_rps")),
             )
     raise RuntimeError(
         f"analysis/probe_report.py não imprimiu PROBE_RESULT na saída remota:\n{stdout}"

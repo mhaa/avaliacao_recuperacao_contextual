@@ -82,6 +82,11 @@ class ProbeResult:
     # subseção sobre re-medição de seletividade média.
     per_rep_p99_ms: list[float] | None = None
     per_rep_violated_slo: list[bool] | None = None
+    # Goodput (status<400 AND latência<=200ms) por segundo — analysis/
+    # probe_report.py:slo_throughput_rps, só calculado no modo "pooled".
+    # None em sondagens antigas ou no modo --decision-statistic
+    # median-per-repetition, que ainda não o calcula.
+    slo_throughput_rps: float | None = None
 
 
 @dataclass(frozen=True)

@@ -102,6 +102,11 @@ class RampStepResult:
     error_rate: float | None = None
     request_count: int | None = None
     offered_ratio: float | None = None
+    # Goodput (status<400 AND latência<=200ms) por segundo — analysis/
+    # ramp_report.py:step_results calcula do dataframe bruto do degrau,
+    # antes de build_summary colapsar em percentis. Distinto de
+    # throughput_rps, que conta toda requisição aceita, SLO ou não.
+    slo_throughput_rps: float | None = None
     # False = o k6 esgotou maxVUs e descartou chegadas; os percentis deste
     # degrau são só dos sobreviventes (docs/DESIGN.md, "Vazão ofertada
     # verificada, não presumida"). Passado o joelho isso é esperado e é o

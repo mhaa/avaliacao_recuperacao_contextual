@@ -36,7 +36,7 @@ from analysis.collect import (
     offered_load_fields,
     parse_requests_ndjson,
 )
-from analysis.probe_report import violated_slo
+from analysis.probe_report import slo_throughput_rps, violated_slo
 from load.ramp import RampStepResult, classify_recovery
 
 # Ordem canônica das fases. A rampa é uma trajetória, não um conjunto: o mesmo
@@ -69,7 +69,8 @@ def step_results(
     results: list[RampStepResult] = []
     groups = latencies_df.group_by(["step_rate", "step_phase"], maintain_order=True)
     for (rate, phase), group in groups:
-        summary = build_summary(group.drop(["step_rate", "step_phase"]))
+        step_df = group.drop(["step_rate", "step_phase"])
+        summary = build_summary(step_df)
         offered = offered_load_fields(summary, float(rate))
         results.append(
             RampStepResult(
@@ -83,6 +84,7 @@ def step_results(
                 error_rate=summary["error_rate"],
                 request_count=summary["request_count"],
                 offered_ratio=offered["offered_ratio"],
+                slo_throughput_rps=slo_throughput_rps(step_df),
                 offered_load_ok=offered["offered_load_ok"],
                 violated_slo=violated_slo(
                     summary, offered["offered_ratio"], ignore_latency=ignore_latency
@@ -196,6 +198,7 @@ def build_ramp_report(
                 "error_rate": r.error_rate,
                 "request_count": r.request_count,
                 "offered_ratio": r.offered_ratio,
+                "slo_throughput_rps": r.slo_throughput_rps,
                 "offered_load_ok": r.offered_load_ok,
                 "violated_slo": r.violated_slo,
                 "started_at": r.started_at,

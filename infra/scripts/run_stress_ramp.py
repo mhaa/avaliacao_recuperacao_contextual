@@ -287,6 +287,7 @@ def make_stress_probe_fn(
             p99_ms=verdict.p99_ms,
             error_rate=verdict.error_rate,
             offered_ratio=verdict.offered_ratio,
+            slo_throughput_rps=verdict.slo_throughput_rps,
         )
 
     return probe_fn
@@ -477,26 +478,51 @@ def format_quick_probe_table(
     daquele patamar, a mesma que o portão dos 60% usa) — nunca da amostra
     correlacionada, para a tabela nunca mostrar dois números diferentes
     para a mesma medição. Memória sempre em % do teto da VM (mesma base de
-    classify_bottleneck), nunca MB bruto — ver docs/DESIGN.md."""
+    classify_bottleneck), nunca MB bruto — ver docs/DESIGN.md.
+
+    `vazão` = `offered_ratio * rate` — exato, não aproximado:
+    ProbeResult.offered_ratio já é `request_count / (rate * duração)`
+    (analysis/probe_report.py), então multiplicar por `rate` devolve
+    exatamente `request_count / duração`, a vazão real sustentada naquele
+    patamar. `oferta%` é o mesmo `offered_ratio` em percentual — abaixo de
+    95% é o próprio portão de vazão ofertada (analysis/collect.py:
+    MIN_OFFERED_RATIO) que pode ter violado o patamar mesmo com err%=0,00
+    (ver docs/DESIGN.md, "Vazão ofertada verificada, não presumida") —
+    mostrar os dois números lado a lado é o que permite distinguir essa
+    causa de uma violação por taxa de erro.
+
+    `vazãoSLO` = ProbeResult.slo_throughput_rps (analysis/probe_report.py:
+    slo_throughput_rps) — requisições bem-sucedidas E dentro dos 200ms do
+    SLO, por segundo. Distinto de `vazão` (toda requisição aceita, SLO ou
+    não): a diferença entre as duas colunas é o que separa "o banco aceitou
+    a carga" de "o banco respondeu dentro do prometido" — um patamar pode
+    ter vazão alta e vazãoSLO baixa quando a fila cresce mas ainda não
+    estoura maxVUs."""
     header = (
-        f"  {'rate':>6}  {'p99(ms)':>8}  {'err%':>6}  {'veredito':<8}  "
+        f"  {'rate':>6}  {'vazão':>7}  {'oferta%':>8}  {'vazãoSLO':>8}  {'p99(ms)':>8}  {'err%':>6}  {'veredito':<8}  "
         f"{'cpuGer%':>8}  {'cpuSrv%':>8}  {'cpuBD%':>7}  "
         f"{'memGer%':>8}  {'memSrv%':>8}  {'memBD%':>7}"
     )
     sep = (
-        f"  {'-' * 6}  {'-' * 8}  {'-' * 6}  {'-' * 8}  "
+        f"  {'-' * 6}  {'-' * 7}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 6}  {'-' * 8}  "
         f"{'-' * 8}  {'-' * 8}  {'-' * 7}  "
         f"{'-' * 8}  {'-' * 8}  {'-' * 7}"
     )
     lines = [header, sep]
     for probe, at in zip(sweep.probes, level_timestamps):
         nearest = _nearest_sample_per_component(resource_samples, at)
+        if probe.offered_ratio is not None:
+            vazao = f"{probe.offered_ratio * probe.rate:.0f}"
+            oferta = f"{probe.offered_ratio * 100:.1f}%"
+        else:
+            vazao = oferta = "—"
+        vazao_slo = f"{probe.slo_throughput_rps:.0f}" if probe.slo_throughput_rps is not None else "—"
         p99 = f"{probe.p99_ms:.1f}" if probe.p99_ms is not None else "—"
         err = f"{probe.error_rate * 100:.2f}%" if probe.error_rate is not None else "—"
         veredito = "VIOLOU" if probe.violated_slo else "OK"
         cpu_ger = f"{probe.generator_cpu_percent:.1f}%" if probe.generator_cpu_percent is not None else "—"
         lines.append(
-            f"  {probe.rate:>6}  {p99:>8}  {err:>6}  {veredito:<8}  "
+            f"  {probe.rate:>6}  {vazao:>7}  {oferta:>8}  {vazao_slo:>8}  {p99:>8}  {err:>6}  {veredito:<8}  "
             f"{cpu_ger:>8}  {_cpu_percent(nearest['service']):>8}  {_cpu_percent(nearest['database']):>7}  "
             f"{_memory_percent(nearest['loadgen'], memory_ceilings):>8}  "
             f"{_memory_percent(nearest['service'], memory_ceilings):>8}  "
@@ -518,14 +544,22 @@ def format_ramp_step_table(
     da sondagem rápida, não há leitura de /proc/stat POR DEGRAU do gerador
     (o portão dos 60% da rampa só amostra uma vez, cercando a campanha
     inteira) — cpuGer% aqui também vem da amostra correlacionada, não de uma
-    fonte mais precisa como na tabela da sondagem (ver docs/DESIGN.md)."""
+    fonte mais precisa como na tabela da sondagem (ver docs/DESIGN.md).
+
+    `vazãoSLO` = RampStepResult.slo_throughput_rps (analysis/ramp_report.py:
+    step_results, via analysis/probe_report.py:slo_throughput_rps) —
+    passagem direta, sem derivação: o dataframe bruto do degrau já existe
+    em step_results antes de build_summary colapsá-lo em percentis. Mesmo
+    significado da coluna homônima da tabela da sondagem rápida: goodput
+    (status<400 E latência<=200ms), distinto de `vazão` (toda requisição
+    aceita)."""
     header = (
-        f"  {'rate':>6}  {'phase':<10}  {'p50':>7}  {'p95':>7}  {'p99':>7}  {'err%':>5}  "
+        f"  {'rate':>6}  {'phase':<10}  {'vazão':>7}  {'oferta%':>8}  {'vazãoSLO':>8}  {'p50':>7}  {'p95':>7}  {'p99':>7}  {'err%':>5}  "
         f"{'oferta':<7}  {'veredito':<8}  {'cpuGer%':>8}  {'cpuSrv%':>8}  {'cpuBD%':>7}  "
         f"{'memGer%':>8}  {'memSrv%':>8}  {'memBD%':>7}"
     )
     sep = (
-        f"  {'-' * 6}  {'-' * 10}  {'-' * 7}  {'-' * 7}  {'-' * 7}  {'-' * 5}  "
+        f"  {'-' * 6}  {'-' * 10}  {'-' * 7}  {'-' * 8}  {'-' * 8}  {'-' * 7}  {'-' * 7}  {'-' * 7}  {'-' * 5}  "
         f"{'-' * 7}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 7}  "
         f"{'-' * 8}  {'-' * 8}  {'-' * 7}"
     )
@@ -538,6 +572,9 @@ def format_ramp_step_table(
             if at is not None
             else {"database": None, "service": None, "loadgen": None}
         )
+        vazao = f"{step['throughput_rps']:.0f}" if step.get("throughput_rps") is not None else "—"
+        oferta_pct = f"{step['offered_ratio'] * 100:.1f}%" if step.get("offered_ratio") is not None else "—"
+        vazao_slo = f"{step['slo_throughput_rps']:.0f}" if step.get("slo_throughput_rps") is not None else "—"
         p50 = f"{step['latency_ms_p50']:.1f}" if step.get("latency_ms_p50") is not None else "—"
         p95 = f"{step['latency_ms_p95']:.1f}" if step.get("latency_ms_p95") is not None else "—"
         p99 = f"{step['latency_ms_p99']:.1f}" if step.get("latency_ms_p99") is not None else "—"
@@ -545,7 +582,7 @@ def format_ramp_step_table(
         oferta = "OK" if step.get("offered_load_ok") else "DEFICIT"
         veredito = "VIOLOU" if step.get("violated_slo") else "OK"
         lines.append(
-            f"  {step['rate']:>6}  {step['phase']:<10}  {p50:>7}  {p95:>7}  {p99:>7}  {err:>5}  "
+            f"  {step['rate']:>6}  {step['phase']:<10}  {vazao:>7}  {oferta_pct:>8}  {vazao_slo:>8}  {p50:>7}  {p95:>7}  {p99:>7}  {err:>5}  "
             f"{oferta:<7}  {veredito:<8}  "
             f"{_cpu_percent(nearest['loadgen']):>8}  {_cpu_percent(nearest['service']):>8}  "
             f"{_cpu_percent(nearest['database']):>7}  "

@@ -119,6 +119,38 @@ def test_offered_ratio_is_recorded_per_step(tmp_path):
     assert step["violated_slo"] is True
 
 
+def test_slo_throughput_rps_counts_only_fast_successful_requests(tmp_path):
+    # 4 requisições num degrau de 10s: 2 dentro do SLO (rápida + sucesso),
+    # 1 lenta (fora do SLO por latência), 1 rápida mas com erro (fora do SLO
+    # por status) — goodput = 2/10 = 0,2 req/s, distinto do throughput_rps
+    # bruto (4/10 = 0,4), que conta toda requisição aceita.
+    path = tmp_path / "requests.ndjson"
+    events = [
+        {
+            "scenario": "stress_ramp",
+            "step_rate": 1000,
+            "step_phase": "fine_up",
+            "timestamp": (BASE + timedelta(seconds=offset)).isoformat(),
+            "latency_ms": latency_ms,
+            "status": status,
+            "returned_count": 20,
+        }
+        for offset, latency_ms, status in [
+            (0, 50, 200),
+            (2, 250, 200),  # lenta — fora do SLO
+            (4, 50, 500),  # erro — fora do SLO
+            (10, 50, 200),
+        ]
+    ]
+    _write_ndjson(path, events)
+
+    report = build_ramp_report(path, cell_id="e4-valkey", tier="medium")
+    step = report["steps"][0]
+
+    assert step["slo_throughput_rps"] == pytest.approx(0.2)
+    assert step["throughput_rps"] == pytest.approx(0.4)
+
+
 def test_degraded_steps_keep_their_percentiles_instead_of_being_dropped(tmp_path):
     # Os degraus além do joelho são os interessantes: precisam sobreviver ao
     # relatório, marcados, nunca descartados.
