@@ -846,7 +846,15 @@ def run_quick_probe(
     )
     quick_probe_table_txt = host_tmp / "quick_probe_table.txt"
     quick_probe_table_txt.write_text(
-        format_quick_probe_table(sweep, level_timestamps, resource_samples, memory_ceilings)
+        format_quick_probe_table(sweep, level_timestamps, resource_samples, memory_ceilings),
+        # Sem isto, Path.write_text() usa a codificação padrão do locale do
+        # host — cp1252 num host Windows — e corrompe permanentemente "ã"/"õ"
+        # dos cabeçalhos ("vazão", "oferta%") no arquivo salvo: não é só a
+        # exibição no console (isso é só o codepage do terminal), os BYTES
+        # gravados ficam errados, e sobem assim para o GCS. Confirmado ao
+        # vivo: quick_probe_table.txt salvo tinha 0xE3 (cp1252 de "ã") em vez
+        # de 0xC3 0xA3 (UTF-8).
+        encoding="utf-8",
     )
 
     for path in (resources_csv, db_cpu_csv, quick_probe_json, quick_probe_table_txt):
@@ -1244,7 +1252,10 @@ def main(argv=None) -> int:
         print("\n--- degraus da rampa (com uso de recursos por VM) ---")
         print(step_table)
         step_table_path = host_tmp / f"ramp_{TIER}_table.txt"
-        step_table_path.write_text(step_table)
+        # encoding="utf-8" pelo mesmo motivo de quick_probe_table_txt acima —
+        # sem isto, o padrão do locale do host (cp1252 no Windows) corrompe
+        # "ã"/"õ" nos cabeçalhos permanentemente no arquivo salvo.
+        step_table_path.write_text(step_table, encoding="utf-8")
 
         for path in (resources_csv, db_cpu_csv, step_table_path):
             _run(
