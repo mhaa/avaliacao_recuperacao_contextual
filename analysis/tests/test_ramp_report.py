@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from analysis.collect import RAMP_EXTRA_FIELDS, RAMP_SCENARIOS, parse_requests_ndjson
-from analysis.ramp_report import build_ramp_report, knee_summary, step_results
+from analysis.ramp_report import build_ramp_report, knee_summary, main, step_results
 from load.ramp import RampStepResult
 
 BASE = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -274,3 +274,64 @@ def test_step_results_on_an_empty_frame_is_empty(tmp_path):
     df = parse_requests_ndjson(path, scenarios=RAMP_SCENARIOS, extra_fields=RAMP_EXTRA_FIELDS)
 
     assert step_results(df) == []
+
+
+def test_ignore_latency_flips_a_latency_only_violation(tmp_path):
+    # rate=1, count=60 sobre 60s: throughput=1.0, offered_ratio~1.0 (>=0.95)
+    # — isola a violação de p99, sem o portão de vazão ofertada interferir.
+    path = tmp_path / "requests.ndjson"
+    _write_ndjson(path, _step_events(1, "fine_up", count=60, latency_ms=250, start_offset_s=0))
+    df = parse_requests_ndjson(path, scenarios=RAMP_SCENARIOS, extra_fields=RAMP_EXTRA_FIELDS)
+
+    default = step_results(df)
+    assert default[0].violated_slo is True
+
+    ignoring = step_results(df, ignore_latency=True)
+    assert ignoring[0].violated_slo is False
+
+
+def test_ignore_latency_still_flags_a_real_error_rate_violation(tmp_path):
+    path = tmp_path / "requests.ndjson"
+    _write_ndjson(
+        path,
+        _step_events(1, "fine_up", count=59, latency_ms=3, start_offset_s=0)
+        + _step_events(1, "fine_up", count=2, latency_ms=3, start_offset_s=59, status=500),
+    )
+    df = parse_requests_ndjson(path, scenarios=RAMP_SCENARIOS, extra_fields=RAMP_EXTRA_FIELDS)
+
+    results = step_results(df, ignore_latency=True)
+    assert results[0].violated_slo is True
+
+
+def test_build_ramp_report_threads_ignore_latency_through(tmp_path):
+    path = tmp_path / "requests.ndjson"
+    _write_ndjson(path, _step_events(1, "fine_up", count=60, latency_ms=250, start_offset_s=0))
+
+    default = build_ramp_report(path, cell_id="e4-valkey", tier="medium")
+    assert default["steps"][0]["violated_slo"] is True
+
+    ignoring = build_ramp_report(path, cell_id="e4-valkey", tier="medium", ignore_latency=True)
+    assert ignoring["steps"][0]["violated_slo"] is False
+
+
+def test_main_ignore_latency_slo_flag_flips_a_latency_only_violation(tmp_path, capsys):
+    path = tmp_path / "requests.ndjson"
+    _write_ndjson(path, _step_events(1, "fine_up", count=60, latency_ms=250, start_offset_s=0))
+    out = tmp_path / "ramp_medium.json"
+
+    main([str(path), "--cell", "e4-valkey", "--tier", "medium", "--out", str(out)])
+    assert json.loads(out.read_text())["steps"][0]["violated_slo"] is True
+
+    main(
+        [
+            str(path),
+            "--cell",
+            "e4-valkey",
+            "--tier",
+            "medium",
+            "--out",
+            str(out),
+            "--ignore-latency-slo",
+        ]
+    )
+    assert json.loads(out.read_text())["steps"][0]["violated_slo"] is False

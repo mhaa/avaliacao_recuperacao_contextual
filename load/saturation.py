@@ -27,7 +27,13 @@ patamar (infra/scripts/run_measurement_battery.py) e passa aqui só como
 `probe_fn(rate) -> ProbeResult`. Isso mantém o algoritmo de decisão
 testável com um probe_fn falso, mesma disciplina de
 storage/tests/fakes.py — nunca precisa de rede/gcloud real para testar a
-lógica de busca."""
+lógica de busca.
+
+`run_linear_probe_sweep` é um segundo protocolo, mais simples, no mesmo
+módulo: varredura linear (+1.000 req/s por patamar), sem busca binária —
+existe para MAPEAR a curva inteira rápido (`infra/scripts/
+run_stress_ramp.py --quick-probe`), não para convergir num único `S`
+aproximado como `run_saturation_search` faz."""
 
 from __future__ import annotations
 
@@ -354,4 +360,70 @@ def run_saturation_search(
         loadgen_bottleneck=False,
         generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
         probes=probes,
+    )
+
+
+@dataclass(frozen=True)
+class LinearSweepResult:
+    probes: list[ProbeResult]
+    loadgen_bottleneck: bool
+    # Mesmo vocabulário de SaturationSearchResult.censored: alcançou `ceiling`
+    # sem nenhuma violação — "sabemos que a violação está pelo menos ali",
+    # nunca um valor aproximado.
+    censored: bool
+    generator_cpu_unmeasured: bool = False
+
+
+def run_linear_probe_sweep(
+    probe_fn: Callable[[int], ProbeResult],
+    *,
+    start_rate: int = DEFAULT_START_RATE,
+    step: int = 1_000,
+    ceiling: int = CEILING_RPS,
+) -> LinearSweepResult:
+    """Varredura linear simples: +`step` a cada patamar, até a primeira
+    violação (ou até o gerador saturar, ou até `ceiling`). Ao contrário de
+    `run_saturation_search`, não refina via busca binária — o objetivo é
+    MAPEAR a curva inteira em resolução fixa de `step`, não convergir num
+    único valor aproximado (docs/DESIGN.md, "Experimento complementar" —
+    `infra/scripts/run_stress_ramp.py --quick-probe`).
+
+    Não precisa de um equivalente a `_backward_walk_to_bracket`: uma
+    violação na PRIMEIRA sondagem não é caso especial aqui, é só a primeira
+    (e única) iteração do laço — não há bracket a estreitar porque não há
+    busca binária nenhuma."""
+    if start_rate > ceiling:
+        raise ValueError(f"start_rate ({start_rate}) > ceiling ({ceiling}): nada a sondar.")
+    if step <= 0:
+        raise ValueError(f"step deve ser positivo, recebeu {step}.")
+
+    probes: list[ProbeResult] = []
+    rate = start_rate
+    while rate <= ceiling:
+        result = probe_fn(rate)
+        probes.append(result)
+
+        if _generator_saturated(result):
+            return LinearSweepResult(
+                probes=probes,
+                loadgen_bottleneck=True,
+                censored=False,
+                generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
+            )
+
+        if result.violated_slo:
+            return LinearSweepResult(
+                probes=probes,
+                loadgen_bottleneck=False,
+                censored=False,
+                generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
+            )
+
+        rate += step
+
+    return LinearSweepResult(
+        probes=probes,
+        loadgen_bottleneck=False,
+        censored=True,
+        generator_cpu_unmeasured=_any_cpu_unmeasured(probes),
     )

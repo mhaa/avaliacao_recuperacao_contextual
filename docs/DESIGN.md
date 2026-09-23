@@ -449,6 +449,48 @@ e3-valkey, e4-valkey), com seletividade fixa no patamar médio:
   3.987 ms ao voltar para 4.709 req/s, abaixo dos 4.695 req/s que eram limpos
   na subida.
 
+**Sondagem linear rápida, opcional, fora do fluxo padrão.** `--quick-probe`
+em `infra/scripts/run_stress_ramp.py` troca a sondagem do joelho + rampa
+completa por uma varredura de +1.000 req/s a cada 30s
+(`load/saturation.py:run_linear_probe_sweep`), subindo até a primeira
+violação ou `--quick-probe-top` (default: 2x o joelho projetado de
+`CELL_DEFAULTS`, ou 2x `--knee` se passado — `run_stress_ramp.py:_quick_probe_top`).
+Existe para dois usos: mapear a curva inteira em resolução grosseira em
+minutos em vez de horas, e checar rapidamente — via `db_cpu_cores.csv` — se o
+dimensionamento atual do serviço (`CELL_DEFAULTS[cell]["service"]`) deixa o
+BANCO aparecer como gargalo primeiro, antes de comprometer horas de VM numa
+rampa completa. Usa o mesmo critério `--ignore-latency-slo` da sondagem do
+joelho (só taxa de erro >1%, além do portão de vazão ofertada, nunca
+ignorado). Não substitui nem a sondagem do joelho (que existe para
+*enquadrar* um valor com busca binária) nem a rampa completa (que existe
+para medir histerese via subida/descida) — é um terceiro instrumento, mais
+barato e menos preciso, para checagem exploratória.
+
+`--ignore-latency-slo` também passou a se aplicar ao veredito por degrau da
+rampa COMPLETA (`analysis/ramp_report.py:step_results`), não só à sondagem do
+joelho — mesma consistência metodológica em toda a campanha, mesmo escopo
+(nunca a bateria principal, que nunca chama `ramp_report.py`).
+
+Tanto a sondagem rápida quanto a rampa completa agora imprimem um veredito
+explícito de gargalo (`analysis/resources.py:classify_bottleneck`, aplicado
+sobre `resources.csv`) logo após a execução — "database_cpu"/"service_cpu"/
+"loadgen_network" — em vez de só os tetos de memória usados no cálculo. Junto
+dele, a CPU de pico de UM núcleo do banco (`db_cpu_cores.csv`) e um aviso
+explícito quando o agregado aponta para outro componente mas o pico por
+núcleo sugere saturação de thread única (Valkey) — o mesmo caso descrito em
+"Valkey e o veredito automático" acima, agora superado automaticamente em vez
+de exigir inspeção manual dos dois CSVs. A rampa completa também passou a
+imprimir uma tabela por degrau (`infra/scripts/run_stress_ramp.py:format_ramp_step_table`),
+com CPU/memória das 3 VMs correlacionadas por timestamp a cada degrau (as
+mesmas colunas — em % da VM, nunca MB bruto — da tabela da sondagem rápida,
+`format_quick_probe_table`), cobrindo subida, platô e descida por inteiro;
+antes disso, o `RAMP_REPORT` de `analysis/ramp_report.py` era gerado
+corretamente na VM do gerador mas seu stdout nunca chegava ao console de
+quem roda a campanha, só ao JSON baixado depois. Ambas as tabelas renderizadas
+também são salvas como artefato próprio (`quick_probe_table.txt`/
+`ramp_<tier>_table.txt`, junto de `resources.csv`/`db_cpu_cores.csv`), não só
+impressas — sobrevivem ao terminal fechar.
+
 **Duas limitações de instrumentação que o desenho precisa contornar**, ambas já
 conhecidas do protocolo principal:
 - `classify_bottleneck` calcula CPU como `1 - idle/total` **somada sobre todos os
