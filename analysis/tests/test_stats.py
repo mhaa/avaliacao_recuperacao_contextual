@@ -14,6 +14,7 @@ from analysis.stats import (
     kruskal_wallis,
     tost_equivalence,
     vargha_delaney_a,
+    vargha_delaney_magnitude,
 )
 
 
@@ -118,3 +119,25 @@ def test_vargha_delaney_a_mirrors_below_half_when_arguments_swap():
     # A12(a, b) = 1 - A12(b, a) — mesma base de postos do Mann-Whitney U,
     # só espelhada pela troca de qual grupo é "referência".
     assert vargha_delaney_a(a, b) == pytest.approx(1 - vargha_delaney_a(b, a))
+
+
+@pytest.mark.parametrize(
+    ("a12", "expected"),
+    [
+        (0.50, "desprezivel"),
+        (0.559, "desprezivel"),
+        (0.56, "pequena"),
+        (0.64, "media"),
+        (0.71, "grande"),  # o próprio limiar — float faria 0.71-0.5 < 0.21
+        (0.99, "grande"),
+    ],
+)
+def test_vargha_delaney_magnitude_uses_the_published_thresholds(a12, expected):
+    assert vargha_delaney_magnitude(a12) == expected
+
+
+def test_vargha_delaney_magnitude_is_symmetric_around_half():
+    # A12 = 0,01 (b quase sempre mais lenta) é tão "grande" quanto 0,99 — o
+    # rótulo mede distância a 0,5, a direção fica no valor.
+    for a12 in (0.52, 0.40, 0.30, 0.01):
+        assert vargha_delaney_magnitude(a12) == vargha_delaney_magnitude(1 - a12)

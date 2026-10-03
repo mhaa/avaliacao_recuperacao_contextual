@@ -141,6 +141,24 @@ def vargha_delaney_a(a: list[float], b: list[float]) -> float:
     return float(u_a / (len(a_arr) * len(b_arr)))
 
 
+def vargha_delaney_magnitude(a12: float) -> str:
+    """Rótulo de magnitude de um A12 pelos limiares de Vargha & Delaney
+    (2000) — 0,56 / 0,64 / 0,71 e os espelhos abaixo de 0,5 —, sobre a
+    distância a 0,5, então vale nas duas direções: A12 = 0,01 é "grande"
+    tanto quanto 0,99. A direção (qual lado é mais lento) fica no próprio
+    valor; este rótulo só diz o quanto."""
+    # round: 0.71 - 0.5 == 0.20999999999999996 em float, o que jogaria o
+    # próprio limiar de "grande" para "media".
+    distance = round(abs(a12 - 0.5), 10)
+    if distance < 0.06:
+        return "desprezivel"
+    if distance < 0.14:
+        return "pequena"
+    if distance < 0.21:
+        return "media"
+    return "grande"
+
+
 @dataclass(frozen=True)
 class TostResult:
     equivalent: bool

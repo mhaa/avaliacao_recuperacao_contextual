@@ -544,6 +544,34 @@ Kruskal-Wallis; se rejeitar H0, Dunn com correção de Bonferroni (α = 5%).
 Intervalos de confiança dos percentis por bootstrap com 10.000 reamostras.
 Reportar também a magnitude do efeito.
 
+### Recorte da comparação de latência na confirmação: por estrato, não por célula
+
+Na confirmação, a comparação de latência ENTRE células é feita **por estrato
+(seletividade × carga fixa)**, nunca sobre todas as requisições de uma
+célula agregadas (`analysis/stratified_report.py`). Só entram os patamares de
+carga fixos e idênticos para todas as células — 100 e 1.000 req/s —, um teste
+completo (Kruskal-Wallis → Dunn/Bonferroni → Â de Vargha-Delaney → p99 com IC
+bootstrap) por estrato.
+
+Motivo, observado nos dados reais (e3-valkey × e4-valkey): a agregação por
+célula pondera cada combinação pelo nº de requisições, proporcional à taxa, e
+~80% das requisições vêm do patamar "alto", cuja taxa é a vazão de saturação
+DAQUELA célula naquela seletividade — diferente entre células (ex.: seletividade
+baixa, 3.195 req/s em e3-valkey contra 1.325 em e4-valkey). O resultado
+agregado mistura estratos com efeitos em sentidos opostos: a 1.000 req/s na
+seletividade baixa, Â(e3, e4) = 0,010 (e4 muito mais lenta), enquanto no
+patamar alto Â = 0,613 (e3 "mais lenta", mas sob 2,4× mais carga); agregado,
+Â = 0,517 — "equivalentes", o que não descreve nenhum estrato. É o mecanismo do
+paradoxo de Simpson.
+
+O patamar "alto" continua medido e reportado, mas é um resultado de
+**capacidade** (quanta carga cada célula sustenta dentro do SLO), não entra na
+comparação de latência: comparar latências sob cargas ofertadas diferentes
+confunde o efeito da célula com o efeito da carga. Os agregados por célula de
+`analysis/report.py` (`kruskal_wallis`, `dunn_posthoc`, `vargha_delaney_a`,
+`bootstrap_ci_p99` em `report.json`) ficam restritos ao eixo de latência do
+Pareto e não sustentam conclusões sobre diferenças entre células.
+
 ## Delineamento em duas etapas
 
 1. **Triagem** — todas as células viáveis, com seletividade e carga fixas em nível
